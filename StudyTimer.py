@@ -8593,7 +8593,7 @@ class OnboardingWizard(tk.Toplevel):
 
     def _build(self):
         import glob, os
-        from datetime import date, timedelta
+        from datetime import timedelta
 
         # Main container
         main_frame = tk.Frame(self, bg="#f5f7fa")
@@ -13438,11 +13438,9 @@ class StudyTimerApp(tk.Tk):
             pass
 
         # Decide if the wizard is needed
-        has_name  = bool((_prof.get("user_name") or "").strip())
-        has_exam  = _load_exam_date_only() is not None
+        # Once onboarding is marked done, do not prompt again even if cached exam date is missing.
         done_flag = bool(_prof.get("onboarding_done"))
-
-        need_wiz = not (has_name and has_exam and done_flag)
+        need_wiz = not done_flag
 
         if need_wiz:
             def _run_wiz():
@@ -13460,9 +13458,9 @@ class StudyTimerApp(tk.Tk):
                     _p = _load_profile()
                     self.user_name   = _p.get("user_name", "")
                     self.avatar_path = _p.get("avatar_path", "")
-                    self.progress_exam_date = _load_exam_date_only()
+                    self.progress_exam_date = _load_exam_date_only() or date.today()
                 except Exception:
-                    self.progress_exam_date = None
+                    self.progress_exam_date = date.today()
 
                 # update any header/badge immediately if available
                 try:
@@ -13478,9 +13476,9 @@ class StudyTimerApp(tk.Tk):
         else:
             # already onboarded → ensure exam date is cached
             try:
-                self.progress_exam_date = _load_exam_date_only()
+                self.progress_exam_date = _load_exam_date_only() or date.today()
             except Exception:
-                self.progress_exam_date = None
+                self.progress_exam_date = date.today()
                 self.after(150, _run_wiz)
                 self.after(200, getattr(self, '_refresh_profile_badge', lambda: None))
         self._sheet_sync = SheetSync(app_load_profile_for_sync, app_save_profile_for_sync)
@@ -13873,7 +13871,7 @@ class StudyTimerApp(tk.Tk):
 
         # Apply styling and effects
         self.setup_notebook_effects()
-        from datetime import date, timedelta
+        from datetime import timedelta
         import os, json
 
         self.progress_start_date = date.today()  # default fallback
@@ -25356,6 +25354,11 @@ class StudyTimerApp(tk.Tk):
         canvas.create_rectangle(x0, y0, x0 + fill_w, y0 + h, fill="#4ba1ff", outline="")
         
         # Draw red markers
+        if self.progress_exam_date is None:
+            self.progress_exam_date = date.today()
+        if self.progress_start_date is None:
+            self.progress_start_date = date.today()
+
         n_days = (self.progress_exam_date - self.progress_start_date).days
         if n_days <= 0:
             n_days = 1
