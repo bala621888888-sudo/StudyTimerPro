@@ -93,23 +93,15 @@ def get_fcm_token_from_file():
         "/data/data/com.chatapp.mobile/files/.chatapp/fcm_token.txt",
     ]
 
-    print("\n🔍 [TOKEN LOADER] Looking for FCM token in paths:")
-    for p in possible_paths:
-        print("   -", p)
-
     for token_path in possible_paths:
         try:
             if os.path.exists(token_path):
                 with open(token_path, "r") as f:
                     token = f.read().strip()
                     if token:
-                        print(f"✅ Loaded FCM token from: {token_path}")
-                        print(f"📱 Token preview: {token[:35]}...")
                         return token
         except Exception as e:
-            print(f"⚠️ Error reading {token_path}: {e}")
-
-    print("❌ FCM token file not found in any location")
+            pass
     return None
 
 # Global error handler for APK builds
@@ -290,25 +282,17 @@ class FCMSender:
         Returns:
             bool: True if successful
         """
-        print(f"\n📤 [FCM SEND] Starting send_notification...")
-        print(f"   Token: {fcm_token[:30] if fcm_token else 'None'}...")
-        print(f"   Title: {title}")
-        print(f"   Body: {body[:50]}...")
-        
         if not self.fcm_url or not fcm_token:
             print(f"❌ [FCM SEND] Missing URL or token")
             print(f"   fcm_url: {self.fcm_url}")
             print(f"   fcm_token: {'Present' if fcm_token else 'Missing'}")
             return False
-        
-        print(f"🔑 [FCM SEND] Getting access token...")
+
         access_token = self._get_access_token()
         if not access_token:
             print(f"❌ [FCM SEND] Failed to get access token")
             return False
-        
-        print(f"✅ [FCM SEND] Got access token: {access_token[:30]}...")
-        
+
         headers = {
             'Authorization': f'Bearer {access_token}',
             'Content-Type': 'application/json; charset=UTF-8',
@@ -1216,7 +1200,6 @@ class FirebaseDatabase:
             fcm_tokens = self.get_multiple_fcm_tokens(member_ids)
             
             if not fcm_tokens:
-                print(f"No FCM tokens found for group {group_id} members")
                 return
             
             # Truncate message if too long
@@ -1236,8 +1219,6 @@ class FirebaseDatabase:
                         'sender_name': sender_username
                     }
                 )
-                print(f"📊 Group notifications: {results['success']} sent, {results['failure']} failed")
-            
             threading.Thread(target=send_notifications_async, daemon=True).start()
             
         except Exception as e:
@@ -1317,7 +1298,6 @@ class FirebaseDatabase:
             response = requests.get(token_url)
             
             if response.status_code != 200 or not response.json():
-                print(f"No FCM token for user {user_id}")
                 return False
             
             fcm_token = response.json()
@@ -1388,37 +1368,25 @@ class FirebaseDatabase:
     
     def _send_private_chat_notification(self, chat_id, sender_id, sender_username, message_text):
         """Send FCM notification for private chat message"""
-        print(f"\n🔔 [FCM DEBUG] Starting notification send...")
-        print(f"   Chat ID: {chat_id}")
-        print(f"   Sender: {sender_username} ({sender_id})")
-        
         if not fcm_sender:
-            print("❌ [FCM DEBUG] fcm_sender is None - FCM not initialized!")
             return
-        
-        print(f"✅ [FCM DEBUG] fcm_sender exists")
         
         try:
             # Get both participants from chat ID
             user_ids = chat_id.split('_')
             recipient_id = user_ids[0] if user_ids[1] == sender_id else user_ids[1]
-            print(f"📱 [FCM DEBUG] Recipient ID: {recipient_id}")
             
             # Get recipient's FCM token
             recipient_token = self.get_fcm_token(recipient_id)
-            print(f"🔑 [FCM DEBUG] Recipient token: {recipient_token[:30] if recipient_token else 'None'}...")
-            
+
             if not recipient_token:
-                print(f"❌ [FCM DEBUG] No FCM token for user {recipient_id}")
                 return
             
             # Truncate message if too long
             body = message_text[:100] + "..." if len(message_text) > 100 else message_text
-            print(f"📝 [FCM DEBUG] Message body: {body[:50]}...")
             
             # Send notification in background thread
             def send_notification_async():
-                print(f"🚀 [FCM DEBUG] Calling fcm_sender.send_notification()...")
                 result = fcm_sender.send_notification(
                     fcm_token=recipient_token,
                     title=f"💬 {sender_username}",
@@ -1430,15 +1398,9 @@ class FirebaseDatabase:
                         'sender_name': sender_username
                     }
                 )
-                print(f"📊 [FCM DEBUG] Notification result: {result}")
-            
             threading.Thread(target=send_notification_async, daemon=True).start()
-            print(f"✅ [FCM DEBUG] Notification thread started\n")
-            
         except Exception as e:
-            print(f"❌ [FCM DEBUG] Error sending notification: {e}")
-            import traceback
-            traceback.print_exc()
+            pass
     
     def get_chat_status(self, chat_id):
         """Get chat request status"""
@@ -1603,28 +1565,16 @@ class FirebaseDatabase:
         Returns:
             bool: True if successful
         """
-        print(f"\n💾 [DB] save_fcm_token called")
-        print(f"   User ID: {user_id}")
-        print(f"   Token: {fcm_token[:30] if fcm_token else 'None'}...")
-        
         url = f"{self.database_url}/users/{user_id}/fcm_token.json?auth={self.auth_token}"
-        print(f"   URL: {url[:80]}...")
-        
+
         try:
             response = requests.put(url, json=fcm_token, timeout=10)
-            print(f"   Response status: {response.status_code}")
-            
+
             if response.status_code == 200:
-                print(f"✅ [DB] FCM token saved for user {user_id}")
                 return True
             else:
-                print(f"❌ [DB] Failed to save FCM token: {response.status_code}")
-                print(f"   Response: {response.text}")
                 return False
-        except Exception as e:
-            print(f"❌ [DB] Error saving FCM token: {e}")
-            import traceback
-            traceback.print_exc()
+        except Exception:
             return False
     
     def get_fcm_token(self, user_id):
@@ -1635,28 +1585,16 @@ class FirebaseDatabase:
         Returns:
             str: FCM token or None
         """
-        print(f"\n🔍 [DB] get_fcm_token called for user: {user_id}")
         url = f"{self.database_url}/users/{user_id}/fcm_token.json?auth={self.auth_token}"
-        print(f"   URL: {url[:80]}...")
-        
+
         try:
             response = requests.get(url, timeout=10)
-            print(f"   Response status: {response.status_code}")
-            
+
             if response.status_code == 200:
-                token = response.json()
-                if token:
-                    print(f"✅ [DB] Got FCM token: {token[:30]}...")
-                else:
-                    print(f"⚠️ [DB] No token in response (null)")
-                return token
+                return response.json()
             else:
-                print(f"❌ [DB] Failed to get token: {response.status_code}")
                 return None
-        except Exception as e:
-            print(f"❌ [DB] Error getting FCM token: {e}")
-            import traceback
-            traceback.print_exc()
+        except Exception:
             return None
     
     def get_multiple_fcm_tokens(self, user_ids):
@@ -2168,15 +2106,11 @@ def main(page: ft.Page):
         try:
             import time
             time.sleep(2)  # Wait for Flutter to be ready
-            
+
             # Try to get token from storage
-            token = page.client_storage.get("fcm_token")
-            if token:
-                print(f"✅ Found existing FCM token: {token[:20]}...")
-            else:
-                print("⏳ Waiting for FCM token from Flutter...")
-        except Exception as e:
-            print(f"⚠️ FCM init error: {e}")
+            page.client_storage.get("fcm_token")
+        except Exception:
+            pass
     
     # Run FCM init in background
     threading.Thread(target=init_fcm_on_startup, daemon=True).start()
@@ -2641,12 +2575,11 @@ def main(page: ft.Page):
         try:
             # Get FCM token from client storage (set by Flutter)
             fcm_token = get_fcm_token_from_file()
-            
+
             if fcm_token and auth.user_id:
                 db.store_fcm_token(auth.user_id, fcm_token)
-                print(f"✅ FCM token registered for user {auth.user_id}")
-        except Exception as e:
-            print(f"❌ FCM token registration error: {e}")
+        except Exception:
+            pass
     
     def send_otp_for_signin(e):
         if not signin_email_field.value:
@@ -3170,45 +3103,25 @@ def main(page: ft.Page):
             """Wait for FCM token from Flutter and save to Firebase."""
             import time
 
-            print("\n🔄 [TOKEN SAVER] Starting FCM token save process...")
-            print(f"   User ID: {auth.user_id}")
-            
             try:
                 max_attempts = 15     # e.g. try for ~30 seconds
                 delay_seconds = 2
 
                 for attempt in range(1, max_attempts + 1):
-                    print(f"🔍 [TOKEN SAVER] Attempt {attempt}/{max_attempts} - Reading token file...")
                     fcm_token = get_fcm_token_from_file()
 
                     if fcm_token:
-                        print(f"✅ [TOKEN SAVER] Got FCM token from FILE (attempt {attempt})")
-                        print(f"   Token preview: {fcm_token[:35]}...")
-                        print(f"   Token length: {len(fcm_token)}")
-
                         # Save token in background thread
                         def save_token():
-                            print(f"💾 [TOKEN SAVER] Calling db.save_fcm_token()...")
                             success = db.save_fcm_token(auth.user_id, fcm_token)
-                            if success:
-                                print(f"✅ [TOKEN SAVER] FCM token saved successfully!")
-                            else:
-                                print(f"❌ [TOKEN SAVER] Failed to save FCM token")
 
                         threading.Thread(target=save_token, daemon=True).start()
-                        print(f"🚀 [TOKEN SAVER] Save thread started\n")
                         return
 
-                    print(f"⚠️ [TOKEN SAVER] No FCM token found (attempt {attempt}/{max_attempts})")
                     time.sleep(delay_seconds)
 
-                print("❌ [TOKEN SAVER] FCM token not available after waiting 30 seconds")
-                print("   Check Flutter FCM initialization in logs")
-                
-            except Exception as e:
-                print(f"❌ [TOKEN SAVER] Error: {e}")
-                import traceback
-                traceback.print_exc()
+            except Exception:
+                pass
 
         # Save FCM token (async, doesn't block UI)
         threading.Thread(target=save_fcm_token_to_firebase, daemon=True).start()
@@ -5597,13 +5510,41 @@ def main(page: ft.Page):
             except Exception as ex:
                 print(f"[SWIPE NAV ERROR] {ex}")
 
+        async def _handle_refresh(e):
+            """Show pull-to-refresh animation and reload current tab"""
+            try:
+                refresh_current_tab()
+                page.update()
+            except Exception as ex:
+                print(f"[REFRESH INDICATOR] {ex}")
+
+        # Animated switcher for smooth tab transitions
+        slide_transition = getattr(ft.AnimatedSwitcherTransition, "SLIDE", None)
+        if slide_transition is None:
+            slide_transition = getattr(ft.AnimatedSwitcherTransition, "SLIDE_LEFT", None) or getattr(
+                ft.AnimatedSwitcherTransition, "SLIDE_RIGHT", None
+            )
+        if slide_transition is None:
+            slide_transition = ft.AnimatedSwitcherTransition.FADE
+
+        # Provide an initial placeholder so AnimatedSwitcher initializes without errors
+        main_switcher = ft.AnimatedSwitcher(
+            transition=slide_transition,
+            duration=400,
+            switch_in_curve=ft.AnimationCurve.EASE_IN_OUT,
+            switch_out_curve=ft.AnimationCurve.EASE_IN_OUT,
+            expand=True,
+            content=ft.Container(),
+        )
+
         def set_main_content(view):
             """Wrap main content with swipe and pull-to-refresh detectors"""
-            main_area.content = ft.GestureDetector(
+            tab_view = ft.Container(
+                key=f"tab-{selected_index}",
                 content=view,
-                on_pan_end=_handle_pan_end,
-                on_vertical_drag_end=refresh_current_tab,
+                expand=True,
             )
+            main_switcher.content = tab_view
 
         def refresh_screen():
             """Optimized screen switching with smart caching"""
@@ -5639,7 +5580,16 @@ def main(page: ft.Page):
                 print(f"Tab switch error: {e}")
 
         # Initialize main area with first screen content BEFORE adding to page
-        main_area = ft.Container(expand=True)
+        main_area = ft.Container(
+            expand=True,
+            content=ft.RefreshIndicator(
+                on_refresh=_handle_refresh,
+                child=ft.GestureDetector(
+                    content=main_switcher,
+                    on_pan_end=_handle_pan_end,
+                ),
+            ),
+        )
         set_main_content(screen_promoter)
 
         # FINAL PAGE LAYOUT (add offline banner)
