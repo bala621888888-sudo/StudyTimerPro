@@ -59,6 +59,7 @@ import smtplib
 import sys
 import traceback
 import queue
+from secrets_util import get_secret, get_encrypted_gspread_client
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
@@ -1757,7 +1758,13 @@ def _load_gsheet_creds_json():
             print("✅ Loaded Google Sheets creds from env")
             return env_val
 
-        # 2) Assets file (for mobile APK)
+        # 2) Secret Manager (via secrets_util)
+        secret_val = get_secret("GCP_GSHEET_CREDS")
+        if secret_val and secret_val.strip():
+            print("✅ Loaded Google Sheets creds from Secret Manager")
+            return secret_val
+
+        # 3) Assets file (for mobile APK)
         assets_dir = os.environ.get("FLET_ASSETS_DIR") or "assets"
         candidates = [
             os.path.join(assets_dir, "gsheet_creds.json"),
@@ -1790,6 +1797,11 @@ def _load_gsheet_sheet_id():
         if env_val and env_val.strip():
             print("✅ Loaded Google Sheet ID from env")
             return env_val.strip()
+
+        secret_val = get_secret("GOOGLE_SHEET_ID")
+        if secret_val and secret_val.strip():
+            print("✅ Loaded Google Sheet ID from Secret Manager")
+            return secret_val.strip()
 
         assets_dir = os.environ.get("FLET_ASSETS_DIR") or "assets"
         candidates = [
@@ -1832,11 +1844,16 @@ class GoogleSheetsManager:
     def _initialize_client(self):
         """Initialize gspread client with service account credentials"""
         try:
+            # Prefer shared client that supports Secret Manager
+            self.client = get_encrypted_gspread_client()
+            if self.client:
+                print("✅ Google Sheets client initialized via secrets_util")
+                return
+
             import gspread
             from google.oauth2.service_account import Credentials
-            
-            # Get credentials from environment
-            # Get credentials from env or assets
+
+            # Get credentials from environment or assets
             creds_json = _load_gsheet_creds_json()
             if not creds_json:
                 print("⚠️ GCP_GSHEET_CREDS not found (env or assets)")
@@ -1844,20 +1861,20 @@ class GoogleSheetsManager:
 
             # Parse credentials
             creds_dict = json.loads(creds_json)
-            
+
             # Define required scopes
             scopes = [
                 'https://www.googleapis.com/auth/spreadsheets',
                 'https://www.googleapis.com/auth/drive'
             ]
-            
+
             # Create credentials
             credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-            
+
             # Initialize gspread client
             self.client = gspread.authorize(credentials)
-            print("✅ Google Sheets client initialized")
-            
+            print("✅ Google Sheets client initialized from raw credentials")
+
         except Exception as e:
             print(f"❌ Google Sheets init error: {e}")
             self.client = None
@@ -1943,75 +1960,81 @@ class GoogleSheetsManager:
             
             # Get all values
             all_values = worksheet.get_all_values()
-            
+
             if len(all_values) < 2:
                 return None
-            
+
+            # Map headers to indexes so we can handle column order changes
+            header = [h.strip().lower() for h in all_values[0]] if all_values else []
+
+            def find_index(possible_names, fallback_index):
+                for name in possible_names:
+                    if name in header:
+                        return header.index(name)
+                return fallback_index
+
+            referral_idx = find_index(["referral_id", "referral id"], 4)
+            installs_idx = find_index(["install_count", "install count", "installs"], 12)
+            subscription_idx = find_index(["subscription_count", "subscription count", "subscriptions"], 14)
+            subscribers_idx = find_index(["subscribed_users", "subscribers", "subscribed users"], 15)
+            earnings_idx = find_index(["total_earnings", "total earnings", "earnings"], 16)
+            paid_idx = find_index(["paid_amount", "paid amount", "paid"], 17)
+
             # Find referral_id in the worksheet
             for row_idx, row in enumerate(all_values[1:], start=2):
-                if len(row) >= 18:  # Ensure row has enough columns
-                    # Check if this row matches our referral_id
-                    # Assuming referral_id is in a column - need to find which one
-                    # Let's check column E (index 4) first
-                    row_referral_id = row[4].strip() if len(row) > 4 else ""
-                    
-                    if row_referral_id == referral_id:
-                        # Extract data from specific columns
-                        # Column G (index 6): Date_Joined
-                        # Column I (index 8): Referred_Users
-                        # Column M (index 12): Install_Count
-                        # Column O (index 14): Subscription_Count
-                        # Column Q (index 16): Total_Earnings
-                        # Column R (index 17): Paid_Amount
-                        
-                        try:
-                            earnings = float(row[16]) if len(row) > 16 and row[16] else 0.0
-                        except:
-                            earnings = 0.0
-                        
-                        try:
-                            paid = float(row[17]) if len(row) > 17 and row[17] else 0.0
-                        except:
-                            paid = 0.0
-                        
-                        pending = earnings - paid
-                        
-                        try:
-                            installs = int(row[12]) if len(row) > 12 and row[12] else 0
-                        except:
-                            installs = 0
-                        
-                        try:
-                            subscriptions = int(row[14]) if len(row) > 14 and row[14] else 0
-                        except:
-                            subscriptions = 0
-                        
-                        # Parse Subscribed_Users (Column P, index 15) - format: "user1,user2,user3,..."
-                        subscribers = []
-                        subscribed_users_str = row[15] if len(row) > 15 else ""
-                        print(f"🔍 Reading subscribers from Column P: '{subscribed_users_str}'")
-                        
-                        if subscribed_users_str:
-                            user_entries = subscribed_users_str.split(',')
-                            for entry in user_entries:
-                                username = entry.strip()
-                                if username:  # Only add non-empty usernames
-                                    subscribers.append({
-                                        'username': username
-                                    })
-                        
-                        print(f"✅ Parsed {len(subscribers)} subscribers: {[s['username'] for s in subscribers]}")
-                        
-                        return {
-                            'earnings': earnings,
-                            'paid': paid,
-                            'pending': pending,
-                            'installs': installs,
-                            'subscriptions': subscriptions,
-                            'subscribers': subscribers
-                        }
-            
+                # Check if this row matches our referral_id using the mapped column
+                row_referral_id = row[referral_idx].strip() if len(row) > referral_idx else ""
+
+                if row_referral_id == referral_id:
+                    try:
+                        earnings = float(row[earnings_idx]) if len(row) > earnings_idx and row[earnings_idx] else 0.0
+                    except:
+                        earnings = 0.0
+
+                    try:
+                        paid = float(row[paid_idx]) if len(row) > paid_idx and row[paid_idx] else 0.0
+                    except:
+                        paid = 0.0
+
+                    pending = earnings - paid
+
+                    try:
+                        installs = int(row[installs_idx]) if len(row) > installs_idx and row[installs_idx] else 0
+                    except:
+                        installs = 0
+
+                    try:
+                        subscriptions = int(row[subscription_idx]) if len(row) > subscription_idx and row[subscription_idx] else 0
+                    except:
+                        subscriptions = 0
+
+                    # Parse Subscribed_Users - supports comma or newline separated values
+                    subscribers = []
+                    subscribed_users_str = row[subscribers_idx] if len(row) > subscribers_idx else ""
+                    print(f"🔍 Reading subscribers from index {subscribers_idx}: '{subscribed_users_str}'")
+
+                    if subscribed_users_str:
+                        user_entries = subscribed_users_str.replace("\n", ",").split(',')
+                        for entry in user_entries:
+                            username = entry.strip()
+                            if username:  # Only add non-empty usernames
+                                subscribers.append({
+                                    'username': username
+                                })
+
+                    print(f"✅ Parsed {len(subscribers)} subscribers: {[s['username'] for s in subscribers]}")
+
+                    return {
+                        'earnings': earnings,
+                        'paid': paid,
+                        'pending': pending,
+                        'installs': installs,
+                        'subscriptions': subscriptions,
+                        'subscribers': subscribers
+                    }
+
             # Referral ID not found
+            print(f"⚠️ Referral ID {referral_id} not found in referral_program sheet")
             return None
             
         except Exception as e:
