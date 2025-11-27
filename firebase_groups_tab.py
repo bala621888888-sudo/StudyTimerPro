@@ -11,6 +11,8 @@ import json
 import threading
 import time
 import os
+import platform
+import uuid
 from secrets_util import get_secret
 from cryptography.fernet import Fernet
 import webbrowser
@@ -236,6 +238,11 @@ class ModernGroupsTab:
         self.notebook = notebook
         self.parent = notebook.master
 
+        # --- Stable device fingerprint for identity recovery ---
+        self.machine_fingerprint = (profile_data or {}).get("machine_fingerprint") or self._generate_machine_fingerprint()
+        if profile_data is not None and "machine_fingerprint" not in profile_data and self.machine_fingerprint:
+            profile_data["machine_fingerprint"] = self.machine_fingerprint
+
         # --- Get user_id safely ---
         self.user_id = None
         if profile_data and profile_data.get("user_id"):
@@ -247,9 +254,13 @@ class ModernGroupsTab:
         if not self.user_id or str(self.user_id).lower() == "none":
             print("⚠ user_id missing or invalid, using fallback.")
             try:
-                self.user_id = (profile_data.get("user_id") if profile_data else None) or user_id
+                self.user_id = (profile_data.get("user_id") if profile_data else None) or self.machine_fingerprint or user_id
             except Exception:
-                self.user_id = user_id
+                self.user_id = self.machine_fingerprint or user_id
+
+        # If we still don't have a user_id, rely on the machine fingerprint to keep membership intact
+        if not self.user_id and self.machine_fingerprint:
+            self.user_id = self.machine_fingerprint
 
         # ✅ Clean user_id globally
         if isinstance(self.user_id, str):
@@ -307,9 +318,20 @@ class ModernGroupsTab:
         except Exception as e:
             print(f"⚠️ Notification system disabled: {e}")
             self.notification_system = None
-        
-    
-        
+
+
+    def _generate_machine_fingerprint(self):
+        """Generate a stable machine fingerprint for group identity"""
+        try:
+            system_info = f"{platform.system()}-{platform.machine()}-{platform.processor()}"
+            hostname = platform.node()
+            fingerprint_data = f"{system_info}-{hostname}"
+            return hashlib.md5(fingerprint_data.encode()).hexdigest()[:16]
+        except Exception as e:
+            print(f"⚠️ Failed to generate machine fingerprint: {e}")
+            return str(uuid.uuid4())[:16]
+
+
     def clear_plan_selection(self):
         """Clear plan selection to show all members again"""
         self.selected_plan_for_members = None
@@ -854,6 +876,29 @@ class ModernGroupsTab:
             'hover': '#E8F4F8',
             'shadow': '#00000010'
         }
+
+    def _create_soft_button(self, parent, text, fg, command, bg=None, hover_bg=None,
+                             font=None, padding=(10, 4)):
+        """Create a slim, pill-like label button with hover effect."""
+        base_bg = bg or '#F4F6FB'
+        hover_bg = hover_bg or '#E8ECF4'
+        btn = tk.Label(
+            parent,
+            text=text,
+            font=font or ('Segoe UI', 9),
+            bg=base_bg,
+            fg=fg,
+            padx=padding[0],
+            pady=padding[1],
+            cursor='hand2',
+            bd=0,
+            relief='flat'
+        )
+        btn.bind("<Enter>", lambda e: btn.config(bg=hover_bg))
+        btn.bind("<Leave>", lambda e: btn.config(bg=base_bg))
+        if command:
+            btn.bind('<Button-1>', lambda e: command())
+        return btn
         
     def setup_ui(self):
         """Setup modern 3-column layout"""
@@ -1508,7 +1553,19 @@ class ModernGroupsTab:
             font=('Segoe UI', 12, 'bold'),
             bg=self.colors['secondary'],
             fg='white'
-        ).pack(anchor='center', pady=10)
+        ).pack(side=tk.LEFT, padx=12)
+
+        chat_refresh = self._create_soft_button(
+            header,
+            "🔄 Refresh",
+            'white',
+            self._reload_chat_messages,
+            bg='#6BD18B',
+            hover_bg='#5BC47D',
+            font=('Segoe UI', 9, 'bold'),
+            padding=(10, 4)
+        )
+        chat_refresh.pack(side=tk.RIGHT, padx=12, pady=8)
 
         # ===== Messages Area =====
         messages_area = tk.Frame(chat_container, bg='white')
@@ -2322,6 +2379,29 @@ class ModernGroupsTab:
         tk.Label(name_row, text=group_name, font=('Segoe UI', 18, 'bold'),
                  bg=header_bg_color, fg=self.colors['dark']).pack(side=tk.LEFT)
 
+        # Always show online status as right-aligned free text
+        online_count = self.get_online_members_count(self.current_group)
+        online_label = tk.Label(
+            name_row,
+            text=f"🟢 Online ({online_count})",
+            font=('Segoe UI', 9),
+            bg=header_bg_color,
+            fg='#00CC66'
+        )
+        online_label.pack(side=tk.RIGHT)
+
+        # Manual refresh for the entire groups tab
+        refresh_btn = self._create_soft_button(
+            name_row,
+            "🔄 Refresh",
+            self.colors['secondary'],
+            self.refresh_groups_tab,
+            bg='#E8F5E9',
+            hover_bg='#D5EFE0',
+            font=('Segoe UI', 9, 'bold'),
+            padding=(8, 3)
+        )
+        refresh_btn.pack(side=tk.RIGHT, padx=(0, 8))
 
         # ✅ EXIT BUTTON (non-creators only)
         if self.user_id != created_by:
@@ -2336,41 +2416,512 @@ class ModernGroupsTab:
         tk.Label(desc_frame, text=group_desc, font=('Segoe UI', 10),
                  bg=self.colors['bg'], fg=self.colors['dark'],
                  wraplength=600, justify=tk.LEFT).pack(padx=15, pady=15)
-        
+
         # ✅ ADMIN OPTIONS
         if self.is_admin(self.current_group):
-            edit_btn = tk.Label(name_row, text="✏ Edit", font=('Segoe UI', 9),
-                                bg=header_bg_color, fg=self.colors['primary'], cursor='hand2')
+            edit_btn = self._create_soft_button(
+                name_row,
+                "✏ Edit",
+                self.colors['primary'],
+                self.edit_group_info,
+                padding=(8, 3)
+            )
             edit_btn.pack(side=tk.LEFT, padx=(10, 0))
-            edit_btn.bind('<Button-1>', lambda e: self.edit_group_info())
 
-            share_btn = tk.Label(name_row, text="🔗 Share", font=('Segoe UI', 9),
-                                 bg=header_bg_color, fg=self.colors['secondary'], cursor='hand2')
+            share_btn = self._create_soft_button(
+                name_row,
+                "🔗 Share",
+                self.colors['secondary'],
+                self.share_invite_link,
+                padding=(8, 3)
+            )
             share_btn.pack(side=tk.LEFT, padx=(10, 0))
-            share_btn.bind('<Button-1>', lambda e: self.share_invite_link())
-            
-            # ✅ ONLINE MEMBERS COUNT
-            online_count = self.get_online_members_count(self.current_group)
-            online_label = tk.Label(name_row, text=f"🟢 Online ({online_count})", 
-                                   font=('Segoe UI', 9, 'bold'),
-                                   bg=header_bg_color, fg='#00CC66')
-            online_label.pack(side=tk.LEFT, padx=(10, 0))
-            
+
             # ✅ NOTIFY ALL BUTTON (Admin only)
-            notify_btn = tk.Label(name_row, text="📢 Notify All", 
-                                 font=('Segoe UI', 9, 'bold'),
-                                 bg=header_bg_color, fg='#9B59B6', cursor='hand2')
+            notify_btn = self._create_soft_button(
+                name_row,
+                "📢 Notify All",
+                '#9B59B6',
+                self.notify_all_members,
+                font=('Segoe UI', 9, 'bold'),
+                padding=(8, 3)
+            )
             notify_btn.pack(side=tk.LEFT, padx=(10, 0))
-            notify_btn.bind('<Button-1>', lambda e: self.notify_all_members())
             
             # ✅ JOIN REQUESTS BUTTON
             pending_count = len(group_data.get('pending_requests', {}))
             if pending_count > 0:
-                requests_btn = tk.Label(name_row, text=f"📩 Requests ({pending_count})", 
+                requests_btn = tk.Label(name_row, text=f"📩 Requests ({pending_count})",
                                        font=('Segoe UI', 9),
                                        bg=header_bg_color, fg=self.colors['accent'], cursor='hand2')
                 requests_btn.pack(side=tk.LEFT, padx=(10, 0))
                 requests_btn.bind('<Button-1>', lambda e: self.show_join_requests())
+
+        # ✅ LIBRARY BUTTON (visible to all members)
+        library_btn = self._create_soft_button(
+            name_row,
+            "📚 Library",
+            self.colors['dark'],
+            self.open_library_window,
+            padding=(8, 3),
+            font=('Segoe UI', 9, 'bold')
+        )
+        library_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+    def is_admin_or_creator(self):
+        """Check if current user is admin or creator for the active group."""
+        if not self.current_group:
+            return False
+        return self.is_creator(self.current_group) or self.is_admin(self.current_group)
+
+    def open_library_window(self):
+        """Open the shared group library for all members."""
+        if not self.current_group:
+            return
+
+        try:
+            if hasattr(self, 'library_window') and self.library_window.winfo_exists():
+                self.library_window.lift()
+                self.render_library_lists()
+                return
+        except Exception:
+            pass
+
+        window = tk.Toplevel(self.parent)
+        window.title("Group Library")
+        window.geometry("780x620")
+        window.transient(self.parent)
+        window.configure(bg=self.colors['light'])
+        self.library_window = window
+        self.library_image_cache = {}
+
+        def on_close():
+            try:
+                if hasattr(self, 'library_window'):
+                    delattr(self, 'library_window')
+                if hasattr(self, 'library_body_frame'):
+                    delattr(self, 'library_body_frame')
+                if hasattr(self, 'library_approved_frame'):
+                    delattr(self, 'library_approved_frame')
+                if hasattr(self, 'library_pending_frame'):
+                    delattr(self, 'library_pending_frame')
+            except Exception:
+                pass
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", on_close)
+
+        header = tk.Frame(window, bg=self.colors['primary'])
+        header.pack(fill=tk.X)
+
+        tk.Label(header, text="📚 Group Library", font=('Segoe UI', 14, 'bold'),
+                 bg=self.colors['primary'], fg='white').pack(side=tk.LEFT, padx=15, pady=12)
+
+        add_btn = tk.Button(header, text="➕ Add Material", font=('Segoe UI', 10, 'bold'),
+                            bg=self.colors['secondary'], fg='white', relief='flat', padx=15, pady=6,
+                            cursor='hand2', command=self.show_add_library_dialog)
+        add_btn.pack(side=tk.RIGHT, padx=15, pady=10)
+
+        # Scrollable body
+        body_container = tk.Frame(window, bg=self.colors['light'])
+        body_container.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(body_container, bg=self.colors['light'], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(body_container, orient="vertical", command=canvas.yview)
+        self.library_body_frame = tk.Frame(canvas, bg=self.colors['light'])
+
+        frame_window = canvas.create_window((0, 0), window=self.library_body_frame, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        self.library_body_frame.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind('<Configure>', lambda e: canvas.itemconfig(frame_window, width=e.width))
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Approved and pending sections
+        self.library_approved_frame = tk.Frame(self.library_body_frame, bg=self.colors['light'])
+        self.library_approved_frame.pack(fill=tk.X, padx=15, pady=(10, 5))
+
+        self.library_pending_frame = tk.Frame(self.library_body_frame, bg=self.colors['light'])
+        self.library_pending_frame.pack(fill=tk.X, padx=15, pady=(5, 15))
+
+        self.render_library_lists()
+
+    def render_library_lists(self):
+        """Render approved materials and pending approvals."""
+        if not self.current_group or not getattr(self, 'library_body_frame', None):
+            return
+
+        for frame in [self.library_approved_frame, self.library_pending_frame]:
+            for widget in frame.winfo_children():
+                widget.destroy()
+
+        tk.Label(self.library_approved_frame, text="✅ Approved Materials", font=('Segoe UI', 12, 'bold'),
+                 bg=self.colors['light'], fg=self.colors['dark']).pack(anchor='w', pady=(0, 8))
+
+        library_data = {}
+        if self.db_ref:
+            try:
+                library_data = self.db_ref.child(f'studyGroups/{self.current_group}/library').get() or {}
+            except Exception as e:
+                tk.Label(self.library_approved_frame, text=f"Error loading library: {e}",
+                         font=('Segoe UI', 9), bg=self.colors['light'], fg=self.colors['accent']).pack(anchor='w', pady=5)
+                return
+
+        approved_items = []
+        pending_items = []
+        for item_id, item in library_data.items():
+            if item.get('status', 'approved') == 'pending':
+                pending_items.append((item_id, item))
+            else:
+                approved_items.append((item_id, item))
+
+        def _sort_items(items):
+            def parse_time(ts):
+                try:
+                    return datetime.fromisoformat(ts)
+                except Exception:
+                    return datetime.min
+
+            return sorted(
+                items,
+                key=lambda pair: (
+                    0 if pair[1].get('pinned') else 1,
+                    -parse_time(pair[1].get('uploaded_at', '')).timestamp()
+                )
+            )
+
+        if approved_items:
+            for item_id, item in _sort_items(approved_items):
+                self.create_library_item(self.library_approved_frame, item_id, item, approved=True)
+        else:
+            tk.Label(self.library_approved_frame, text="No approved materials yet.",
+                     font=('Segoe UI', 9), bg=self.colors['light'], fg=self.colors['gray']).pack(anchor='w', pady=5)
+
+        # Pending section
+        tk.Label(self.library_pending_frame, text="⏳ Pending Approval", font=('Segoe UI', 12, 'bold'),
+                 bg=self.colors['light'], fg=self.colors['dark']).pack(anchor='w', pady=(10, 8))
+
+        if pending_items:
+            for item_id, item in pending_items:
+                self.create_library_item(self.library_pending_frame, item_id, item, approved=False)
+        else:
+            tk.Label(self.library_pending_frame, text="No pending submissions.",
+                     font=('Segoe UI', 9), bg=self.colors['light'], fg=self.colors['gray']).pack(anchor='w', pady=5)
+
+    def create_library_item(self, parent, item_id, item_data, approved=True):
+        """Render a single library entry."""
+        card = tk.Frame(parent, bg='white', relief='solid', borderwidth=1)
+        card.pack(fill=tk.X, pady=4)
+
+        inner = tk.Frame(card, bg='white')
+        inner.pack(fill=tk.X, padx=10, pady=8)
+
+        icon_map = {'pdf': '📕', 'link': '🔗', 'image': '🖼️', 'file': '📎'}
+        preview_container = tk.Frame(inner, bg='white')
+        preview_container.pack(side=tk.LEFT, padx=(0, 8))
+
+        preview_rendered = False
+        if item_data.get('type') == 'image' and item_data.get('url'):
+            try:
+                if not hasattr(self, 'library_image_cache'):
+                    self.library_image_cache = {}
+                cached = self.library_image_cache.get(item_data['url'])
+                if not cached:
+                    response = requests.get(item_data['url'], timeout=8)
+                    response.raise_for_status()
+                    image = Image.open(BytesIO(response.content))
+                    image.thumbnail((72, 72))
+                    cached = ImageTk.PhotoImage(image)
+                    self.library_image_cache[item_data['url']] = cached
+                img_label = tk.Label(preview_container, image=cached, bg='white')
+                img_label.image = cached
+                img_label.pack()
+                preview_rendered = True
+            except Exception as e:
+                print(f"⚠️ Failed to render image preview: {e}")
+
+        if not preview_rendered:
+            icon = icon_map.get(item_data.get('type', 'file'), '📎')
+            tk.Label(preview_container, text=icon, font=('Segoe UI', 14), bg='white').pack()
+
+        text_frame = tk.Frame(inner, bg='white')
+        text_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        name = item_data.get('name', 'Untitled')
+        uploader = item_data.get('uploader_name', 'Unknown')
+        status = item_data.get('status', 'approved')
+        uploaded_at = item_data.get('uploaded_at', '')
+
+        tk.Label(text_frame, text=name, font=('Segoe UI', 10, 'bold'), bg='white', anchor='w').pack(fill=tk.X)
+        detail_text = f"By {uploader}"
+        if uploaded_at:
+            detail_text += f" • {uploaded_at.split('T')[0]}"
+        if not approved:
+            detail_text += " • Pending"
+        tk.Label(text_frame, text=detail_text, font=('Segoe UI', 9), bg='white', fg=self.colors['gray']).pack(anchor='w')
+
+        meta_frame = tk.Frame(text_frame, bg='white')
+        meta_frame.pack(anchor='w', pady=(4, 0))
+
+        tk.Label(meta_frame, text=f"Type: {item_data.get('type', 'file').capitalize()}",
+                 font=('Segoe UI', 8, 'bold'), bg=self.colors['light'],
+                 fg=self.colors['dark'], padx=6, pady=2).pack(side=tk.LEFT, padx=(0, 6))
+
+        if item_data.get('pinned'):
+            tk.Label(meta_frame, text="📌 Pinned", font=('Segoe UI', 8, 'bold'),
+                     bg=self.colors['secondary'], fg='white', padx=6, pady=2).pack(side=tk.LEFT, padx=(0, 6))
+
+        views = item_data.get('views', 0)
+        tk.Label(meta_frame, text=f"👁️ {views}", font=('Segoe UI', 8), bg=self.colors['light'],
+                 fg=self.colors['dark'], padx=6, pady=2).pack(side=tk.LEFT)
+
+        # Actions
+        actions = tk.Frame(inner, bg='white')
+        actions.pack(side=tk.RIGHT, anchor='e')
+
+        button_row = tk.Frame(actions, bg='white')
+        button_row.pack(anchor='e')
+
+        open_btn = tk.Label(button_row, text="Open", font=('Segoe UI', 9, 'bold'),
+                            bg=self.colors['primary'], fg='white', cursor='hand2', padx=10, pady=4)
+        open_btn.pack(side=tk.LEFT, padx=4, pady=2)
+        open_btn.bind('<Button-1>', lambda e, data=item_data, iid=item_id: self.open_material(data, iid))
+
+        download_btn = tk.Label(button_row, text="Download", font=('Segoe UI', 9),
+                                bg=self.colors['secondary'], fg='white', cursor='hand2', padx=10, pady=4)
+        download_btn.pack(side=tk.LEFT, padx=4, pady=2)
+        download_btn.bind('<Button-1>', lambda e, data=item_data: self.download_material(data))
+
+        if self.is_admin_or_creator():
+            if approved:
+                pin_text = "Unpin" if item_data.get('pinned') else "Pin"
+                pin_btn = tk.Label(button_row, text=pin_text, font=('Segoe UI', 9),
+                                   bg=self.colors['secondary'], fg='white', cursor='hand2', padx=10, pady=4)
+                pin_btn.pack(side=tk.LEFT, padx=4, pady=2)
+                pin_btn.bind('<Button-1>', lambda e, iid=item_id, current=item_data.get('pinned', False):
+                             self.toggle_library_pin(iid, not current))
+
+                remove_btn = tk.Label(button_row, text="Remove", font=('Segoe UI', 9),
+                                      bg=self.colors['accent'], fg='white', cursor='hand2', padx=10, pady=4)
+                remove_btn.pack(side=tk.LEFT, padx=4, pady=2)
+                remove_btn.bind('<Button-1>', lambda e, iid=item_id: self.remove_library_item(iid))
+            else:
+                approve_btn = tk.Label(button_row, text="Approve", font=('Segoe UI', 9, 'bold'),
+                                       bg=self.colors['secondary'], fg='white', cursor='hand2', padx=10, pady=4)
+                approve_btn.pack(side=tk.LEFT, padx=4, pady=2)
+                approve_btn.bind('<Button-1>', lambda e, iid=item_id: self.update_library_status(iid, 'approved'))
+
+                reject_btn = tk.Label(button_row, text="Reject", font=('Segoe UI', 9),
+                                      bg=self.colors['accent'], fg='white', cursor='hand2', padx=10, pady=4)
+                reject_btn.pack(side=tk.LEFT, padx=4, pady=2)
+                reject_btn.bind('<Button-1>', lambda e, iid=item_id: self.remove_library_item(iid))
+        else:
+            if not approved:
+                tk.Label(button_row, text="Awaiting approval", font=('Segoe UI', 8),
+                         bg='white', fg=self.colors['gray'], padx=6).pack(side=tk.LEFT, padx=4, pady=2)
+
+    def show_add_library_dialog(self):
+        """Dialog for adding new library material."""
+        if not self.current_group:
+            return
+
+        dialog = tk.Toplevel(self.library_window if hasattr(self, 'library_window') else self.parent)
+        dialog.title("Add Library Material")
+        dialog.geometry("420x360")
+        dialog.transient(self.parent)
+        dialog.grab_set()
+
+        tk.Label(dialog, text="Material Name", font=('Segoe UI', 10, 'bold')).pack(anchor='w', padx=20, pady=(20, 5))
+        name_entry = ttk.Entry(dialog, width=40)
+        name_entry.pack(padx=20, fill=tk.X)
+
+        tk.Label(dialog, text="Type", font=('Segoe UI', 10, 'bold')).pack(anchor='w', padx=20, pady=(15, 5))
+        type_var = tk.StringVar(value='file')
+        type_combo = ttk.Combobox(dialog, textvariable=type_var, values=['file', 'pdf', 'image', 'link'], state='readonly')
+        type_combo.pack(padx=20, fill=tk.X)
+
+        link_frame = tk.Frame(dialog)
+        link_frame.pack(fill=tk.X, padx=20, pady=(15, 5))
+        tk.Label(link_frame, text="URL (for links)", font=('Segoe UI', 10, 'bold')).pack(anchor='w')
+        url_entry = ttk.Entry(link_frame, width=40)
+        url_entry.pack(fill=tk.X, pady=(5, 0))
+
+        file_frame = tk.Frame(dialog)
+        file_frame.pack(fill=tk.X, padx=20, pady=(10, 5))
+        file_path_var = tk.StringVar()
+
+        tk.Label(file_frame, text="File (any type)", font=('Segoe UI', 10, 'bold')).pack(anchor='w')
+        file_row = tk.Frame(file_frame)
+        file_row.pack(fill=tk.X, pady=(5, 0))
+        file_entry = ttk.Entry(file_row, textvariable=file_path_var, width=30)
+        file_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def browse_file():
+            filetypes = [("All files", "*.*")]
+            path = filedialog.askopenfilename(title="Select file", filetypes=filetypes)
+            if path:
+                file_path_var.set(path)
+
+        ttk.Button(file_row, text="Browse", command=browse_file).pack(side=tk.LEFT, padx=5)
+
+        def save_material():
+            name = name_entry.get().strip()
+            selected_type = type_var.get()
+            url = url_entry.get().strip()
+            status = 'approved' if self.is_admin_or_creator() else 'pending'
+
+            if not name:
+                messagebox.showerror("Error", "Please provide a name for the material.")
+                return
+
+            material_url = None
+
+            if selected_type == 'link':
+                if not url:
+                    messagebox.showerror("Error", "Please provide a URL for the link.")
+                    return
+                material_url = url
+            else:
+                if not self.storage_bucket:
+                    messagebox.showerror("Error", "Storage not available for file uploads.")
+                    return
+                path = file_path_var.get()
+                if not path or not os.path.exists(path):
+                    messagebox.showerror("Error", "Please choose a file to upload.")
+                    return
+                try:
+                    file_size_mb = os.path.getsize(path) / (1024 * 1024)
+                    if file_size_mb > 5:
+                        messagebox.showerror("Error", "File must be 5 MB or smaller.")
+                        return
+                except Exception:
+                    messagebox.showerror("Error", "Unable to read file size.")
+                    return
+
+                filename = os.path.basename(path)
+                progress_dialog = self._show_progress_dialog(dialog, f"Uploading {filename}...")
+
+                def perform_upload():
+                    upload_error = None
+                    upload_url = None
+                    try:
+                        blob_path = f'groups/{self.current_group}/library/{int(time.time())}_{filename}'
+                        blob = self.storage_bucket.blob(blob_path)
+                        blob.upload_from_filename(path)
+                        blob.make_public()
+                        upload_url = blob.public_url
+                    except Exception as e:
+                        upload_error = e
+
+                    def finalize():
+                        if progress_dialog and progress_dialog.winfo_exists():
+                            progress_dialog.destroy()
+                        if upload_error:
+                            messagebox.showerror("Error", f"Failed to upload file: {upload_error}")
+                            return
+                        self._save_library_entry(name, selected_type, upload_url, status, dialog)
+
+                    dialog.after(0, finalize)
+
+                threading.Thread(target=perform_upload, daemon=True).start()
+                return
+
+            self._save_library_entry(name, selected_type, material_url, status, dialog)
+
+        btn_frame = tk.Frame(dialog)
+        btn_frame.pack(pady=20)
+        tk.Button(btn_frame, text="Save", bg=self.colors['secondary'], fg='white', relief='flat',
+                 padx=20, command=save_material).pack(side=tk.LEFT, padx=8)
+        tk.Button(btn_frame, text="Cancel", bg=self.colors['gray'], fg='white', relief='flat',
+                 padx=20, command=dialog.destroy).pack(side=tk.LEFT, padx=8)
+
+    def _save_library_entry(self, name, selected_type, material_url, status, dialog):
+        """Persist a new library entry and refresh UI."""
+        try:
+            entry = {
+                'name': name,
+                'type': selected_type,
+                'url': material_url,
+                'uploaded_by': self.user_id,
+                'uploader_name': self.get_user_name(),
+                'uploaded_at': datetime.now().isoformat(),
+                'status': status,
+                'pinned': False,
+                'views': 0
+            }
+            ref = self.db_ref.child(f'studyGroups/{self.current_group}/library').push()
+            ref.set(entry)
+            if dialog and dialog.winfo_exists():
+                dialog.destroy()
+            self.refresh_group_data()
+            self.render_library_lists()
+            if status == 'pending':
+                messagebox.showinfo("Submitted", "Your material is pending approval by an admin or creator.")
+            else:
+                messagebox.showinfo("Added", "Material added to the library.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save material: {e}")
+
+    def _show_progress_dialog(self, parent, message):
+        """Show an indeterminate progress dialog while a task runs."""
+        dialog = tk.Toplevel(parent)
+        dialog.title("Please wait")
+        dialog.geometry("320x140")
+        dialog.transient(parent)
+        dialog.grab_set()
+
+        tk.Label(dialog, text=message, font=('Segoe UI', 10, 'bold')).pack(pady=(20, 10))
+        bar = ttk.Progressbar(dialog, mode='indeterminate', length=240)
+        bar.pack(pady=(0, 10))
+        bar.start(10)
+
+        tk.Label(dialog, text="This may take a few seconds...", font=('Segoe UI', 9), fg=self.colors['gray']).pack()
+        return dialog
+
+    def update_library_status(self, item_id, status):
+        """Approve or update status for a library item."""
+        if not self.current_group or not self.db_ref:
+            return
+        try:
+            self.db_ref.child(f'studyGroups/{self.current_group}/library/{item_id}/status').set(status)
+            self.refresh_group_data()
+            self.render_library_lists()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to update status: {e}")
+
+    def toggle_library_pin(self, item_id, should_pin):
+        """Toggle the pinned state for a library item (admin only)."""
+        if not self.current_group or not self.db_ref:
+            return
+
+        if not self.is_admin_or_creator():
+            messagebox.showwarning("Permission denied", "Only admins or the creator can pin items.")
+            return
+
+        try:
+            self.db_ref.child(f'studyGroups/{self.current_group}/library/{item_id}/pinned').set(bool(should_pin))
+            self.refresh_group_data()
+            self.render_library_lists()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to update pin: {e}")
+
+    def remove_library_item(self, item_id):
+        """Remove a library item (admin/creator only)."""
+        if not self.current_group or not self.db_ref:
+            return
+        if not self.is_admin_or_creator():
+            messagebox.showwarning("Permission denied", "Only admins or the creator can remove items.")
+            return
+        if not messagebox.askyesno("Remove", "Remove this library item?"):
+            return
+        try:
+            self.db_ref.child(f'studyGroups/{self.current_group}/library/{item_id}').delete()
+            self.refresh_group_data()
+            self.render_library_lists()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to remove item: {e}")
         
     def set_background_image(self):
         """✅ Upload and set background image for group header"""
@@ -3611,9 +4162,66 @@ class ModernGroupsTab:
         except Exception as e:
             messagebox.showerror("Error", f"Failed: {e}")
     
-    def open_material(self, mat_data):
-        """Open material"""
+    def open_material(self, mat_data, library_item_id=None):
+        """Open material and optionally track library views."""
         webbrowser.open(mat_data['url'])
+
+        if library_item_id and self.current_group and self.db_ref:
+            try:
+                views_ref = self.db_ref.child(
+                    f'studyGroups/{self.current_group}/library/{library_item_id}/views'
+                )
+
+                def _increment(current):
+                    try:
+                        return int(current or 0) + 1
+                    except Exception:
+                        return 1
+
+                views_ref.transaction(_increment)
+
+                if hasattr(self, 'library_window') and self.library_window.winfo_exists():
+                    self.render_library_lists()
+            except Exception as e:
+                print(f"⚠️ Failed to update view count: {e}")
+
+    def download_material(self, mat_data):
+        """Allow members to download a library item to their device."""
+        url = mat_data.get('url')
+        if not url:
+            messagebox.showerror("Error", "Download link not available.")
+            return
+
+        default_name = mat_data.get('name', 'download')
+        save_path = filedialog.asksaveasfilename(title="Save File As", initialfile=default_name)
+        if not save_path:
+            return
+
+        progress_dialog = self._show_progress_dialog(self.parent, f"Downloading {default_name}...")
+
+        def perform_download():
+            error = None
+            try:
+                with requests.get(url, stream=True, timeout=20) as response:
+                    response.raise_for_status()
+                    with open(save_path, 'wb') as outfile:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                outfile.write(chunk)
+            except Exception as e:
+                error = e
+
+            def finalize():
+                if progress_dialog and progress_dialog.winfo_exists():
+                    progress_dialog.destroy()
+                if error:
+                    messagebox.showerror("Error", f"Download failed: {error}")
+                else:
+                    messagebox.showinfo("Downloaded", f"File saved to:\n{save_path}")
+
+            self.parent.after(0, finalize)
+
+        threading.Thread(target=perform_download, daemon=True).start()
     
     def edit_group_info(self):
         """Modern edit group dialog matching create dialog design"""
@@ -3675,10 +4283,10 @@ class ModernGroupsTab:
         tk.Label(content, text="🎨 Header Background Color", 
                 font=('Segoe UI', 11, 'bold'),
                 bg='#F5F7FA', fg='#2C3E50').pack(anchor='w', pady=(15, 5))
-        
+
         color_frame = tk.Frame(content, bg='#F5F7FA')
         color_frame.pack(fill=tk.X, pady=(0, 10))
-        
+
         current_bg_color = metadata.get('header_bg_color', self.colors['light'])
         selected_color = tk.StringVar(value=current_bg_color)
         
@@ -3739,6 +4347,37 @@ class ModernGroupsTab:
             
             color_btn.bind('<Button-1>', lambda e, c=color: set_color(c))
             color_label.bind('<Button-1>', lambda e, c=color: set_color(c))
+
+        # Security Settings
+        tk.Label(content, text="🔒 Security Settings",
+                font=('Segoe UI', 11, 'bold'),
+                bg='#F5F7FA', fg='#2C3E50').pack(anchor='w', pady=(15, 5))
+
+        security_frame = tk.Frame(content, bg='white', relief='solid', borderwidth=1)
+        security_frame.pack(fill=tk.X, pady=(0, 15))
+
+        password_enabled = metadata.get('password') is not None
+        password_var = tk.BooleanVar(value=password_enabled)
+
+        def toggle_password_fields():
+            state = 'normal' if password_var.get() else 'disabled'
+            password_entry.config(state=state)
+
+        password_check = tk.Checkbutton(security_frame, text="🔐 Password Protected Group",
+                                       variable=password_var,
+                                       font=('Segoe UI', 10),
+                                       bg='white', activebackground='white',
+                                       command=toggle_password_fields)
+        password_check.pack(anchor='w', padx=10, pady=10)
+
+        password_entry_frame = tk.Frame(security_frame, bg='white')
+        password_entry_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        tk.Label(password_entry_frame, text="Password:", font=('Segoe UI', 9),
+                bg='white').pack(anchor='w')
+        password_entry = ttk.Entry(password_entry_frame, width=40, show="●", font=('Segoe UI', 10))
+        password_entry.pack(fill=tk.X, pady=(2, 0))
+        toggle_password_fields()
         
         # Remove background button
         remove_bg_btn = tk.Button(content, text="🔄 Reset to Default Color", 
@@ -3768,16 +4407,26 @@ class ModernGroupsTab:
         def save_changes():
             name = name_entry.get().strip()
             desc = desc_text.get('1.0', tk.END).strip()
-            
+
             if not name:
                 messagebox.showerror("❌ Error", "Group name is required!")
                 return
-            
+
+            current_password_hash = metadata.get('password')
+            if password_var.get():
+                if password_entry.get():
+                    new_password_hash = hashlib.sha256(password_entry.get().encode()).hexdigest()
+                else:
+                    new_password_hash = current_password_hash
+            else:
+                new_password_hash = None
+
             try:
                 updates = {
-                    'name': name, 
+                    'name': name,
                     'description': desc,
-                    'header_bg_color': selected_color.get()
+                    'header_bg_color': selected_color.get(),
+                    'password': new_password_hash
                 }
                 meta_ref = self.db_ref.child(f'studyGroups/{self.current_group}/metadata')
                 meta_ref.update(updates)
@@ -3885,8 +4534,16 @@ class ModernGroupsTab:
                 member_ref.update({'typing': False})
             except:
                 pass
-    
-    
+
+
+    def refresh_groups_tab(self):
+        """Manually refresh all group data and current view."""
+        self.load_all_groups()
+        if self.current_group:
+            self.show_group_content()
+            self._reload_chat_messages()
+
+
     def load_all_groups(self):
         """Load all groups"""
         if not self.db_ref:
@@ -3946,7 +4603,7 @@ class ModernGroupsTab:
                 # Check who created it
                 is_creator = (created_by == self.user_id)
                 print(f"   ❓ Is user the creator? {is_creator}")
-                
+
                 if is_creator:
                     your_groups.append((group_id, group_data))
                     print(f"   ✅ Added to YOUR GROUPS")
@@ -3954,7 +4611,32 @@ class ModernGroupsTab:
                     joined_groups.append((group_id, group_data))
                     print(f"   ✅ Added to JOINED GROUPS")
             else:
-                print(f"   ❌ User NOT in members - Skipping")
+                # If the user created the group but isn't listed as a member (e.g., after reinstall), re-add them
+                if created_by == self.user_id:
+                    print("   ⚠️ User is creator but missing from members - restoring membership")
+
+                    # Attempt to re-add the creator as admin to preserve access
+                    try:
+                        if self.db_ref:
+                            member_data = {
+                                'name': self.get_user_name(),
+                                'avatar_name': f"avatar {self.profile_data.get('avatar_id', 1)}.png",
+                                'role': 'admin',
+                                'joined_at': datetime.now().isoformat(),
+                                'online': True,
+                                'last_seen': datetime.now().isoformat(),
+                                'typing': False,
+                                'telegram_chat_id': self.profile_data.get('telegram_chat_id', '')
+                            }
+                            self.db_ref.child(f'studyGroups/{group_id}/members/{self.user_id}').set(member_data)
+                            print("   ✅ Creator membership restored as admin")
+                    except Exception as e:
+                        print(f"   ⚠️ Failed to restore membership: {e}")
+
+                    your_groups.append((group_id, group_data))
+                    print(f"   ✅ Added creator-owned group to YOUR GROUPS")
+                else:
+                    print(f"   ❌ User NOT in members - Skipping")
             
             print()
         

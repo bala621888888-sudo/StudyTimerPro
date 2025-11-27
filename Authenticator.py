@@ -66,14 +66,17 @@ if ONLINE:
     # Google Sheets
     SHEET_ID = get_secret("LB_SHEET_ID")
     if not SHEET_ID:
-        raise RuntimeError("❌ Missing LB_SHEET_ID secret")
+        # ⚠ Do NOT crash – just log and run without online sheet
+        print("⚠ [AUTH] LB_SHEET_ID secret missing or fetch failed. "
+              "Running without online user sheet for now.")
     WORKSHEET_NAME = get_secret("USER_WORKSHEET") or "UserAccounts"
 else:
     SHEET_ID = None
     WORKSHEET_NAME = "UserAccounts"
     print("[OFFLINE] Skipping Google Sheets secrets")
 
-
+# Simple flag to know if sheet features are enabled
+SHEETS_ENABLED = bool(SHEET_ID)
 
 def get_free_port():
     """Get a free port on localhost"""
@@ -226,11 +229,32 @@ class UnifiedAuthSystem:
         try:
             client = self.get_gspread_client()
             if not client:
-                print("No Google Sheets client available")
+                print("[AUTH] No Google Sheets client available.")
                 return
-            
+
+            # 🔁 If we don't have sheet_id yet, try to (re)fetch it once here
+            if not getattr(self, "sheet_id", None):
+                try:
+                    from secrets_util import get_secret, ONLINE
+                    if ONLINE:
+                        new_id = get_secret("LB_SHEET_ID")
+                        if new_id:
+                            self.sheet_id = new_id
+                            print(f"[AUTH] LB_SHEET_ID fetched on demand: {self.sheet_id}")
+                        else:
+                            print("[AUTH] LB_SHEET_ID still missing; "
+                                  "skipping this cloud sheet operation.")
+                            return
+                    else:
+                        print("[AUTH] Offline; skipping this cloud sheet operation.")
+                        return
+                except Exception as e:
+                    print(f"[AUTH] Error while re-fetching LB_SHEET_ID: {e}")
+                    return
+
+            # ✅ Only reach here if we have a valid sheet_id
             sheet = client.open_by_key(self.sheet_id)
-            worksheet = sheet.worksheet(self.worksheet_name)  # UserAccounts
+            worksheet = sheet.worksheet(self.worksheet_name)
             
             # Define all columns we need
             all_columns = [
@@ -416,9 +440,30 @@ class UnifiedAuthSystem:
         try:
             client = self.get_gspread_client()
             if not client:
-                print("No Google Sheets client")
-                return None
-            
+                print("[AUTH] No Google Sheets client available.")
+                return
+
+            # 🔁 If we don't have sheet_id yet, try to (re)fetch it once here
+            if not getattr(self, "sheet_id", None):
+                try:
+                    from secrets_util import get_secret, ONLINE
+                    if ONLINE:
+                        new_id = get_secret("LB_SHEET_ID")
+                        if new_id:
+                            self.sheet_id = new_id
+                            print(f"[AUTH] LB_SHEET_ID fetched on demand: {self.sheet_id}")
+                        else:
+                            print("[AUTH] LB_SHEET_ID still missing; "
+                                  "skipping this cloud sheet operation.")
+                            return
+                    else:
+                        print("[AUTH] Offline; skipping this cloud sheet operation.")
+                        return
+                except Exception as e:
+                    print(f"[AUTH] Error while re-fetching LB_SHEET_ID: {e}")
+                    return
+
+            # ✅ Only reach here if we have a valid sheet_id
             sheet = client.open_by_key(self.sheet_id)
             worksheet = sheet.worksheet(self.worksheet_name)
             
@@ -630,8 +675,30 @@ class UnifiedAuthSystem:
         try:
             client = self.get_gspread_client()
             if not client:
-                return True  # If can't connect, allow local data
-            
+                print("[AUTH] No Google Sheets client available.")
+                return
+
+            # 🔁 If we don't have sheet_id yet, try to (re)fetch it once here
+            if not getattr(self, "sheet_id", None):
+                try:
+                    from secrets_util import get_secret, ONLINE
+                    if ONLINE:
+                        new_id = get_secret("LB_SHEET_ID")
+                        if new_id:
+                            self.sheet_id = new_id
+                            print(f"[AUTH] LB_SHEET_ID fetched on demand: {self.sheet_id}")
+                        else:
+                            print("[AUTH] LB_SHEET_ID still missing; "
+                                  "skipping this cloud sheet operation.")
+                            return
+                    else:
+                        print("[AUTH] Offline; skipping this cloud sheet operation.")
+                        return
+                except Exception as e:
+                    print(f"[AUTH] Error while re-fetching LB_SHEET_ID: {e}")
+                    return
+
+            # ✅ Only reach here if we have a valid sheet_id
             sheet = client.open_by_key(self.sheet_id)
             worksheet = sheet.worksheet(self.worksheet_name)
             

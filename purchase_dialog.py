@@ -187,8 +187,8 @@ class PurchaseDialog:
             traceback.print_exc()
             messagebox.showerror("Payment Error",
                                f"Could not create payment.\n\n{str(e)}\n\n"
-                               "Check:\n1. RAZORPAY_KEY_SECRET in Secret Manager\n"
-                               "2. Internet connection\n3. Razorpay account active")
+                               "Check:\n1. Check your system time match with your zone time\n"
+                               "2. Internet connection")
     
     def _show_payment_with_polling(self, order_id, package):
         """Show payment dialog with auto-polling."""

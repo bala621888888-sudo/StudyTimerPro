@@ -7106,7 +7106,7 @@ class PaymentWizard(tk.Toplevel):
                 return message, 400
 
             # Decide amount based on referral
-            payment_amount = 199 if referral_applied else 349
+            payment_amount = 199 if referral_applied else 1
 
             # ✅ Create payment order via backend
             order_response = api.create_payment(amount=payment_amount, currency='INR')
@@ -8878,28 +8878,16 @@ class FirebaseSync:
 
 # === Exam date + profile helpers (do not touch existing config.json) ===
 def _load_exam_date_only():
-    """Return the exam date for the *current exam* or None. Never prompts."""
+    """Return exam date from exam_date.json or None. Never prompts."""
     try:
+        import os, json
         from datetime import datetime
-
-        # Prefer exam-specific mapping (new format) and fall back to the legacy
-        # single-date structure if present.
-        mapping = _load_exam_date_mapping()
-
-        try:
-            exam_key = _get_exam_key_for_plans()
-        except Exception:
-            exam_key = "__GLOBAL__"
-
-        date_str = mapping.get(exam_key) or mapping.get("__GLOBAL__")
-        if date_str:
-            return datetime.strptime(date_str, "%Y-%m-%d").date()
-
-        # Legacy: {"exam_date": "YYYY-MM-DD"}
-        date_str = mapping.get("exam_date") if isinstance(mapping, dict) else None
-        if date_str:
-            return datetime.strptime(date_str, "%Y-%m-%d").date()
-
+        if os.path.exists(app_paths.exam_date_file):
+            with open(app_paths.exam_date_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                s = data.get("exam_date")
+                if s:
+                    return datetime.strptime(s, "%Y-%m-%d").date()
         return None
     except Exception:
         return None
@@ -14498,8 +14486,8 @@ class StudyTimerApp(tk.Tk):
         self._validation_in_progress = False
         self._validation_completed = False
         self.after(1000, self._check_initial_trial_status)
-        self.after(100000, integrity_check) 
-        self.after(900000, self._check_license_and_payment) 
+        self.after(1000, integrity_check) 
+        self.after(1000, self._check_license_and_payment) 
         # Start periodic write (30s) and read (60s) heartbeats
         self.after(3_000, self._gsync_write_tick)
         self.after(5_000, self._gsync_read_tick)
@@ -21458,13 +21446,43 @@ class StudyTimerApp(tk.Tk):
 
         # ✅ NEW: Create with AI button
         def on_create_with_ai():
-            """Start AI plan creation without requiring a manual name."""
-
-            # Close the popup immediately so AI dialog can take over
+            name = plan_name_var.get().strip()
+            
+            if not name:
+                validation_label.config(text="⚠ Please enter a plan name", fg="#e74c3c")
+                name_entry.focus_set()
+                return
+            
+            if name in self.plans:
+                validation_label.config(text="⚠ Plan name already exists", fg="#e74c3c")
+                name_entry.focus_set()
+                return
+            
+            if len(name) > 50:
+                validation_label.config(text="⚠ Plan name too long", fg="#e74c3c")
+                name_entry.focus_set()
+                return
+            
+            # Create the plan
+            self.plans[name] = []
+            save_all_plans(self.plans)
+            
+            self.plan_var.set(name)
+            self.current_plan_name = name  # ✅ Set current plan name
+            self.schedule = []  # ✅ Empty schedule initially
+            
+            # Save as last active plan
+            save_last_active_plan(name)
+            
+            # ✅ Register all sessions (currently none, but will register after AI creates them)
+            self._register_all_plan_sessions()
+            
+            self.refresh_plan_tree()  # ✅ Use refresh_plan_tree instead of switch_plan
+            
             popup.grab_release()
             popup.destroy()
-
-            # Open AI plan creation dialog (AI will create and name plans)
+            
+            # Open AI plan creation dialog
             self.after(100, self._open_ai_plan_creation)
 
         # Bind Enter key
@@ -23264,60 +23282,8 @@ class StudyTimerApp(tk.Tk):
     def refresh_goal_and_markers(self):
         """Recalculate goal hours & markers, then refresh UI + progress denominator."""
         try:
-            from datetime import datetime, timedelta, date
-
-            # Prefer a live recomputation so we never get stuck on a stale per-day value
-            # saved in goal_config.json. We compute the daily hours from the current
-            # schedule, then multiply by the active exam window.
-            daily_hours = 0.0
-            try:
-                total_minutes = 0
-                for sess in getattr(self, "schedule", []) or []:
-                    if not sess or len(sess) < 3:
-                        continue
-                    start = parse_time(sess[1])
-                    end = parse_time(sess[2])
-                    if start and end:
-                        st_dt = datetime.combine(date.today(), start)
-                        en_dt = datetime.combine(date.today(), end)
-                        if en_dt <= st_dt:
-                            en_dt += timedelta(days=1)
-                        total_minutes += (en_dt - st_dt).total_seconds() / 60
-                if total_minutes > 0:
-                    daily_hours = total_minutes / 60
-            except Exception:
-                pass
-
-            # Fallbacks if schedule is empty
-            if daily_hours <= 0:
-                try:
-                    import json, os
-                    if os.path.exists(app_paths.goal_config_file):
-                        with open(app_paths.goal_config_file, "r") as f:
-                            content = f.read().strip()
-                            if content:
-                                cfg = json.loads(content)
-                                daily_hours = float(cfg.get("daily_hours", 0.0) or 0.0)
-                except Exception:
-                    pass
-            if daily_hours <= 0:
-                daily_hours = _get_daily_hours_fallback()
-
-            exam_date = getattr(self, "progress_exam_date", None) or _load_exam_date_only()
-            if exam_date:
-                self.progress_exam_date = exam_date
-            days_left = max((exam_date - date.today()).days, 0) if exam_date else 0
-
-            computed_total = round(daily_hours * days_left, 2) if daily_hours > 0 and days_left > 0 else 0.0
-
-            base_hours = float(getattr(self, "progress_goal_hours", 0.0) or 0.0)
-
-            if computed_total > 0:
-                hours = computed_total
-            elif hasattr(self, "_calculate_goal_from_schedule"):
+            if hasattr(self, "_calculate_goal_from_schedule"):
                 hours = float(self._calculate_goal_from_schedule() or 0.0)
-            elif base_hours > 0:
-                hours = base_hours
             else:
                 hours = float(calculate_goal_duration_hours())
         except Exception as e:
@@ -26508,16 +26474,8 @@ class StudyTimerApp(tk.Tk):
             # 2. Calculate total days until exam
             from datetime import date as _date
             today = _date.today()
-            exam_day = (
-                getattr(self, "progress_exam_date", None)
-                or _load_exam_date_only()
-                or today
-            )
-            # Keep the cached exam date in sync
-            self.progress_exam_date = exam_day
-
-            # Avoid forcing a 1-day minimum so we never default to a per-day target.
-            days_left = max(0, (exam_day - today).days)
+            exam_day = getattr(self, "progress_exam_date", today)
+            days_left = max(1, (exam_day - today).days)
             
             # 3. Calculate TOTAL goal = daily × days
             total_goal_hours = daily_hours * days_left
@@ -32524,14 +32482,7 @@ class StudyTimerApp(tk.Tk):
         self.target_hours_entry = tk.Entry(self.live_frame, textvariable=self.target_hours_var)
         self.target_hours_entry.pack_forget()  # Hide the entry completely
 
-        # Ensure the goal duration uses the full exam target (not per-day hours)
-        if hasattr(self, "refresh_goal_and_markers"):
-            try:
-                self.refresh_goal_and_markers()
-            except Exception as e:
-                print(f"[GOAL] Failed to refresh goal on live tab setup: {e}")
-
-
+       
 
         # Continue normal UI
         self.after(500, self.update_progress_bar)

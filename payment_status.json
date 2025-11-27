@@ -1,0 +1,10 @@
+{
+  "machine_id": "a6a221c966221aed",
+  "uid": "a1c68b235f07449bb08d3466b7631184",
+  "payment_id": "recovered_from_sheet",
+  "payment_method": "online_recovery",
+  "payment_amount": 19900,
+  "status": "paid",
+  "paid_at": "2025-11-27T03:09:07.700149",
+  "checksum": "ed7b9164db2b82645d9a422f85302a9991d7f4aa593568392b7c3a35668ff185"
+}

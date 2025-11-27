@@ -1,6 +1,6 @@
 # ==== EMBEDDED LEADERBOARD WIDGETS (Top-10 + Top-3) ====
 from __future__ import annotations
-from datetime import date
+from datetime import date, datetime, timezone
 import os, math, random, requests
 import gspread
 from PIL import Image, ImageTk, ImageDraw, ImageFont, ImageFont, ImageDraw, ImageFilter, ImageChops, Image as PILImage
@@ -16,6 +16,7 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 import smtplib, ssl
+from email.utils import parsedate_to_datetime
 from config_paths import app_paths
 import hashlib
 from pathlib import Path
@@ -36,7 +37,6 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import platform, uuid, psutil
-from datetime import datetime
 # Add this line at the top with your other imports
 from auto_updater import add_auto_update_to_app
 import tkinter as tk
@@ -155,6 +155,37 @@ def get_decrypted_service_account():
     cipher = Fernet(encryption_key.encode())
     service_account_json = cipher.decrypt(encrypted_sa.encode()).decode()
     return json.loads(service_account_json)
+
+
+def is_system_time_valid(max_drift_minutes: int = 5):
+    """Check if local system time is within an acceptable drift of server time.
+
+    Returns (is_valid, drift_seconds). If the server time cannot be retrieved,
+    the function returns (False, None) so the caller can block the payment flow.
+    """
+    def _get_server_time():
+        # Try a lightweight HEAD request first
+        response = requests.head("https://www.google.com", timeout=5)
+        date_header = response.headers.get("Date")
+        if date_header:
+            return parsedate_to_datetime(date_header).astimezone(timezone.utc)
+
+        # Fallback to a dedicated time API if the Date header is missing
+        api_resp = requests.get("https://worldtimeapi.org/api/ip", timeout=5)
+        api_resp.raise_for_status()
+        data = api_resp.json()
+        if "utc_datetime" in data:
+            return datetime.fromisoformat(data["utc_datetime"])
+        raise ValueError("No server time available")
+
+    try:
+        server_time = _get_server_time()
+        local_time = datetime.utcnow().replace(tzinfo=timezone.utc)
+        drift_seconds = abs((local_time - server_time).total_seconds())
+        return drift_seconds <= max_drift_minutes * 60, drift_seconds
+    except Exception as e:
+        print(f"[TIME-CHECK] Unable to validate system time: {e}")
+        return False, None
 
 FIREBASE_DATABASE_URL = get_secret("FIREBASE_DATABASE_URL") or "https://leaderboard-98e8c-default-rtdb.asia-southeast1.firebasedatabase.app"
 FIREBASE_SERVICE_ACCOUNT = get_decrypted_service_account()
@@ -1905,8 +1936,7 @@ def _load_profile():
     if os.path.exists(app_paths.profile_file):
         try:
             with open(app_paths.profile_file, 'r', encoding='utf-8') as f:
-                profile_data = json.load(f)
-                print("Loaded profile from local file")
+                profile_data = json.load(f)                
                 return profile_data
         except Exception as e:
             print(f"Error reading local profile: {e}")
@@ -1916,24 +1946,40 @@ def _load_profile():
     
 def get_user_id_from_profile():
     """Get user_id from existing profile"""
-   
+
     profile = _load_profile()
-    user_id = profile.get('uid')
-    
-    if not user_id:
-        # If no uid in profile, generate one and save it
-        import uuid
-        user_id = str(uuid.uuid4())[:16]
-        
-        # Save it back to profile
-        profile['uid'] = user_id
-        if os.path.exists(app_paths.profile_file):
-            try:
-                with open(app_paths.profile_file, 'w', encoding='utf-8') as f:
-                    json.dump(profile, f, indent=4)
-            except Exception as e:
-                print(f"Error saving uid to profile: {e}")
-    
+    legacy_uid = profile.get('uid')
+
+    def _generate_machine_fingerprint():
+        """Create a stable machine fingerprint for identity recovery"""
+        try:
+            system_info = f"{platform.system()}-{platform.machine()}-{platform.processor()}"
+            hostname = platform.node()
+            fingerprint_data = f"{system_info}-{hostname}"
+            return hashlib.md5(fingerprint_data.encode()).hexdigest()[:16]
+        except Exception as e:
+            print(f"Error generating machine fingerprint: {e}")
+            return None
+
+    # Ensure we always have a fingerprint on disk
+    machine_fp = profile.get('machine_fingerprint') or _generate_machine_fingerprint()
+    if machine_fp and profile.get('machine_fingerprint') != machine_fp:
+        profile['machine_fingerprint'] = machine_fp
+
+    # ✅ Prefer the machine fingerprint as the canonical identity so group membership survives reinstalls
+    user_id = machine_fp or legacy_uid or str(uuid.uuid4())[:16]
+
+    # Persist both uid and fingerprint so they survive app reinstalls/file deletion
+    profile['uid'] = user_id
+    if legacy_uid and legacy_uid != user_id:
+        profile['legacy_uid'] = legacy_uid
+    try:
+        os.makedirs(os.path.dirname(app_paths.profile_file), exist_ok=True)
+        with open(app_paths.profile_file, 'w', encoding='utf-8') as f:
+            json.dump(profile, f, indent=4)
+    except Exception as e:
+        print(f"Error saving uid/fingerprint to profile: {e}")
+
     return user_id
         
 def _create_default_profile():
@@ -3908,6 +3954,174 @@ class SecureTrialManager:
         self.last_known_time = None
         self.time_check_points = []
         
+    def _load_online_trial_with_timeout(self, user_profile, timeout_seconds=5):
+        """
+        Run _load_trial_from_sheet() in a background thread with a timeout.
+        If it takes too long or errors, we treat online as unavailable for this run.
+        Returns: (online_trial_dict or None, error_reason or None)
+        error_reason is one of: None, "timeout", "error"
+        """
+        import threading
+
+        result = {}
+        error = {}
+
+        def target():
+            try:
+                result["value"] = self._load_trial_from_sheet(user_profile)
+            except Exception as e:
+                error["value"] = e
+
+        t = threading.Thread(target=target, daemon=True)
+        t.start()
+        t.join(timeout_seconds)
+
+        if t.is_alive():
+            print(f"[TRIAL] Online trial load timed out after {timeout_seconds} seconds.")
+            return None, "timeout"
+
+        if "value" in error:
+            print(f"[TRIAL] Online trial load raised error: {error['value']}")
+            return None, "error"
+
+        return result.get("value"), None    
+        
+    def get_trial_location_diagnostics(self, user_profile):
+        """
+        Return a list of per-location diagnostics for trial data.
+        Each entry has: index, path, trial_status.
+        trial_status will be one of:
+            - OK
+            - MISSING
+            - MACHINE_MISMATCH
+            - INVALID_DATA
+            - DECRYPT_ERROR:<ExceptionName>
+            - UNEXPECTED:<ExceptionName>
+        This function is defensive: it should NEVER raise, only report status.
+        """
+        import os
+        import json
+
+        results = []
+
+        try:
+            locations = list(getattr(self, "storage_locations", []))
+        except Exception:
+            locations = []
+
+        # Adjust filenames if your trial files have different names
+        filenames = [".trial_data.dat", ".trial_backup.dat"]
+
+        for idx, location in enumerate(locations, start=1):
+            status = "MISSING"
+            any_file = False
+
+            try:
+                for filename in filenames:
+                    trial_path = os.path.join(location, filename)
+                    if os.path.exists(trial_path):
+                        any_file = True
+                        try:
+                            with open(trial_path, "rb") as f:
+                                encrypted = f.read()
+
+                            # If for some reason self.fernet is missing, catch it
+                            try:
+                                decrypted = self.fernet.decrypt(encrypted)
+                            except Exception as e:
+                                status = f"DECRYPT_ERROR:{type(e)._name_}"
+                                continue  # try other file in this location
+
+                            try:
+                                trial_data = json.loads(decrypted.decode("utf-8", errors="ignore"))
+                            except Exception as e:
+                                status = f"DECRYPT_ERROR:{type(e)._name_}"
+                                continue
+
+                            # Basic validation similar to your loader
+                            file_mid = trial_data.get("machine_id")
+                            if file_mid != getattr(self, "machine_id", None):
+                                status = "MACHINE_MISMATCH"
+                            elif "trial_start" not in trial_data or "trial_end" not in trial_data:
+                                status = "INVALID_DATA"
+                            else:
+                                status = "OK"
+                                # One good file is enough to mark this location OK
+                                break
+                        except Exception as e_inner:
+                            # Error reading this particular file
+                            status = f"DECRYPT_ERROR:{type(e_inner)._name_}"
+
+                if not any_file:
+                    status = "MISSING"
+
+            except Exception as e_outer:
+                status = f"UNEXPECTED:{type(e_outer)._name_}"
+
+            results.append(
+                {
+                    "index": idx,
+                    "path": location,
+                    "trial_status": status,
+                }
+            )
+
+        return results
+        
+    def get_offline_trial_status(self, user_profile):
+        """
+        Return a summary of where trial files exist and how many are valid.
+        Does NOT change any logic, only for diagnostics.
+        """
+        total_locations = len(self.storage_locations)
+        any_trial_locations = 0      # locations where ANY trial file exists
+        valid_trial_locations = 0    # locations where decrypted + valid trial exists
+
+        filenames = [".trial_data.dat", ".trial_backup.dat"]
+        uid = user_profile.get("uid")
+
+        for location in self.storage_locations:
+            loc_has_any = False
+            loc_has_valid = False
+
+            for filename in filenames:
+                trial_file = os.path.join(location, filename)
+                if os.path.exists(trial_file):
+                    loc_has_any = True
+                    try:
+                        with open(trial_file, "rb") as f:
+                            encrypted = f.read()
+                        decrypted = self.fernet.decrypt(encrypted)
+                        trial_data = json.loads(decrypted.decode("utf-8"))
+
+                        # Basic validation – same style as _load_trial_from_all_locations
+                        if (
+                            trial_data.get("machine_id") == self.machine_id
+                            and "trial_start" in trial_data
+                            and "trial_end" in trial_data
+                        ):
+                            loc_has_valid = True
+                            break  # no need to check other file in this location
+                    except Exception:
+                        # ignore errors – just means this particular file is not valid
+                        pass
+
+            if loc_has_any:
+                any_trial_locations += 1
+            if loc_has_valid:
+                valid_trial_locations += 1
+
+        # For trial, 1 valid location is usually enough;
+        # this flag just tells you "do we have at least one sane copy?"
+        trial_ok = valid_trial_locations >= 1
+
+        return {
+            "trial_ok": trial_ok,
+            "valid_trial_locations": valid_trial_locations,
+            "any_trial_locations": any_trial_locations,
+            "total_locations": total_locations,
+        }
+        
     def update_time_checkpoints(self):
         """Update time checkpoint files to current time"""
         current_time = time.time()
@@ -4241,206 +4455,296 @@ class SecureTrialManager:
     
     def validate_trial(self, user_profile):
         """
-        Comprehensive trial validation with tamper detection
-        Returns: (status, message, days_remaining)
+        FINAL TRIAL LOGIC (matching license pattern):
+
+        1) Detect tampering first (offline).
+        2) Load local trial from all locations.
+        3) If internet is available:
+             -> Try to load online trial with 5s timeout.
+             -> If timeout/error: ignore online and rely on offline only.
+        4) If online_trial exists but local_trial is missing:
+             -> If trial expired online: expired (no restore).
+             -> If still valid: restore trial files to ALL locations from online.
+        5) If no trial anywhere: 'no_trial'.
+        6) If local_trial exists but online_trial does not and internet is OK:
+             -> Push local trial to sheet (first-time sync).
+        7) If both exist:
+             -> Check consistency.
+             -> Use most restrictive (earliest end).
+        8) Check machine_id and expiry.
+        9) If valid and not expired:
+             -> Update time checkpoints.
+             -> Refresh trial files in ALL 5 locations (repair partial deletions).
         """
-        
-        # Check for tampering indicators first
-        tamper_result = self._detect_tampering()
-        if tamper_result['tampered']:
-            return 'tampered', tamper_result['reason'], 0
-        
-        # Get trial data from all sources
-        local_trial = self._load_trial_from_all_locations()
-        online_trial = self._load_trial_from_sheet(user_profile)
-        
-        # ✅ NEW: Check if trial_ever_started but no files found = tampering
-        if user_profile.get('trial_ever_started') and not local_trial and not online_trial:
-            print("[TRIAL] trial_ever_started=True but no trial files found - TAMPERED")
-            return 'tampered', 'Trial files were deleted', 0
-        
-        # ✅ NEW LOGIC: Check for deleted local files tampering
-        if online_trial and not local_trial:
-            # Trial exists in sheet but not locally = user deleted files
-            print("[TRIAL] Trial exists online but not locally - files were deleted")
-            
-            # Check if trial is expired
-            try:
-                trial_end = datetime.fromisoformat(online_trial['trial_end'])
-                now = datetime.now()
-                
-                if now > trial_end:
-                    # Trial expired - don't restore files, just block
-                    return 'expired', 'Trial period has expired', 0
-                else:
-                    # Trial still valid - restore files and continue
-                    print("[TRIAL] Trial still valid - restoring local files")
-                    self._save_trial_data_everywhere(online_trial)
-                    local_trial = online_trial
-            except:
-                return 'tampered', 'Invalid trial data', 0
-        
-        # No trial found anywhere
-        if not local_trial and not online_trial:
-            return 'no_trial', 'No trial found', 0
-        
-        # ✅ If trial exists locally but not in sheet, sync it
-        if local_trial and not online_trial:
-            if self.unified_manager._check_internet():
-                print("[TRIAL] Local trial found but not in sheet - syncing now")
-                self._save_trial_to_sheet(local_trial, user_profile)
-                online_trial = local_trial
-        
-        # Validate consistency between local and online
-        if local_trial and online_trial:
-            if not self._validate_consistency(local_trial, online_trial):
-                return 'tampered', 'Trial data inconsistency detected', 0
-        
-        # Use most restrictive trial data
-        trial_data = self._get_most_restrictive_trial(local_trial, online_trial)
-        
-        if not trial_data:
-            return 'no_trial', 'Invalid trial data', 0
-        
-        # Check machine ID
-        if trial_data.get('machine_id') != self.machine_id:
-            return 'tampered', 'Trial transferred from different machine', 0
-        
-        # Check trial expiration
+        from datetime import datetime
+
+        # ---------- STEP 1: TAMPERING CHECK ----------
         try:
-            trial_end = datetime.fromisoformat(trial_data['trial_end'])
-            now = datetime.now()
-            
-            if now > trial_end:
-                return 'expired', 'Trial period has expired', 0
-            
-            days_remaining = (trial_end - now).days
-            # ✅ UPDATE TIME CHECKPOINTS (before returning valid)
-            self.update_time_checkpoints()
-            return 'valid', f'Trial active: {days_remaining} days remaining', days_remaining
-            
+            tamper_result = self._detect_tampering()
         except Exception as e:
-            return 'tampered', f'Invalid trial date format', 0
-            
-    
+            print(f"[TRIAL] Tamper detection error: {e}")
+            tamper_result = {"tampered": False, "reason": ""}
+
+        if tamper_result.get("tampered"):
+            reason = tamper_result.get("reason", "Trial tampering detected")
+            print(f"[TRIAL] Tampering detected: {reason}")
+            return "tampered", reason, 0
+
+        # ---------- STEP 2: LOAD OFFLINE TRIAL ----------
+        try:
+            local_trial = self._load_trial_from_all_locations()
+        except Exception as e:
+            print(f"[TRIAL] Error loading local trial: {e}")
+            local_trial = None
+
+        # ---------- STEP 3: INTERNET / ONLINE TRIAL WITH TIMEOUT ----------
+        internet_available = False
+        online_trial = None
+        online_error = None
+
+        try:
+            if hasattr(self, "unified_manager") and self.unified_manager:
+                internet_available = self.unified_manager._check_internet()
+            else:
+                internet_available = False
+        except Exception as e:
+            print(f"[TRIAL] _check_internet error: {e}")
+            internet_available = False
+
+        if internet_available:
+            online_trial, online_error = self._load_online_trial_with_timeout(
+                user_profile,
+                timeout_seconds=5
+            )
+            # If timeout or error -> treat as "no online" for this run
+            if online_error in ("timeout", "error"):
+                online_trial = None
+        else:
+            online_error = "no_internet"
+
+        # ---------- STEP 4: ONLINE EXISTS, LOCAL MISSING (DELETED FILES CASE) ----------
+        if online_trial and not local_trial:
+            print("[TRIAL] Trial exists online but not locally - local files deleted.")
+
+            try:
+                trial_end = datetime.fromisoformat(online_trial["trial_end"])
+            except Exception:
+                print("[TRIAL] Invalid trial_end format in online data.")
+                return "tampered", "Invalid trial data", 0
+
+            now = datetime.now()
+            if now > trial_end:
+                # Trial expired online -> DO NOT restore, just expired.
+                print("[TRIAL] Online trial expired - not restoring local files.")
+                return "expired", "Trial period has expired", 0
+
+            # Trial still valid -> restore to ALL 5 locations from online.
+            print("[TRIAL] Online trial still valid - restoring local trial files.")
+            try:
+                self._save_trial_data_everywhere(online_trial)
+            except Exception as e:
+                print(f"[TRIAL] Error while restoring trial data everywhere: {e}")
+            local_trial = online_trial
+
+        # ---------- STEP 5: NO TRIAL ANYWHERE ----------
+        if not local_trial and not online_trial:
+            print("[TRIAL] No trial found (offline or online).")
+            return "no_trial", "No trial found", 0
+
+        # ---------- STEP 6: LOCAL EXISTS, ONLINE MISSING ----------
+        if local_trial and not online_trial and internet_available and online_error is None:
+            # First-time sync: push local trial to sheet
+            try:
+                print("[TRIAL] Local trial exists but no online record - syncing to sheet.")
+                self._save_trial_to_sheet(local_trial, user_profile)
+            except Exception as e:
+                print(f"[TRIAL] Failed to sync local trial to sheet: {e}")
+
+        # ---------- STEP 7: COMBINE LOCAL + ONLINE ----------
+        trial_data = None
+
+        if local_trial and online_trial:
+            # Consistency check
+            try:
+                if not self._validate_consistency(local_trial, online_trial):
+                    print("[TRIAL] Local/online trial inconsistency detected.")
+                    return "tampered", "Trial data inconsistency detected", 0
+            except Exception as e:
+                print(f"[TRIAL] Error in trial consistency check: {e}")
+                return "tampered", "Trial data inconsistency detected", 0
+
+            # Use most restrictive (earliest end date)
+            try:
+                trial_data = self._get_most_restrictive_trial(local_trial, online_trial)
+            except Exception as e:
+                print(f"[TRIAL] Error choosing most restrictive trial: {e}")
+                return "tampered", "Invalid trial data", 0
+
+        elif local_trial:
+            trial_data = local_trial
+        else:
+            trial_data = online_trial
+
+        if not trial_data:
+            # Very defensive; should not normally hit this
+            print("[TRIAL] No valid trial_data after combination.")
+            return "no_trial", "No trial found", 0
+
+        # ---------- STEP 8: MACHINE + EXPIRY CHECK ----------
+        try:
+            trial_machine = trial_data.get("machine_id")
+            if trial_machine != getattr(self, "machine_id", None):
+                print(f"[TRIAL] Machine mismatch: trial_machine={trial_machine}, current={self.machine_id}")
+                return "tampered", "Trial transferred from different machine", 0
+
+            trial_end = datetime.fromisoformat(trial_data["trial_end"])
+        except Exception as e:
+            print(f"[TRIAL] Invalid trial data structure: {e}")
+            return "tampered", "Invalid trial data", 0
+
+        now = datetime.now()
+        if now > trial_end:
+            print("[TRIAL] Trial period has expired based on combined data.")
+            return "expired", "Trial period has expired", 0
+
+        days_remaining = max(0, (trial_end - now).days)
+
+        # ---------- STEP 9: TIME CHECKPOINTS + REPAIR OFFLINE FILES ----------
+        try:
+            self.update_time_checkpoints()
+        except Exception as e:
+            print(f"[TRIAL] Error updating time checkpoints: {e}")
+
+        # IMPORTANT: Refresh trial data to ALL locations
+        # This repairs partial deletions while still respecting trial_end.
+        try:
+            self._save_trial_data_everywhere(trial_data)
+            print("[TRIAL] Trial data refreshed to all locations (repair/consistency).")
+        except Exception as e:
+            print(f"[TRIAL] Failed to refresh trial data everywhere: {e}")
+
+        # ---------- STEP 10: RETURN VALID STATUS ----------
+        print(f"[TRIAL] Trial valid. Days remaining: {days_remaining}")
+        return "valid", f"Trial active: {days_remaining} days remaining", days_remaining
     
     def _detect_tampering(self):
-        """Detect various tampering attempts"""
-        
+        """Detect various tampering attempts.
+
+        We now focus on:
+          1) System time moved backwards (via .time_check files)
+          2) Selective deletion (suspiciously few files vs expected)
+
+        We also UPDATE .time_check forward when time is OK so that
+        going back in time later will be detected.
+        """
         print("[TAMPER-DEBUG] ==================")
         print("[TAMPER-DEBUG] Starting tampering detection")
-        
+
         tampering_indicators = []
-        
-        # Count actual files
+
+        # ---------- Count actual files ----------
         actual_files = 0
         filenames = [".trial_data.dat", ".trial_backup.dat", ".time_check"]
-        
+
         print(f"[TAMPER-DEBUG] Checking {len(self.storage_locations)} locations")
-        
+
         for location in self.storage_locations:
             location_files = 0
-            for filename in filenames:
-                file_path = os.path.join(location, filename)
-                if os.path.exists(file_path):
-                    actual_files += 1
-                    location_files += 1
-            if location_files > 0:
-                print(f"[TAMPER-DEBUG] Found {location_files} files in: {location}")
-        
+            try:
+                for name in filenames:
+                    path = os.path.join(location, name)
+                    if os.path.exists(path):
+                        actual_files += 1
+                        location_files += 1
+                if location_files > 0:
+                    print(f"[TAMPER-DEBUG] Found {location_files} files in: {location}")
+            except Exception as e:
+                print(f"[TAMPER-DEBUG] Error counting files in {location}: {e}")
+
         print(f"[TAMPER-DEBUG] Total files found: {actual_files}")
-        
+
         # Early exit for fresh start
         if actual_files == 0:
             print("[TAMPER-DEBUG] No files - not tampering (fresh start)")
-            return {'tampered': False, 'reason': None}
-        
-        # 1. Check system time backwards movement
+            print("[TAMPER-DEBUG] ==================")
+            return {"tampered": False, "reason": None}
+
+        # ---------- 1. Check system time backwards movement ----------
         print("[TAMPER-DEBUG] === Checking Time Reversal ===")
         current_time = time.time()
         print(f"[TAMPER-DEBUG] Current time: {current_time}")
         print(f"[TAMPER-DEBUG] Current datetime: {datetime.fromtimestamp(current_time)}")
-        
+
         time_check_found = False
-        
+
         for location in self.storage_locations:
             time_file = os.path.join(location, ".time_check")
             if os.path.exists(time_file):
                 time_check_found = True
                 try:
-                    with open(time_file, 'r') as f:
+                    with open(time_file, "r") as f:
                         last_time = float(f.read())
-                    
+
                     time_diff = current_time - last_time
-                    hours_diff = time_diff / 3600
-                    
+                    hours_diff = time_diff / 3600.0
+
                     print(f"[TAMPER-DEBUG] Location: {location}")
                     print(f"[TAMPER-DEBUG]   Last time: {last_time}")
                     print(f"[TAMPER-DEBUG]   Last datetime: {datetime.fromtimestamp(last_time)}")
                     print(f"[TAMPER-DEBUG]   Time difference: {time_diff:.2f} seconds ({hours_diff:.2f} hours)")
-                    
+
+                    # If system time moved back by >5 minutes compared to stored time
                     if current_time < last_time - 300:
-                        hours_back = (last_time - current_time) / 3600
+                        hours_back = (last_time - current_time) / 3600.0
                         print(f"[TAMPER-DEBUG] ❌ TIME MOVED BACKWARDS by {hours_back:.1f} hours!")
-                        tampering_indicators.append(f"System time moved backwards by {hours_back:.1f} hours")
+                        tampering_indicators.append(
+                            f"System time moved backwards by {hours_back:.1f} hours"
+                        )
                         break
                     else:
-                        print(f"[TAMPER-DEBUG] ✅ Time check passed for this location")
+                        # ✅ Time is OK -> push checkpoint forward if it's noticeably newer
+                        if current_time > last_time + 1:
+                            try:
+                                with open(time_file, "w") as f:
+                                    f.write(str(current_time))
+                                print("[TAMPER-DEBUG] Updated time checkpoint for this location.")
+                            except Exception as e:
+                                print(f"[TAMPER-DEBUG] Failed to update time checkpoint: {e}")
+                        else:
+                            print("[TAMPER-DEBUG] ✅ Time check passed for this location (no significant change)")
                 except Exception as e:
                     print(f"[TAMPER-DEBUG] ❌ Error reading time file: {e}")
             else:
                 print(f"[TAMPER-DEBUG] No .time_check file in: {location}")
-        
+
         if not time_check_found:
-            print(f"[TAMPER-DEBUG] ⚠ No .time_check files found in any location!")
-        
-        # 2. Check file modification times
-        print("[TAMPER-DEBUG] === Checking File Modifications ===")
-        for location in self.storage_locations:
-            trial_file = os.path.join(location, ".trial_data.dat")
-            if os.path.exists(trial_file):
-                try:
-                    mtime = os.path.getmtime(trial_file)
-                    ctime = os.path.getctime(trial_file)
-                    diff = abs(mtime - ctime)
-                    
-                    print(f"[TAMPER-DEBUG] File: {location}")
-                    print(f"[TAMPER-DEBUG]   Created: {datetime.fromtimestamp(ctime)}")
-                    print(f"[TAMPER-DEBUG]   Modified: {datetime.fromtimestamp(mtime)}")
-                    print(f"[TAMPER-DEBUG]   Difference: {diff:.2f} seconds")
-                    
-                    if diff > 60:
-                        print(f"[TAMPER-DEBUG] ❌ File was modified {diff:.2f}s after creation")
-                        tampering_indicators.append("Trial file was modified")
-                        break
-                    else:
-                        print(f"[TAMPER-DEBUG] ✅ File modification check passed")
-                except Exception as e:
-                    print(f"[TAMPER-DEBUG] ❌ Error checking file times: {e}")
-        
-        # 3. Check for selective deletion
+            print("[TAMPER-DEBUG] ⚠ No .time_check files found in any location!")
+
+        # ---------- 2. Check for selective deletion ----------
         print("[TAMPER-DEBUG] === Checking Selective Deletion ===")
-        expected_files = len(self.storage_locations) * 3
-        threshold = expected_files * 0.3
-        
+        expected_files = len(self.storage_locations) * 3  # trial + backup + time_check
+        threshold = expected_files * 0.3  # <30% of expected -> suspicious
+
         print(f"[TAMPER-DEBUG] Expected files: {expected_files}")
         print(f"[TAMPER-DEBUG] Actual files: {actual_files}")
         print(f"[TAMPER-DEBUG] Threshold (30%): {threshold}")
-        
+
         if actual_files > 0 and actual_files < threshold:
-            print(f"[TAMPER-DEBUG] ❌ Selective deletion detected!")
-            tampering_indicators.append(f"Selective deletion ({actual_files}/{expected_files} files)")
+            print("[TAMPER-DEBUG] ❌ Selective deletion detected!")
+            tampering_indicators.append(
+                f"Selective deletion ({actual_files}/{expected_files} files)"
+            )
         else:
-            print(f"[TAMPER-DEBUG] ✅ Selective deletion check passed")
-        
-        print(f"[TAMPER-DEBUG] === Final Result ===")
+            print("[TAMPER-DEBUG] ✅ Selective deletion check passed")
+
+        print("[TAMPER-DEBUG] === Final Result ===")
         print(f"[TAMPER-DEBUG] Tampering indicators: {tampering_indicators}")
         print("[TAMPER-DEBUG] ==================")
-        
+
         if tampering_indicators:
-            return {'tampered': True, 'reason': '; '.join(tampering_indicators)}
-        
-        return {'tampered': False, 'reason': None}
+            return {"tampered": True, "reason": "; ".join(tampering_indicators)}
+
+        return {"tampered": False, "reason": None}
     
     def _load_trial_from_all_locations(self):
         """Load and validate trial data from all local storage locations"""
@@ -4816,7 +5120,114 @@ class UnifiedLicenseManager:
         self._connect_unified_gsheet()
         self.gspread_client = get_encrypted_gspread_client()
         
-    
+    def get_location_diagnostics(self, user_profile):
+        """
+        Return a list of per-location diagnostics dictionaries.
+        Each entry describes payment_status and license_status for one storage path.
+        """
+        results = []
+        uid = user_profile.get("uid")
+
+        for idx, location in enumerate(getattr(self, "storage_locations", []), start=1):
+            info = {
+                "index": idx,
+                "path": location,
+                "payment_status": "MISSING",   # default
+                "license_status": "MISSING",   # default
+            }
+
+            # ---- Payment file diagnostics ----
+            try:
+                payment_path = os.path.join(location, "payment_status.json")
+                if not os.path.exists(payment_path):
+                    info["payment_status"] = "MISSING"
+                else:
+                    try:
+                        with open(payment_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+
+                        file_mid   = data.get("machine_id")
+                        file_uid   = data.get("uid")
+                        file_stat  = data.get("status")
+                        payment_id = data.get("payment_id")
+                        checksum   = data.get("checksum", "")
+
+                        if file_mid != self.machine_id:
+                            info["payment_status"] = "MACHINE_MISMATCH"
+                        elif file_uid != uid:
+                            info["payment_status"] = "UID_MISMATCH"
+                        elif file_stat != "paid":
+                            info["payment_status"] = f"STATUS_{file_stat}"
+                        elif not self._verify_checksum(payment_id, checksum):
+                            info["payment_status"] = "CHECKSUM_FAIL"
+                        else:
+                            info["payment_status"] = "OK"
+                    except Exception as e:
+                        info["payment_status"] = f"READ_ERROR:{type(e)._name_}"
+            except Exception as e:
+                info["payment_status"] = f"UNEXPECTED:{type(e)._name_}"
+
+            # ---- License file diagnostics ----
+            try:
+                license_path = os.path.join(location, "app_license.dat")
+                if not os.path.exists(license_path):
+                    info["license_status"] = "MISSING"
+                else:
+                    try:
+                        with open(license_path, "rb") as f:
+                            encrypted = f.read()
+                        decrypted = self.fernet.decrypt(encrypted)
+                        license_info = json.loads(decrypted.decode("utf-8", errors="ignore"))
+
+                        file_mid    = license_info.get("machine_id")
+                        license_key = license_info.get("license_key", "")
+                        checksum    = license_info.get("checksum", "")
+
+                        if file_mid != self.machine_id:
+                            info["license_status"] = "MACHINE_MISMATCH"
+                        elif not license_key:
+                            info["license_status"] = "EMPTY_KEY"
+                        elif not self._verify_checksum(license_key, checksum):
+                            info["license_status"] = "CHECKSUM_FAIL"
+                        else:
+                            info["license_status"] = "OK"
+                    except Exception as e:
+                        info["license_status"] = f"DECRYPT_ERROR:{type(e)._name_}"
+            except Exception as e:
+                info["license_status"] = f"UNEXPECTED:{type(e)._name_}"
+
+            results.append(info)
+
+        return results
+        
+    def _check_online_status_with_timeout(self, user_profile, timeout_seconds=5):
+        """
+        Run check_online_status() in a background thread with a timeout.
+        If it takes too long or errors, we fall back to offline validation.
+        Returns: (online_status_dict or None, error_reason or None)
+        """
+        result = {}
+        error = {}
+
+        def target():
+            try:
+                result["value"] = self.check_online_status(user_profile)
+            except Exception as e:
+                error["value"] = e
+
+        t = threading.Thread(target=target, daemon=True)
+        t.start()
+        t.join(timeout_seconds)
+
+        if t.is_alive():
+            print(f"[LICENSE] Online check timed out after {timeout_seconds} seconds.")
+            return None, "timeout"
+
+        if "value" in error:
+            print(f"[LICENSE] Online check raised error: {error['value']}")
+            return None, "error"
+
+        return result.get("value"), None
     
     def _get_storage_locations(self):
         """Get multiple hidden locations across the system for license storage"""
@@ -4959,10 +5370,20 @@ class UnifiedLicenseManager:
     # Local file methods
     def save_payment_locally(self, payment_data, user_profile):
         """Save payment to all hidden locations"""
+        amount = payment_data.get('amount', 0) or 0
+        method = (
+            payment_data.get('method')
+            or payment_data.get('payment_method')
+            or payment_data.get('bank')
+            or ''
+        )
+
         data = {
             'machine_id': self.machine_id,
             'uid': user_profile.get('uid', ''),
             'payment_id': payment_data.get('id', ''),
+            'payment_method': method,
+            'payment_amount': amount,
             'status': 'paid',
             'paid_at': datetime.now().isoformat(),
             'checksum': self._generate_checksum(payment_data.get('id', ''))
@@ -5055,74 +5476,69 @@ class UnifiedLicenseManager:
         return expected == checksum
     
     def comprehensive_validation(self, user_profile):
-        """Validation with license priority over trial"""
+        """
+        FINAL LOGIC:
+        - If internet is available and server responds in time:
+            -> ONLINE is source of truth.
+            -> If valid online, refresh offline files from server.
+        - If internet is NOT available or server times out / errors:
+            -> OFFLINE validation only.
+        """
         internet_available = self._check_internet()
         offline_status = self.check_offline_status(user_profile)
-        
-        # ✅ STEP 1: Check offline license FIRST (before any online/trial checks)
-        if offline_status["payment"] and offline_status["license"]:
-            print(f"[VALIDATION] Found valid offline license ({offline_status['license_count']}/{offline_status['total_locations']})")
-            
-            # ✅ Try to sync to Google Sheets if online
-            if internet_available:
-                try:
-                    online_status = self.check_online_status(user_profile)
-                    
-                    # Handle deactivation
-                    if online_status.get("deactivated"):
-                        self._remove_all_local_files()
-                        return False, "Account deactivated"
-                    
-                    # ✅ If online is missing payment/license, sync from offline
-                    if not online_status.get("payment") or not online_status.get("license"):
-                        print("[VALIDATION] Offline license valid but not in sheet - syncing now")
-                        success = self._sync_offline_to_online(user_profile, offline_status)
-                        if success:
-                            print("[VALIDATION] ✅ Successfully synced offline license to sheet")
-                        else:
-                            print("[VALIDATION] ⚠ Sheet sync failed but offline license is valid")
-                    
-                    return True, f"License valid (offline {offline_status['license_count']}/{offline_status['total_locations']})"
-                    
-                except Exception as e:
-                    print(f"[VALIDATION] Online sync error: {e}")
-                    # Continue with offline validation
-                    return True, f"License valid (offline, sync failed)"
-            else:
-                # No internet - offline validation is enough
-                return True, f"License valid (offline {offline_status['license_count']}/{offline_status['total_locations']})"
-        
-        # ✅ STEP 2: No offline license - check online
-        if not internet_available:
-            return False, "No license found"
-        
-        online_status = self.check_online_status(user_profile)
-        
-        if online_status.get("error"):
-            return False, "Cannot verify license"
-        
-        if online_status.get("deactivated"):
-            self._remove_all_local_files()
-            return False, "Account deactivated"
-        
-        if not online_status.get("user_exists"):
-            return False, "first_time_user"
-        
-        # Online has license - recover offline if missing
-        if online_status["payment"] and online_status["license"]:
-            if offline_status["license_count"] < len(self.storage_locations):
-                print("[VALIDATION] Recovering offline files from sheet")
-                self.recover_offline_files_from_online(user_profile)
-            return True, "License valid (online)"
-        
-        # No license anywhere
-        missing = []
-        if not online_status["payment"]:
-            missing.append("payment")
-        if not online_status["license"]:
-            missing.append("license")
-        
-        return False, f"Missing: {', '.join(missing)}"
+
+        # ---------- STEP 1: INTERNET AVAILABLE -> ONLINE FIRST ----------
+        if internet_available:
+            online_status, online_error = self._check_online_status_with_timeout(
+                user_profile,
+                timeout_seconds=5  # you can tweak this
+            )
+
+            # If the sheet isn't reachable (e.g., timezone/region blocks),
+            # treat it as an online failure and fall back to offline validation
+            if online_status and online_status.get("error"):
+                print(f"[LICENSE] Online validation error: {online_status['error']} - falling back to OFFLINE validation.")
+                online_error = online_status.get("error") if isinstance(online_status, dict) else "error"
+                online_status = None
+
+            if online_status is not None:
+                # 1A) Online says this is a brand-new / first-time user (no license row yet)
+                if online_status.get("first_time_user"):
+                    print("[LICENSE] Online: first-time user (no license row yet).")
+                    return False, "first_time_user"
+
+                # 1B) Online says license is valid
+                if online_status.get("payment") and online_status.get("license"):
+                    print("[LICENSE] Online license valid - server is source of truth.")
+
+                    # Refresh / repair offline files from server so offline mode stays correct
+                    try:
+                        self.recover_offline_files_from_online(user_profile)
+                        print("[LICENSE] Offline files refreshed from server.")
+                    except Exception as e:
+                        print(f"[LICENSE] Failed to refresh offline files: {e}")
+
+                    return True, "License valid (online)"
+
+                # 1C) Online explicitly says license is NOT valid
+                print("[LICENSE] Online check: license NOT valid (payment or license missing/invalid).")
+                return False, "Online license invalid"
+
+            # If we are here: timeout or error in online check, fall back to offline
+            print(f"[LICENSE] Online validation unavailable ({online_error}); falling back to OFFLINE validation.")
+
+        # ---------- STEP 2: NO RELIABLE ONLINE -> OFFLINE ONLY ----------
+        print("[LICENSE] Using OFFLINE validation only.")
+
+        if offline_status.get("payment") and offline_status.get("license"):
+            print("[LICENSE] Offline license valid (quorum satisfied).")
+            return True, "License valid (offline)"
+
+        # If no offline license at all:
+        #   - either completely fresh user -> will be handled as trial/first-time elsewhere
+        #   - or no valid license for this machine.
+        print("[LICENSE] No valid offline license found.")
+        return False, "No license found"
         
     def _sync_offline_to_online(self, user_profile, offline_status):
         """Sync offline license to Google Sheets"""
@@ -5504,13 +5920,32 @@ class UnifiedLicenseManager:
             if not row_num:
                 return False
             
+            raw_amount = payment_data.get('amount')
+            if raw_amount is None or raw_amount == '':
+                raw_amount = payment_data.get('payment_amount', 0)
+
+            try:
+                raw_amount = float(raw_amount)
+            except Exception:
+                raw_amount = 0
+
+            # Razorpay returns amount in paise; assume paise for large values
+            amount = raw_amount / 100 if raw_amount > 1000 else raw_amount
+
+            method = (
+                payment_data.get('method')
+                or payment_data.get('payment_method')
+                or payment_data.get('bank')
+                or ''
+            )
+
             # Update payment columns in existing row
             updates = [
                 {'range': f'D{row_num}', 'values': [['payment_completed']]},           # Status
                 {'range': f'F{row_num}', 'values': [[datetime.now().strftime('%Y-%m-%d %H:%M:%S')]]}, # Last_Updated
                 {'range': f'G{row_num}', 'values': [[payment_data.get('id', '')]]},   # Payment_ID
-                {'range': f'H{row_num}', 'values': [[payment_data.get('method', '')]]}, # Payment_Method
-                {'range': f'I{row_num}', 'values': [[payment_data.get('amount', 0) / 100]]}, # Payment_Amount
+                {'range': f'H{row_num}', 'values': [[method]]}, # Payment_Method
+                {'range': f'I{row_num}', 'values': [[amount]]}, # Payment_Amount
                 {'range': f'J{row_num}', 'values': [[datetime.now().strftime('%Y-%m-%d %H:%M:%S')]]}, # Payment_Date
                 {'range': f'N{row_num}', 'values': [[payment_data.get('email', '')]]}, # Email
                 {'range': f'O{row_num}', 'values': [[payment_data.get('contact', '')]]}, # Phone
@@ -5612,6 +6047,135 @@ class UnifiedLicenseManager:
             print(f"[UNIFIED] Online check error: {e}")
             return {"payment": False, "license": False, "error": str(e)}
     
+    def append_diagnostics(self, user_profile, diagnostics):
+        """
+        Append a diagnostics snapshot row into a 'Diagnostics' worksheet.
+        ORDER:
+          1) User info
+          2) Trial-related (status + offline + location details)
+          3) License/payment-related (status + offline + online + location details)
+        """
+        try:
+            # ---------- COMMON HEADERS (used for both new + existing sheet) ----------
+            headers = [
+                # ---------- USER INFO ----------
+                "Timestamp",               # 1
+                "UID",                     # 2
+                "User_Name",               # 3
+                "Install_ID",              # 4
+                "Machine_ID",              # 5
+
+                # ---------- TRIAL (LOGIC + OFFLINE + LOCATIONS) ----------
+                "Trial_Status",            # 6
+                "Trial_Message",           # 7
+                "Trial_Days_Remaining",    # 8
+                "Offline_Trial_OK",        # 9
+                "Offline_Trial_Valid_Locations",   # 10
+                "Offline_Trial_Any_Locations",     # 11
+                "Offline_Trial_Total_Locations",   # 12
+                "Trial_Location_Details",          # 13
+
+                # ---------- LICENSE/PAYMENT (LOGIC + OFFLINE + ONLINE + LOCATIONS) ----------
+                "License_Valid",           # 14
+                "License_Message",         # 15
+                "Internet_Available",      # 16
+                "Offline_Payment_OK",      # 17
+                "Offline_License_OK",      # 18
+                "Offline_Payment_Count",   # 19
+                "Offline_License_Count",   # 20
+                "Offline_Total_Locations", # 21
+                "Online_Payment_File",     # 22  # from online_status['payment']
+                "Online_License_File",     # 23  # from online_status['license']
+                "Online_File_Error",       # 24  # error while checking sheet / files
+                "Location_Details",        # 25  # per-location payment/license status
+            ]
+
+            # 1) Get gspread client (encrypted first, then file-based fallback)
+            gc = get_encrypted_gspread_client()
+            if not gc:
+                if not os.path.exists(self.gsheet_credentials):
+                    print("[DIAG] No valid credentials available for diagnostics.")
+                    return False
+
+                import gspread
+                from oauth2client.service_account import ServiceAccountCredentials
+
+                scope = [
+                    "https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive",
+                ]
+                creds = ServiceAccountCredentials.from_json_keyfile_name(
+                    self.gsheet_credentials, scope
+                )
+                gc = gspread.authorize(creds)
+
+            # 2) Open sheet by ID or URL
+            if self.gsheet_id.startswith("http"):
+                sheet = gc.open_by_url(self.gsheet_id)
+            else:
+                sheet = gc.open_by_key(self.gsheet_id)
+
+            # 3) Get or create Diagnostics worksheet
+            import gspread  # ensure we have the update() method etc.
+            try:
+                ws = sheet.worksheet("Diagnostics")
+            except Exception:
+                # Sheet doesn't exist -> create with enough columns/rows and add headers
+                ws = sheet.add_worksheet(title="Diagnostics", rows="2000", cols="40")
+                ws.append_row(headers)
+            else:
+                # Sheet exists -> ensure header row is present and correct
+                try:
+                    existing_headers = ws.row_values(1)
+                except Exception:
+                    existing_headers = []
+
+                # If row1 is empty or doesn't start with "Timestamp", rewrite headers
+                if (not existing_headers) or (len(existing_headers) == 0) or (existing_headers[0] != "Timestamp"):
+                    # Write headers directly into first row
+                    ws.update("A1", [headers])
+
+            # 4) Build row in same order as headers above
+            row = [
+                # ---------- USER INFO ----------
+                diagnostics.get("timestamp", ""),                   # Timestamp
+                diagnostics.get("uid", ""),                         # UID
+                diagnostics.get("user_name", ""),                   # User_Name
+                diagnostics.get("install_id", ""),                  # Install_ID
+                diagnostics.get("machine_id", ""),                  # Machine_ID
+
+                # ---------- TRIAL ----------
+                diagnostics.get("trial_status", ""),                        # Trial_Status
+                diagnostics.get("trial_message", ""),                       # Trial_Message
+                diagnostics.get("trial_days_remaining", ""),                # Trial_Days_Remaining
+                str(diagnostics.get("offline_trial_ok", "")),               # Offline_Trial_OK
+                diagnostics.get("offline_trial_valid_locations", ""),       # Offline_Trial_Valid_Locations
+                diagnostics.get("offline_trial_any_locations", ""),         # Offline_Trial_Any_Locations
+                diagnostics.get("offline_trial_total_locations", ""),       # Offline_Trial_Total_Locations
+                diagnostics.get("trial_location_details", ""),              # Trial_Location_Details
+
+                # ---------- LICENSE / PAYMENT ----------
+                str(diagnostics.get("license_valid", "")),                  # License_Valid
+                diagnostics.get("license_message", ""),                     # License_Message
+                str(diagnostics.get("internet_available", "")),             # Internet_Available
+                str(diagnostics.get("offline_payment_ok", "")),             # Offline_Payment_OK
+                str(diagnostics.get("offline_license_ok", "")),             # Offline_License_OK
+                diagnostics.get("offline_payment_count", ""),               # Offline_Payment_Count
+                diagnostics.get("offline_license_count", ""),               # Offline_License_Count
+                diagnostics.get("offline_total_locations", ""),             # Offline_Total_Locations
+                str(diagnostics.get("online_status_payment", "")),          # Online_Payment_File
+                str(diagnostics.get("online_status_license", "")),          # Online_License_File
+                diagnostics.get("online_status_error", ""),                 # Online_File_Error
+                diagnostics.get("location_details", ""),                    # Location_Details
+            ]
+
+            ws.append_row(row)
+            print("[DIAG] Diagnostics snapshot appended to Diagnostics sheet.")
+            return True
+
+        except Exception as e:
+            print(f"[DIAG] Failed to append diagnostics: {e}")
+            return False
                
     def recover_offline_files_from_online(self, user_profile):
         """Recover missing offline files from Google Sheets when internet is available"""
@@ -6122,10 +6686,13 @@ class PaymentWizard(tk.Toplevel):
             # Check if token exists and is expired
             current_time = time.time()
             token_age = current_time - token_timestamp
-            token_expired = token_age > 3300  # 55 minutes
+            # Treat negative age (clock changes) as expired to force refresh
+            token_expired = token_age < 0 or token_age > 3300  # 55 minutes
 
             print(f"[PAYMENT] Token exists: {bool(id_token)}")
             print(f"[PAYMENT] Token age: {token_age:.0f} seconds")
+            if token_age < 0:
+                print("[PAYMENT] ⚠ Token timestamp is in the future; refreshing token")
             print(f"[PAYMENT] Token expired: {token_expired}")
 
             # ✅ Refresh or get new token if missing/expired
@@ -6528,6 +7095,16 @@ class PaymentWizard(tk.Toplevel):
             user_profile = _load_profile()
             referral_applied = user_profile.get('referral_code') is not None
 
+            # Block payment flow when system time is outside allowable drift
+            time_ok, drift_seconds = is_system_time_valid()
+            if not time_ok:
+                drift_minutes = (drift_seconds or 0) / 60
+                message = (
+                    f"❌ System clock out of sync by {drift_minutes:.1f} minutes. "
+                    "Please correct your date/time (±5 minutes allowed) and reopen the payment page."
+                )
+                return message, 400
+
             # Decide amount based on referral
             payment_amount = 199 if referral_applied else 349
 
@@ -6565,11 +7142,43 @@ class PaymentWizard(tk.Toplevel):
                 # ✅ Verify signature & capture status via backend
                 verify_response = api.verify_payment(order_id, payment_id, signature)
 
+                # Guard against unexpected None/invalid responses
+                if not isinstance(verify_response, dict):
+                    return jsonify({'success': False, 'error': 'Invalid response from verification server'})
+
                 if not verify_response.get('success'):
                     return jsonify({'success': False, 'error': verify_response.get('error', 'Verification failed')})
 
+                time_ok, drift_seconds = is_system_time_valid()
+                if not time_ok:
+                    drift_minutes = (drift_seconds or 0) / 60
+                    return jsonify({
+                        'success': False,
+                        'error': f'System time is off by {drift_minutes:.1f} minutes. Please correct your clock and retry payment.'
+                    })
+
                 # ✅ Payment verified successfully
-                payment = verify_response.get('payment')  # optional: if backend returns details
+                payment = verify_response.get('payment') or {}
+
+                # Normalize key names so sheet/offline storage always receive values
+                payment.setdefault('id', payment_id)
+
+                raw_amount = (
+                    payment.get('amount')
+                    or payment.get('payment_amount')
+                    or verify_response.get('amount')
+                    or verify_response.get('payment_amount')
+                )
+
+                payment['amount'] = raw_amount
+
+                payment['method'] = (
+                    payment.get('method')
+                    or payment.get('payment_method')
+                    or payment.get('bank')
+                    or verify_response.get('method')
+                    or verify_response.get('payment_method')
+                )
 
                 # Save payment (unchanged)
                 user_profile = _load_profile()
@@ -8269,16 +8878,28 @@ class FirebaseSync:
 
 # === Exam date + profile helpers (do not touch existing config.json) ===
 def _load_exam_date_only():
-    """Return exam date from exam_date.json or None. Never prompts."""
+    """Return the exam date for the *current exam* or None. Never prompts."""
     try:
-        import os, json
         from datetime import datetime
-        if os.path.exists(app_paths.exam_date_file):
-            with open(app_paths.exam_date_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                s = data.get("exam_date")
-                if s:
-                    return datetime.strptime(s, "%Y-%m-%d").date()
+
+        # Prefer exam-specific mapping (new format) and fall back to the legacy
+        # single-date structure if present.
+        mapping = _load_exam_date_mapping()
+
+        try:
+            exam_key = _get_exam_key_for_plans()
+        except Exception:
+            exam_key = "__GLOBAL__"
+
+        date_str = mapping.get(exam_key) or mapping.get("__GLOBAL__")
+        if date_str:
+            return datetime.strptime(date_str, "%Y-%m-%d").date()
+
+        # Legacy: {"exam_date": "YYYY-MM-DD"}
+        date_str = mapping.get("exam_date") if isinstance(mapping, dict) else None
+        if date_str:
+            return datetime.strptime(date_str, "%Y-%m-%d").date()
+
         return None
     except Exception:
         return None
@@ -12227,6 +12848,7 @@ STUDY_TOTAL_FILE = app_paths.study_total_file
 WASTAGE_DAY_FILE = app_paths.wastage_day_file
 STUDY_TODAY_FILE = app_paths.study_today_file
 RESET_WASTAGE_FILE = app_paths.reset_wastage_file
+PLAN_ACTIVATION_FILE = os.path.join(app_paths.appdata_dir, "plan_activation.json")
 CUSTOM_SCHEDULE_FILE = app_paths.custom_schedule_file
 HISTORY_LOG = app_paths.history_log_file
 TARGET_DRIFT_FILE = app_paths.target_drift_file
@@ -12316,6 +12938,90 @@ def load_reset_wastage():
         with open(RESET_WASTAGE_FILE, "r") as f:
             return json.load(f)
     return {}
+
+
+def _load_plan_activation_times():
+    """Return the persisted plan activation timestamps per exam key."""
+    try:
+        if os.path.exists(PLAN_ACTIVATION_FILE):
+            with open(PLAN_ACTIVATION_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_plan_activation_times(data):
+    try:
+        os.makedirs(app_paths.appdata_dir, exist_ok=True)
+        with open(PLAN_ACTIVATION_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def _record_plan_activation(plan_name, ts=None):
+    """Persist when a plan became active (per exam)."""
+    try:
+        exam_key = _get_exam_key_for_plans(None)
+    except Exception:
+        exam_key = "__GLOBAL__"
+
+    if ts is None:
+        ts = datetime.now()
+
+    data = _load_plan_activation_times()
+    exam_block = data.get(exam_key, {}) if isinstance(data.get(exam_key), dict) else {}
+    exam_block[plan_name or "Default"] = ts.isoformat()
+    data[exam_key] = exam_block
+    _save_plan_activation_times(data)
+
+
+_runtime_activation_cache = {}
+
+
+def _ensure_today_activation(plan_name):
+    """Return an activation timestamp for today, setting one to now if missing."""
+    now = datetime.now()
+
+    # Prefer persisted activation when it's for today
+    ts = _get_plan_activation(plan_name)
+    if ts and ts.date() == now.date():
+        _runtime_activation_cache[plan_name or "Default"] = ts
+        return ts
+
+    # If we already set one this runtime, reuse it (only for today)
+    runtime_ts = _runtime_activation_cache.get(plan_name or "Default")
+    if runtime_ts and runtime_ts.date() == now.date():
+        return runtime_ts
+
+    # Otherwise, record a fresh activation for today
+    _record_plan_activation(plan_name, now)
+    _runtime_activation_cache[plan_name or "Default"] = now
+    return now
+
+
+def _get_plan_activation(plan_name):
+    """Fetch the activation timestamp for the given plan (if any)."""
+    try:
+        exam_key = _get_exam_key_for_plans(None)
+    except Exception:
+        exam_key = "__GLOBAL__"
+
+    data = _load_plan_activation_times()
+    exam_block = data.get(exam_key, {})
+    if not isinstance(exam_block, dict):
+        return None
+
+    ts_str = exam_block.get(plan_name or "Default")
+    if not isinstance(ts_str, str):
+        return None
+
+    try:
+        return datetime.fromisoformat(ts_str)
+    except Exception:
+        return None
 
 def save_reset_wastage(obj):
     with open(RESET_WASTAGE_FILE, "w") as f:
@@ -12496,16 +13202,88 @@ def get_current_plan_wastage_log(plan_name):
     """Return only wastage entries for the specified plan."""
     return [entry for entry in wastage_log if entry.get("Plan", "Default") == plan_name]
 
-def add_or_update_wastage(session_name, scheduled_start, actual_start, seconds_to_add, missed="No", app=None):
+
+def _resolve_plan_name(plan_name=None, app=None):
+    """Determine which plan name to use for wastage calculations."""
+    if plan_name:
+        return plan_name
+    if app and hasattr(app, "current_plan_name"):
+        return app.current_plan_name or "Default"
+    if APP_INSTANCE and hasattr(APP_INSTANCE, "current_plan_name"):
+        return APP_INSTANCE.current_plan_name or "Default"
+    try:
+        return load_last_active_plan()
+    except Exception:
+        return "Default"
+
+
+def _load_last_seen_plan(return_details=False):
+    """
+    Return the plan name recorded with the last_seen timestamp (if any).
+
+    When return_details is True, also report whether the file existed and
+    whether a plan was explicitly recorded, so callers can safely guard
+    against legacy files that lack plan metadata.
+    """
+    last_seen_file_exists = os.path.exists(LAST_SEEN_FILE)
+    has_explicit_plan = False
+    plan_value = None
+
+    try:
+        if last_seen_file_exists:
+            with open(LAST_SEEN_FILE, "r", encoding="utf-8") as f:
+                txt = f.read().strip()
+                try:
+                    data = json.loads(txt)
+                    if isinstance(data, dict):
+                        plan_value = data.get("plan")
+                        has_explicit_plan = "plan" in data
+                except Exception:
+                    # legacy plain timestamp format
+                    plan_value = None
+    except Exception:
+        pass
+
+    # Fallback to last active plan so we don't unintentionally backfill other plans
+    if plan_value is None:
+        try:
+            plan_value = load_last_active_plan()
+        except Exception:
+            plan_value = None
+
+    if return_details:
+        return plan_value, has_explicit_plan, last_seen_file_exists
+    return plan_value
+
+def add_or_update_wastage(
+    session_name,
+    scheduled_start,
+    actual_start,
+    seconds_to_add,
+    missed="No",
+    app=None,
+    plan_name=None,
+):
     """
     Write/merge wastage into the row that belongs to the SCHEDULED day.
     Now includes Plan tracking.
     """
-    # Get current plan name
-    if app and hasattr(app, 'current_plan_name'):
-        current_plan = app.current_plan_name
+    # Resolve target plan and make sure it matches the active plan
+    current_plan = _resolve_plan_name(plan_name, app)
+    active_plan = None
+
+    if app and hasattr(app, "current_plan_name"):
+        active_plan = app.current_plan_name or "Default"
+    elif APP_INSTANCE and hasattr(APP_INSTANCE, "current_plan_name"):
+        active_plan = APP_INSTANCE.current_plan_name or "Default"
     else:
-        current_plan = "Default"
+        try:
+            active_plan = load_last_active_plan()
+        except Exception:
+            active_plan = "Default"
+
+    if active_plan and current_plan != active_plan:
+        return
     
     # Trigger UI refresh if app instance is available
     if app:
@@ -12556,11 +13334,14 @@ def get_total_studied_seconds():
         return obj.get("total", 0)
     return 0
     
-def compute_true_grand_total():
+def compute_true_grand_total(plan_name=None, app=None):
     load_wastage_log()
-    backfill_gap_days(schedule)
+    resolved_plan = _resolve_plan_name(plan_name, app)
+    backfill_gap_days(schedule, app=app, plan_name=resolved_plan)
     total_seconds = 0
     for entry in wastage_log:
+        if entry.get("Plan", "Default") != resolved_plan:
+            continue
         sec = parse_hhmmss(entry["Wastage (hh:mm:ss)"])
         total_seconds += sec
     return total_seconds
@@ -12582,8 +13363,9 @@ def save_total_studied_seconds(val):
     with open(STUDY_TOTAL_FILE, "w") as f:
         json.dump({"total": val}, f)
 
-def get_total_wastage_seconds():
-    summary = load_wastage_day_summary()
+def get_total_wastage_seconds(plan_name=None, app=None):
+    plan_name = _resolve_plan_name(plan_name, app)
+    summary = load_wastage_day_summary(plan_name)
     if not summary:
         return 0  # ✅ Safeguard for None or empty
 
@@ -12704,22 +13486,61 @@ def _session_duration_seconds(start_12h: str, end_12h: str) -> int:
     return int((end - base).total_seconds())
 
 
-def backfill_gap_days(schedule):
+def backfill_gap_days(schedule, app=None, plan_name=None):
     """
     Create MISSED entries for every scheduled session on any calendar day
     missing between the last logged day and yesterday.
     Idempotent: does not duplicate if rows already exist for a (session, schedule, date).
+    Only considers the active plan.
     """
     load_wastage_log()  # ensure fresh
 
-    # Find the newest date we have in the log (or None)
+    if plan_name is None:
+        if app and hasattr(app, "current_plan_name"):
+            plan_name = app.current_plan_name
+        elif APP_INSTANCE and hasattr(APP_INSTANCE, "current_plan_name"):
+            plan_name = APP_INSTANCE.current_plan_name
+        else:
+            try:
+                plan_name = load_last_active_plan()
+            except Exception:
+                plan_name = "Default"
+
+    plan_name = plan_name or "Default"
+
+    # ✅ Guard: never backfill for an inactive plan
+    if app and hasattr(app, "current_plan_name"):
+        if plan_name != app.current_plan_name:
+            return
+    else:
+        try:
+            active_plan = load_last_active_plan()
+            if active_plan and plan_name != active_plan:
+                return
+        except Exception:
+            pass
+
+    # ✅ Guard: only backfill if this plan was the one active when the app last closed
+    last_seen_plan, has_plan, file_exists = _load_last_seen_plan(return_details=True)
+    if has_plan:
+        if last_seen_plan and last_seen_plan != plan_name:
+            return
+    elif file_exists:
+        # Legacy last_seen file without plan context; avoid cross-plan backfill
+        return
+
+    activation_ts = _get_plan_activation(plan_name)
+    activation_date = activation_ts.date() if activation_ts else None
+
+    # Find the newest date we have in the log (or None) for this plan
     def _parse_date(d):
         try:
             return datetime.strptime(d, "%Y-%m-%d").date()
         except Exception:
             return None
 
-    logged_dates = [_parse_date(e.get("Date")) for e in wastage_log if e.get("Date")]
+    plan_entries = [e for e in wastage_log if e.get("Plan", "Default") == plan_name]
+    logged_dates = [_parse_date(e.get("Date")) for e in plan_entries if e.get("Date")]
     last_logged = max([d for d in logged_dates if d is not None], default=None)
 
     today = datetime.now().date()
@@ -12729,14 +13550,26 @@ def backfill_gap_days(schedule):
     if last_logged is None or last_logged >= yesterday:
         return
 
+    start_date = last_logged + timedelta(days=1)
+
+    # If this plan was activated after the last logged date, avoid backfilling
+    # gaps from before activation (when the plan wasn't active).
+    if activation_date and start_date < activation_date:
+        start_date = activation_date
+
+    if start_date > yesterday:
+        return
+
     # Build a quick lookup of existing keys so we don't duplicate
     existing = set(
         (e.get("Session"), e.get("Scheduled Start"), e.get("Date"))
-        for e in wastage_log
+        for e in plan_entries
     )
 
+    target_app = app or APP_INSTANCE
+
     # Walk every missing day: (last_logged + 1) ... yesterday
-    cur = last_logged + timedelta(days=1)
+    cur = start_date
     while cur <= yesterday:
         for sess in schedule:
             # sess: [SessionName, start_12h, end_12h]
@@ -12757,28 +13590,66 @@ def backfill_gap_days(schedule):
             if key in existing:
                 continue  # already has a row for this session on this day
 
-            add_or_update_wastage(sess[0], scheduled_str, "MISSED", dur, missed="Yes")
+            add_or_update_wastage(
+                sess[0],
+                scheduled_str,
+                "MISSED",
+                dur,
+                missed="Yes",
+                app=target_app,
+                plan_name=plan_name,
+            )
             existing.add(key)
 
         cur += timedelta(days=1)
 
     # Persisted inside add_or_update_wastage; nothing else to do
 
-def log_skipped_sessions(schedule, app=None):
+def log_skipped_sessions(schedule, app=None, plan_name=None):
     now = datetime.now()
     today_str = get_study_day_id(now, schedule)
     load_wastage_log()
-    backfill_gap_days(schedule)
+
+    if plan_name is None:
+        if app and hasattr(app, "current_plan_name"):
+            plan_name = app.current_plan_name
+        elif APP_INSTANCE and hasattr(APP_INSTANCE, "current_plan_name"):
+            plan_name = APP_INSTANCE.current_plan_name
+        else:
+            try:
+                plan_name = load_last_active_plan()
+            except Exception:
+                plan_name = "Default"
+
+    plan_name = plan_name or "Default"
+
+    # ✅ Guard: only log skips for the active plan
+    if app and hasattr(app, "current_plan_name"):
+        if plan_name != app.current_plan_name:
+            return
+    else:
+        try:
+            active_plan = load_last_active_plan()
+            if active_plan and plan_name != active_plan:
+                return
+        except Exception:
+            pass
+
+    activation_ts = _ensure_today_activation(plan_name)
+
+    backfill_gap_days(schedule, app=app, plan_name=plan_name)
     resets = load_reset_wastage()
 
     # Build sets for quick checks
     attended_keys = set(
         (e["Session"], e["Scheduled Start"], e["Date"])
-        for e in wastage_log if e.get("Missed", "No") != "Yes"
+        for e in wastage_log
+        if e.get("Plan", "Default") == plan_name and e.get("Missed", "No") != "Yes"
     )
     missed_keys = set(
         (e["Session"], e["Scheduled Start"], e["Date"])
-        for e in wastage_log if e.get("Missed", "No") == "Yes"
+        for e in wastage_log
+        if e.get("Plan", "Default") == plan_name and e.get("Missed", "No") == "Yes"
     )
 
     today_resets = resets.get(today_str, [])
@@ -12794,11 +13665,23 @@ def log_skipped_sessions(schedule, app=None):
             if (sess[0] in today_resets) or (key in attended_keys) or (key in missed_keys):
                 continue
 
+            if activation_ts and en_dt <= activation_ts:
+                continue
+
             duration = int((en_dt - st_dt).total_seconds())
-            add_or_update_wastage(sess[0], scheduled, "MISSED", duration, missed="Yes", app=app)  # ← Added app=app
+            add_or_update_wastage(
+                sess[0],
+                scheduled,
+                "MISSED",
+                duration,
+                missed="Yes",
+                app=app,
+                plan_name=plan_name,
+            )  # ← Added app=app
 # --- For studied time calculation ---
-def get_today_studied_seconds_actual(schedule):
+def get_today_studied_seconds_actual(schedule, plan_name=None, app=None):
     today_str = datetime.now().strftime("%Y-%m-%d")
+    plan_name = _resolve_plan_name(plan_name, app)
     total = 0
     for idx, sess in enumerate(schedule):
         st_dt, en_dt = get_session_datetimes(sess[1], sess[2])
@@ -12806,11 +13689,12 @@ def get_today_studied_seconds_actual(schedule):
             total += int((en_dt - st_dt).total_seconds())
     today_waste = 0
     for entry in wastage_log:
-        if entry["Date"] == today_str:
+        if entry["Date"] == today_str and entry.get("Plan", "Default") == plan_name:
             today_waste += parse_hhmmss(entry["Wastage (hh:mm:ss)"])
     return max(total - today_waste, 0)
 
-def get_total_studied_seconds_actual(schedule):
+def get_total_studied_seconds_actual(schedule, plan_name=None, app=None):
+    plan_name = _resolve_plan_name(plan_name, app)
     all_dates = set()
     for idx, sess in enumerate(schedule):
         st_dt, en_dt = get_session_datetimes(sess[1], sess[2])
@@ -12820,7 +13704,7 @@ def get_total_studied_seconds_actual(schedule):
         for idx, sess in enumerate(schedule):
             st_dt, en_dt = get_session_datetimes(sess[1], sess[2], datetime.strptime(date, "%Y-%m-%d"))
             total += int((en_dt - st_dt).total_seconds())
-    total_waste = get_total_wastage_seconds()
+    total_waste = get_total_wastage_seconds(plan_name, app)
     return max(total - total_waste, 0)
 
 def play_alarm_sound(alarm_path=None):
@@ -13346,7 +14230,9 @@ class StudyTimerApp(tk.Tk):
         super().__init__()
         self.bind_all('<Control-Shift-D>', self._on_dev_shortcut)
         print("[DEV] Ctrl+Shift+D global shortcut bound")
-        
+        # 🔹 NEW: diagnostics shortcut
+        self.bind_all('<Control-Shift-S>', self._on_send_diagnostics)
+        print("[DIAG] Ctrl+Shift+S global shortcut bound for diagnostics")
         # Load profile and set user info on app
         profile = _load_profile()
         self.user_uid = profile.get("uid", "")
@@ -13492,41 +14378,92 @@ class StudyTimerApp(tk.Tk):
             self._sheet_sync.schedule_heartbeat(self, self._sheet_get_stats)
         except Exception as e:
             print('[GSYNC] schedule failed:', e)
+            
         def integrity_check():
             try:
                 user_profile = _load_profile()
                 
-                # Check license validation
+                # Check license validation (ONLINE-first inside comprehensive_validation)
                 license_valid, license_message = self.license_manager.comprehensive_validation(user_profile)
-                
-                # If first-time user, skip
+
+                # If first-time user, skip integrity checks (trial / onboarding will handle it)
                 if license_message == "first_time_user":
-                    print("[INTEGRITY] First-time user - skipping")
+                    print("[INTEGRITY] First-time user - skipping integrity check.")
                     return
-                
-                # If license is valid, check file integrity
+
+                # If license is valid, do multi-location integrity sanity check
                 if license_valid:
                     offline_status = self.license_manager.check_offline_status(user_profile)
-                    
-                    total_files = offline_status["payment_count"] + offline_status["license_count"]
-                    expected_files = len(self.license_manager.storage_locations) * 2
-                    
-                    if total_files > 0 and total_files < expected_files:
-                        print(f"[INTEGRITY] License files missing - attempting recovery")
-                        
+
+                    payment_ok  = offline_status.get("payment", False)
+                    license_ok  = offline_status.get("license", False)
+                    pay_count   = offline_status.get("payment_count", 0)
+                    lic_count   = offline_status.get("license_count", 0)
+                    total_loc   = offline_status.get("total_locations", 0)
+
+                    total_valid_files = pay_count + lic_count
+                    expected_slots    = max(1, total_loc * 2)
+
+                    print(
+                        f"[INTEGRITY] Offline status -> "
+                        f"payment_ok={payment_ok}, license_ok={license_ok}, "
+                        f"valid_files={total_valid_files}/{expected_slots}"
+                    )
+
+                    # ✅ Case 1: quorum satisfied -> log and continue
+                    if payment_ok and license_ok:
+                        if total_valid_files < expected_slots:
+                            print(
+                                "[INTEGRITY] Warning: partial offline copies "
+                                "(some locations cleaned), but quorum satisfied. Continuing."
+                            )
+                        else:
+                            print("[INTEGRITY] License integrity OK (all locations healthy).")
+                        return
+
+                    # ✅ Case 2: some valid files exist but quorum not satisfied
+                    if total_valid_files > 0:
+                        print("[INTEGRITY] Offline quorum not satisfied - attempting online repair if possible.")
+
                         if self.license_manager._check_internet():
-                            recovery_success = self.license_manager.recover_offline_files_from_online(user_profile)
-                            
+                            # Try to repair from server (this should be fast; server already validated in comprehensive_validation)
+                            try:
+                                recovery_success = self.license_manager.recover_offline_files_from_online(user_profile)
+                            except Exception as e:
+                                print(f"[INTEGRITY] Recovery raised error: {e}")
+                                recovery_success = False
+
                             if recovery_success:
-                                print("[INTEGRITY] Files recovered successfully")
+                                print("[INTEGRITY] Files recovered successfully after quorum failure.")
                                 return
-                        
-                        print(f"[INTEGRITY] Recovery failed - payment: {offline_status['payment_count']}, license: {offline_status['license_count']}")
-                        messagebox.showerror("License Error", 
-                            "License file integrity check failed. Please restart.")
-                        self._force_exit()
-                    
-                    print("[INTEGRITY] License integrity OK")
+
+                            # Here: internet exists, but recovery failed -> this is really suspicious
+                            print(
+                                f"[INTEGRITY] Recovery failed despite internet - "
+                                f"valid files={total_valid_files}/{expected_slots}"
+                            )
+                            messagebox.showerror(
+                                "License Error",
+                                "License file integrity check failed. Please restart."
+                            )
+                            self._force_exit()
+                            return
+
+                        # 🚨 IMPORTANT CHANGE (your request):
+                        # No internet + partial offline state:
+                        #   -> DO NOT hard-exit.
+                        #   -> Allow session, but log that we want an online repair later.
+                        print(
+                            "[INTEGRITY] No internet during partial offline state. "
+                            "Allowing session, but will require online repair on a future run."
+                        )
+                        return
+
+                    # ✅ Case 3: no valid offline files at all
+                    print(
+                        "[INTEGRITY] No valid offline files found. "
+                        "Relying on prior license validation (online/offline) for this session."
+                    )
                     return
                 
                 # ✅ License not valid - check trial
@@ -13560,7 +14497,7 @@ class StudyTimerApp(tk.Tk):
         # ✅ Add validation state tracking
         self._validation_in_progress = False
         self._validation_completed = False
-        self.after(2000, self._check_initial_trial_status)
+        self.after(1000, self._check_initial_trial_status)
         self.after(100000, integrity_check) 
         self.after(900000, self._check_license_and_payment) 
         # Start periodic write (30s) and read (60s) heartbeats
@@ -13839,7 +14776,7 @@ class StudyTimerApp(tk.Tk):
         self.notebook.add(self.live_tab, text="Live Session")
         self.notebook.add(self.wastage_tab, text="Wastage Report")
         self.notebook.pack(fill="both", expand=True)
-        # Create exam-name pill overlayed on the tab row
+        # Create exam-name pill near the plan selector + countdown on tab row
         self.after(0, self._init_exam_header_on_tabs)
 
         
@@ -13950,7 +14887,7 @@ class StudyTimerApp(tk.Tk):
         if self.pause_credit_label:
             self.update_pause_credit_label()
         load_wastage_log()
-        backfill_gap_days(self.schedule)   # add this line
+        backfill_gap_days(self.schedule, app=self, plan_name=self.current_plan_name)   # add this line
         
         self.pause_total_seconds = 0
         self.pause_start = None
@@ -13963,7 +14900,7 @@ class StudyTimerApp(tk.Tk):
         self.update_timer()
         self.protocol("WM_DELETE_WINDOW", self.on_app_close)
 
-        self.total_studied_time = get_total_studied_seconds_actual(self.schedule)
+        self.total_studied_time = get_total_studied_seconds_actual(self.schedule, plan_name=self.current_plan_name, app=self)
         self.set_theme(self.dark_mode)
         self.prev_session_idx = None
         
@@ -14090,8 +15027,10 @@ class StudyTimerApp(tk.Tk):
         if hasattr(self, "exam_countdown_label") and self.exam_countdown_label.winfo_exists():
             return
         if not hasattr(self, "notebook") or not self.notebook.winfo_ismapped():
+            self.after(200, self._ensure_exam_countdown_label)
             return
         if not hasattr(self, "exam_header_label") or not self.exam_header_label.winfo_exists():
+            self.after(200, self._ensure_exam_countdown_label)
             return
 
         # Try to match notebook background, fall back to a neutral color
@@ -14106,9 +15045,9 @@ class StudyTimerApp(tk.Tk):
         self.exam_countdown_label = tk.Label(
             self.notebook,
             text="",
-            font=("Segoe UI", 8),     # slim small letters
+            font=("Segoe UI", 10, "bold"),
             bg=bg_color,
-            fg="#555555",
+            fg="#444444",
         )
         self._position_exam_countdown_label()
 
@@ -14120,8 +15059,9 @@ class StudyTimerApp(tk.Tk):
             not hasattr(self, "exam_countdown_label")
             or not self.exam_countdown_label.winfo_exists()
         ):
-            # If label is gone, stop loop
-            self._exam_countdown_started = False
+            # If label disappeared, recreate and keep loop alive
+            self._ensure_exam_countdown_label()
+            self.after(1000, self._update_exam_countdown)
             return
 
         exam_date = self._get_exam_date_for_current_exam()
@@ -14170,8 +15110,8 @@ class StudyTimerApp(tk.Tk):
         
     def _init_exam_header_on_tabs(self):
         """
-        Create or update the white exam-name pill that sits visually
-        on the tabs row (overlays the ttk.Notebook tab strip).
+        Create or update the white exam-name pill that sits near the
+        plan dropdown while keeping the countdown on the tabs row.
         """
         # Get current exam name from profile
         try:
@@ -14200,44 +15140,54 @@ class StudyTimerApp(tk.Tk):
         visible_exams = [e for e in exam_names if e and e != "__GLOBAL__"]
         has_multiple_exams = len(set(visible_exams)) > 1
 
-        # Notebook must exist and be packed before we can overlay
-        if not hasattr(self, "notebook") or not self.notebook.winfo_ismapped():
-            # Try again a little later if UI not ready
+        # Ensure plan dropdown exists before positioning beside it
+        if not hasattr(self, "plan_display_btn") or not self.plan_display_btn.winfo_exists():
             self.after(200, self._init_exam_header_on_tabs)
             return
 
-        # Build label text
-        label_text = exam_name
-        if has_multiple_exams:
-            label_text = f"{exam_name} ▾"
+        self.exam_header_char_width = 8
+        # Build label text with fixed-width formatting so the dropdown arrow is always visible
+        label_text = self._format_exam_header_label(exam_name)
+
+        plan_font = getattr(self.plan_display_btn, "cget", lambda x: ("Segoe UI", 9))("font")
+        plan_padx = getattr(self.plan_display_btn, "cget", lambda x: 10)("padx")
+        plan_pady = getattr(self.plan_display_btn, "cget", lambda x: 4)("pady")
 
         # If label already exists, just update text and reposition
         if hasattr(self, "exam_header_label") and self.exam_header_label.winfo_exists():
-            self.exam_header_label.config(text=label_text)
+            self.exam_header_label.config(
+                text=label_text,
+                width=self.exam_header_char_width,
+                font=plan_font,
+                padx=plan_padx,
+                pady=plan_pady,
+            )
             self._position_exam_header_label()
             self._ensure_exam_countdown_label()
             return
 
 
-        # Create new label that overlays on top of the tab strip
-        self.exam_header_label = tk.Label(
-            self.notebook,
+        # Create new label that sits near the plan dropdown
+        self.exam_header_label = tk.Button(
+            getattr(self, "plan_button_frame", self.plan_tab),
             text=label_text,
-            font=("Segoe UI", 9),          # normal slim font
+            font=plan_font,
             bg="white",
             fg="#333",
-            bd=0.5,                        # ultra-thin border
+            bd=1,
             relief="solid",
-            padx=8,                        # tighter padding
-            pady=1,                        # slimmer height
+            padx=plan_padx,
+            pady=plan_pady,
+            width=self.exam_header_char_width,
+            anchor="w",
+            cursor="hand2",
+            command=lambda: self._on_exam_header_click(),
         )
-        self.exam_header_label.bind("<Button-1>", self._on_exam_header_click)
 
-        # Position it and keep it centered when notebook resizes
+        # Position it beside the plan dropdown
         self._position_exam_header_label()
-        self.notebook.bind("<Configure>", lambda e: self._position_exam_header_label())
-        
-        # Create / ensure countdown label next to exam name
+
+        # Create / ensure countdown label on the tab row
         self._ensure_exam_countdown_label()
 
         # Start countdown loop once
@@ -14245,44 +15195,65 @@ class StudyTimerApp(tk.Tk):
             self._exam_countdown_started = True
             self._update_exam_countdown()
 
+    def _format_exam_header_label(self, exam_name: str) -> str:
+        """
+        Format the exam label so short names sit near the center while the ▼ stays on
+        the far right edge of the fixed-width button.
+        """
+        safe_name = (exam_name or "No Exam").strip() or "No Exam"
+        total_width = getattr(self, "exam_header_char_width", 8)
+        arrow = " ▼"
+
+        name_space = max(total_width - len(arrow), 1)
+        if len(safe_name) > name_space:
+            safe_name = safe_name[: max(name_space - 1, 1)] + "…"
+
+        # Center the text within the available space and keep the arrow pinned right.
+        if len(safe_name) < name_space:
+            left_pad = (name_space - len(safe_name)) // 2
+            right_pad = name_space - len(safe_name) - left_pad
+        else:
+            left_pad = right_pad = 0
+
+        return f"{' ' * left_pad}{safe_name}{' ' * right_pad}{arrow}"
+
     def _position_exam_header_label(self):
-        """Place the exam header label visually on the tab row."""
+        """Place the exam header label beside the plan dropdown."""
         if not hasattr(self, "exam_header_label") or not self.exam_header_label.winfo_exists():
             return
-        if not hasattr(self, "notebook") or not self.notebook.winfo_ismapped():
+        if (
+            not hasattr(self, "plan_display_btn")
+            or not self.plan_display_btn.winfo_exists()
+        ):
             return
 
         try:
             self.exam_header_label.lift()
-            # Adjust y to your taste; 0 is usually good
-            self.exam_header_label.place(relx=0.5, y=0, anchor="n")
-            self._position_exam_countdown_label()
+            self.exam_header_label.pack(
+                side="left",
+                padx=(0, 8),
+                before=self.plan_display_btn,
+            )
         except Exception as e:
             print(f"[EXAM-UI] Failed to position exam header label: {e}")
 
     def _position_exam_countdown_label(self):
-        """Position the small remaining-time label next to the exam pill."""
+        """Position the remaining-time label on the tab row (centered)."""
         if (
             not hasattr(self, "exam_countdown_label")
             or not self.exam_countdown_label.winfo_exists()
         ):
             return
-        if (
-            not hasattr(self, "exam_header_label")
-            or not self.exam_header_label.winfo_exists()
-        ):
+        if not hasattr(self, "notebook") or not self.notebook.winfo_ismapped():
             return
 
         try:
-            self.exam_header_label.update_idletasks()
-            x = self.exam_header_label.winfo_x() + self.exam_header_label.winfo_width() + 6
-            y = self.exam_header_label.winfo_y() + 2  # slightly lower than pill text
             self.exam_countdown_label.lift()
-            self.exam_countdown_label.place(x=x, y=y)
+            self.exam_countdown_label.place(relx=0.5, y=-6, anchor="n")
         except Exception as e:
             print(f"[EXAM-UI] Failed to position countdown label: {e}")
 
-    def _on_exam_header_click(self, event):
+    def _on_exam_header_click(self, event=None):
         """
         When user clicks the exam pill:
         - If only one exam exists, do nothing.
@@ -14321,8 +15292,13 @@ class StudyTimerApp(tk.Tk):
 
             menu.add_command(label=label, command=_make_cmd())
 
+        x_root = event.x_root if event is not None else self.exam_header_label.winfo_rootx()
+        y_root = event.y_root if event is not None else (
+            self.exam_header_label.winfo_rooty() + self.exam_header_label.winfo_height()
+        )
+
         try:
-            menu.tk_popup(event.x_root, event.y_root)
+            menu.tk_popup(x_root, y_root)
         finally:
             menu.grab_release()
 
@@ -14951,6 +15927,193 @@ class StudyTimerApp(tk.Tk):
     def _on_dev_shortcut(self, event):
         print("[DEV] Shortcut pressed")
         self._dev_cleanup()    
+        
+    def _on_send_diagnostics(self, event=None):
+        """Ctrl+Shift+S -> send a diagnostics snapshot to the Diagnostics sheet."""
+        from datetime import datetime
+        import os
+
+        print("[DIAG] Sending diagnostics snapshot...")
+
+        # 1) Load profile for UID / name / install_id
+        try:
+            user_profile = _load_profile()
+        except Exception as e:
+            print(f"[DIAG] Failed to load profile: {e}")
+            user_profile = {}
+
+        uid = user_profile.get("uid", "")
+        user_name = user_profile.get("user_name", "")
+        install_id = user_profile.get("install_id", "")
+
+        # 2) Init variables
+        license_valid = False
+        license_message = ""
+        trial_status = ""
+        trial_message = ""
+        days_remaining = ""
+
+        offline_status = {
+            "payment": False,
+            "license": False,
+            "payment_count": 0,
+            "license_count": 0,
+            "total_locations": 0,
+        }
+
+        # offline trial status summary (we’ll fill later)
+        trial_offline_status = {
+            "trial_ok": None,
+            "valid_trial_locations": 0,
+            "any_trial_locations": 0,
+            "total_locations": 0,
+        }
+
+        internet_available = False
+        online_status = None
+        online_error = ""
+        self._last_location_details_for_diag = ""
+        trial_location_details = ""
+
+        # ---- LICENSE + OFFLINE/ONLINE SNAPSHOT ----
+        try:
+            if hasattr(self, "license_manager") and self.license_manager:
+                # Uses your online-first comprehensive_validation
+                license_valid, license_message = self.license_manager.comprehensive_validation(user_profile)
+                offline_status = self.license_manager.check_offline_status(user_profile)
+                internet_available = self.license_manager._check_internet()
+
+                # License/payment per-location diagnostics summary
+                try:
+                    loc_diags = self.license_manager.get_location_diagnostics(user_profile)
+                    summary_parts = []
+                    for d in loc_diags:
+                        part = (
+                            f"[{d.get('index')}] {d.get('path')} | "
+                            f"pay={d.get('payment_status')} | "
+                            f"lic={d.get('license_status')}"
+                        )
+                        summary_parts.append(part)
+                    self._last_location_details_for_diag = " || ".join(summary_parts)
+                except Exception as e:
+                    print(f"[DIAG] Error while building location details: {e}")
+                    self._last_location_details_for_diag = ""
+
+                # Online snapshot (best-effort)
+                try:
+                    self.license_manager._connect_unified_gsheet()
+                    online_status = self.license_manager.check_online_status(user_profile)
+                except Exception as oe:
+                    online_error = str(oe)
+        except Exception as e:
+            print(f"[DIAG] Error while collecting license status: {e}")
+
+        # ---- TRIAL SNAPSHOT (logic + offline + per-location) ----
+        try:
+            if hasattr(self, "trial_manager") and self.trial_manager:
+                # Logical trial status
+                trial_status, trial_message, days_remaining = self.trial_manager.validate_trial(user_profile)
+
+                # Aggregate offline trial status
+                try:
+                    trial_offline_status = self.trial_manager.get_offline_trial_status(user_profile)
+                except Exception as te:
+                    print(f"[DIAG] Error while collecting offline trial status: {te}")
+                    trial_offline_status = {
+                        "trial_ok": None,
+                        "valid_trial_locations": 0,
+                        "any_trial_locations": 0,
+                        "total_locations": 0,
+                    }
+
+                # 🔹 Per-location TRIAL diagnostics string (this is the column you want)
+                try:
+                    trial_loc_diags = self.trial_manager.get_trial_location_diagnostics(user_profile)
+                    t_parts = []
+                    for d in trial_loc_diags:
+                        t_parts.append(
+                            f"[{d.get('index')}] {d.get('path')} | trial={d.get('trial_status')}"
+                        )
+                    trial_location_details = " || ".join(t_parts)
+                except Exception as te2:
+                    print(f"[DIAG] Error while building trial location details: {te2}")
+                    trial_location_details = ""
+        except Exception as e:
+            print(f"[DIAG] Error while collecting trial status: {e}")
+
+        # 3) Determine which locations are missing any LICENSE files (simple flag)
+        failed_locations = []
+        try:
+            if hasattr(self, "license_manager") and self.license_manager:
+                for loc in getattr(self.license_manager, "storage_locations", []):
+                    payment_path = os.path.join(loc, "payment_status.json")
+                    license_path = os.path.join(loc, "app_license.dat")
+                    if (not os.path.exists(payment_path)) or (not os.path.exists(license_path)):
+                        failed_locations.append(loc)
+        except Exception as e:
+            print(f"[DIAG] Error while checking locations: {e}")
+
+        # 4) Build diagnostics dict
+        diagnostics = {
+            # USER INFO
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "uid": uid,
+            "user_name": user_name,
+            "install_id": install_id,
+            "machine_id": getattr(self.license_manager, "machine_id", "") if hasattr(self, "license_manager") else "",
+
+            # TRIAL (logic + offline + locations)
+            "trial_status": trial_status,
+            "trial_message": trial_message,
+            "trial_days_remaining": days_remaining,
+            "offline_trial_ok": trial_offline_status.get("trial_ok"),
+            "offline_trial_valid_locations": trial_offline_status.get("valid_trial_locations"),
+            "offline_trial_any_locations": trial_offline_status.get("any_trial_locations"),
+            "offline_trial_total_locations": trial_offline_status.get("total_locations"),
+            "trial_location_details": trial_location_details,
+
+            # LICENSE / PAYMENT (logic + offline + online + locations)
+            "license_valid": license_valid,
+            "license_message": license_message,
+            "internet_available": internet_available,
+            "offline_payment_ok": offline_status.get("payment"),
+            "offline_license_ok": offline_status.get("license"),
+            "offline_payment_count": offline_status.get("payment_count"),
+            "offline_license_count": offline_status.get("license_count"),
+            "offline_total_locations": offline_status.get("total_locations"),
+            "online_status_payment": online_status.get("payment") if isinstance(online_status, dict) else "",
+            "online_status_license": online_status.get("license") if isinstance(online_status, dict) else "",
+            "online_status_error": online_error or (online_status.get("error") if isinstance(online_status, dict) else ""),
+            "location_details": getattr(self, "_last_location_details_for_diag", ""),
+        }
+
+        # 5) Send to Diagnostics sheet via UnifiedLicenseManager
+        success = False
+        try:
+            if hasattr(self, "license_manager") and self.license_manager:
+                success = self.license_manager.append_diagnostics(user_profile, diagnostics)
+        except Exception as e:
+            print(f"[DIAG] Failed to append diagnostics: {e}")
+            success = False
+
+        # 6) Notify user
+        try:
+            if success:
+                messagebox.showinfo(
+                    "Diagnostics Sent",
+                    "A diagnostics snapshot has been sent to the developer.\n"
+                    "You can now contact support and mention your UID or Install ID."
+                )
+            else:
+                messagebox.showwarning(
+                    "Diagnostics Failed",
+                    "Unable to send diagnostics snapshot.\n"
+                    "Please check your internet connection and try again."
+                )
+        except Exception:
+            pass
+
+        print(f"[DIAG] Diagnostics send result: {success}")   
         
     def show_plan_menu(self):
         """Show plan menu with individual submenus per plan."""
@@ -17736,11 +18899,11 @@ class StudyTimerApp(tk.Tk):
                 if profile.get('used_referral', False):
                     return 150  # Discounted price
                     
-            return 34900  # Standard price
+            return 100  # Standard price
             
         except Exception as e:
             print(f"Error getting subscription price: {e}")
-            return 34900  # Default to standard price
+            return 100  # Default to standard price
         
     def setup_email_and_referral_ui(self):
         """Setup both email and referral buttons"""
@@ -20068,9 +21231,11 @@ class StudyTimerApp(tk.Tk):
         if name in self.plans:
             self.current_plan_name = name
             self.schedule = self.plans[name]
-            
+
             # ✅ Save the last active plan
             save_last_active_plan(name)
+            # Mark this plan as (re)activated right now
+            _record_plan_activation(name)
             
             # ✅ Register all sessions in this plan
             self._register_all_plan_sessions()
@@ -20293,43 +21458,13 @@ class StudyTimerApp(tk.Tk):
 
         # ✅ NEW: Create with AI button
         def on_create_with_ai():
-            name = plan_name_var.get().strip()
-            
-            if not name:
-                validation_label.config(text="⚠ Please enter a plan name", fg="#e74c3c")
-                name_entry.focus_set()
-                return
-            
-            if name in self.plans:
-                validation_label.config(text="⚠ Plan name already exists", fg="#e74c3c")
-                name_entry.focus_set()
-                return
-            
-            if len(name) > 50:
-                validation_label.config(text="⚠ Plan name too long", fg="#e74c3c")
-                name_entry.focus_set()
-                return
-            
-            # Create the plan
-            self.plans[name] = []
-            save_all_plans(self.plans)
-            
-            self.plan_var.set(name)
-            self.current_plan_name = name  # ✅ Set current plan name
-            self.schedule = []  # ✅ Empty schedule initially
-            
-            # Save as last active plan
-            save_last_active_plan(name)
-            
-            # ✅ Register all sessions (currently none, but will register after AI creates them)
-            self._register_all_plan_sessions()
-            
-            self.refresh_plan_tree()  # ✅ Use refresh_plan_tree instead of switch_plan
-            
+            """Start AI plan creation without requiring a manual name."""
+
+            # Close the popup immediately so AI dialog can take over
             popup.grab_release()
             popup.destroy()
-            
-            # Open AI plan creation dialog
+
+            # Open AI plan creation dialog (AI will create and name plans)
             self.after(100, self._open_ai_plan_creation)
 
         # Bind Enter key
@@ -20584,7 +21719,7 @@ class StudyTimerApp(tk.Tk):
         try:
             import re
             load_wastage_log()
-            backfill_gap_days(self.schedule)
+            backfill_gap_days(self.schedule, app=self, plan_name=self.current_plan_name)
             global wastage_log
             wastage_log[:] = [e for e in wastage_log if e.get("Session", "") not in set(deleted_names)]
             save_wastage_log()
@@ -22129,8 +23264,64 @@ class StudyTimerApp(tk.Tk):
     def refresh_goal_and_markers(self):
         """Recalculate goal hours & markers, then refresh UI + progress denominator."""
         try:
-            hours = float(calculate_goal_duration_hours())
-        except Exception:
+            from datetime import datetime, timedelta, date
+
+            # Prefer a live recomputation so we never get stuck on a stale per-day value
+            # saved in goal_config.json. We compute the daily hours from the current
+            # schedule, then multiply by the active exam window.
+            daily_hours = 0.0
+            try:
+                total_minutes = 0
+                for sess in getattr(self, "schedule", []) or []:
+                    if not sess or len(sess) < 3:
+                        continue
+                    start = parse_time(sess[1])
+                    end = parse_time(sess[2])
+                    if start and end:
+                        st_dt = datetime.combine(date.today(), start)
+                        en_dt = datetime.combine(date.today(), end)
+                        if en_dt <= st_dt:
+                            en_dt += timedelta(days=1)
+                        total_minutes += (en_dt - st_dt).total_seconds() / 60
+                if total_minutes > 0:
+                    daily_hours = total_minutes / 60
+            except Exception:
+                pass
+
+            # Fallbacks if schedule is empty
+            if daily_hours <= 0:
+                try:
+                    import json, os
+                    if os.path.exists(app_paths.goal_config_file):
+                        with open(app_paths.goal_config_file, "r") as f:
+                            content = f.read().strip()
+                            if content:
+                                cfg = json.loads(content)
+                                daily_hours = float(cfg.get("daily_hours", 0.0) or 0.0)
+                except Exception:
+                    pass
+            if daily_hours <= 0:
+                daily_hours = _get_daily_hours_fallback()
+
+            exam_date = getattr(self, "progress_exam_date", None) or _load_exam_date_only()
+            if exam_date:
+                self.progress_exam_date = exam_date
+            days_left = max((exam_date - date.today()).days, 0) if exam_date else 0
+
+            computed_total = round(daily_hours * days_left, 2) if daily_hours > 0 and days_left > 0 else 0.0
+
+            base_hours = float(getattr(self, "progress_goal_hours", 0.0) or 0.0)
+
+            if computed_total > 0:
+                hours = computed_total
+            elif hasattr(self, "_calculate_goal_from_schedule"):
+                hours = float(self._calculate_goal_from_schedule() or 0.0)
+            elif base_hours > 0:
+                hours = base_hours
+            else:
+                hours = float(calculate_goal_duration_hours())
+        except Exception as e:
+            print(f"[GOAL] refresh_goal_and_markers failed: {e}")
             hours = 0.0
 
         # keep both names in sync (UI uses target_hours_var / progress_goal_hours)
@@ -22564,30 +23755,47 @@ class StudyTimerApp(tk.Tk):
         except Exception as e:
             print(f"Failed to save daily report status: {e}")
 
-    def is_report_sent_today(self):
-        """Check if today's report has already been sent"""
-        status = self.load_daily_report_status()
-        today_str = date.today().isoformat()
-        return status.get(today_str, {}).get("sent", False)
+    def is_report_sent(self, report_date: date | None = None):
+        """Check if a specific day's report has already been sent.
 
-    def mark_report_sent_today(self):
-        """Mark today's report as sent"""
+        Defaults to today's date when ``report_date`` is not provided.
+        """
+        if report_date is None:
+            report_date = date.today()
+
         status = self.load_daily_report_status()
-        today_str = date.today().isoformat()
-        status[today_str] = {
+        date_key = report_date.isoformat()
+        return status.get(date_key, {}).get("sent", False)
+
+    def is_report_sent_today(self):
+        """Compatibility wrapper for existing call sites."""
+        return self.is_report_sent(date.today())
+
+    def mark_report_sent(self, report_date: date | None = None, sent_via: str = "auto"):
+        """Mark a specific day's report as sent."""
+        if report_date is None:
+            report_date = date.today()
+
+        status = self.load_daily_report_status()
+        date_key = report_date.isoformat()
+        status[date_key] = {
             "sent": True,
             "sent_at": datetime.now().isoformat(),
-            "sent_via": "auto"  # or "startup" or "manual"
+            "sent_via": sent_via  # "auto" | "startup" | "manual"
         }
         self.save_daily_report_status(status)
+
+    def mark_report_sent_today(self):
+        """Compatibility wrapper for existing call sites."""
+        self.mark_report_sent(date.today())
 
     def save_pending_report(self, report_date=None):
         """Save a pending report snapshot (only if no report sent today)"""
         if report_date is None:
             report_date = date.today()
         
-        # Don't save if today's report already sent
-        if self.is_report_sent_today():
+        # Don't save if the report for the target date was already sent
+        if self.is_report_sent(report_date):
             print(f"[PENDING] Report already sent for {report_date}, not saving pending report")
             return False
         
@@ -22637,7 +23845,7 @@ class StudyTimerApp(tk.Tk):
             report_date = date.today()
 
         # Check if already sent today
-        if self.is_report_sent_today():
+        if self.is_report_sent(report_date):
             print(f"[REPORT] Report already sent for {report_date}, skipping")
             return False
 
@@ -22687,9 +23895,9 @@ class StudyTimerApp(tk.Tk):
                     print("[REPORT] Email blocked - Premium feature")
 
             # ✅ Mark as sent
-            self.mark_report_sent_today()
-            print(f"[REPORT] Successfully sent daily report for {report_date}")
-            return True
+                self.mark_report_sent(report_date, sent_via)
+                print(f"[REPORT] Successfully sent daily report for {report_date}")
+                return True
 
         except Exception as e:
             print(f"[REPORT] Failed to send daily report: {e}")
@@ -22750,7 +23958,7 @@ class StudyTimerApp(tk.Tk):
 
                 # ✅ Mark as sent or save as pending
                 if telegram_success or email_success:
-                    self.mark_report_sent_today()
+                    self.mark_report_sent(today, sent_via="11:59pm")
                     print(f"[11:59] Report sent (Telegram: {telegram_success}, Email: {email_success})")
                 else:
                     self.save_pending_report(today)
@@ -22780,7 +23988,7 @@ class StudyTimerApp(tk.Tk):
         """Check for pending reports on startup and send if needed"""
         try:
             # Check if today's report already sent
-            if self.is_report_sent_today():
+            if self.is_report_sent(date.today()):
                 print("[STARTUP] Today's report already sent, no need to check pending")
                 self.clear_pending_report()
                 return
@@ -22795,7 +24003,7 @@ class StudyTimerApp(tk.Tk):
             today = date.today()
             
             # Only send if pending report is for yesterday and today's report not sent yet
-            if pending_date == today - timedelta(days=1) and not self.is_report_sent_today():
+            if pending_date == today - timedelta(days=1) and not self.is_report_sent(pending_date):
                 print(f"[STARTUP] Found pending report for {pending_date}, attempting to send")
                 
                 # ADD PREMIUM CHECK HERE for email portion
@@ -23228,6 +24436,14 @@ class StudyTimerApp(tk.Tk):
 
         date_str = report_date.strftime("%Y-%m-%d")
         cutoff_date = report_date - timedelta(days=30)
+        resolved_plan = _resolve_plan_name(getattr(self, "current_plan_name", None), self)
+
+        # Always load freshest wastage data for the active plan
+        try:
+            load_wastage_log()
+            backfill_gap_days(self.schedule, app=self, plan_name=resolved_plan)
+        except Exception as e:
+            print(f"[PDF] Unable to refresh wastage log: {e}")
         
         
 
@@ -23236,12 +24452,15 @@ class StudyTimerApp(tk.Tk):
         try:
             # First try to get from live stopwatch if available
             today_studied_sec = int(getattr(self, "today_study_stopwatch_seconds", 0))
-            
-            # If zero, check the studied_today_time.json file
-            if today_studied_sec == 0 and os.path.exists(STUDY_TODAY_FILE):
-                with open(STUDY_TODAY_FILE, "r") as f:
-                    data = json.load(f)
-                today_studied_sec = int(data.get(date_str, 0))
+
+            # If zero, check the studied_today_time.json file scoped to the active plan
+            if today_studied_sec == 0:
+                data = load_today_studied_data()
+                if resolved_plan in data and isinstance(data[resolved_plan], dict):
+                    today_studied_sec = int(data[resolved_plan].get(date_str, 0))
+                elif date_str in data:
+                    # Legacy single-plan format
+                    today_studied_sec = int(data.get(date_str, 0))
         except Exception as e:
             print(f"Error getting today's studied time: {e}")
             today_studied_sec = 0
@@ -23251,19 +24470,25 @@ class StudyTimerApp(tk.Tk):
         # ===== 2) Get Total Studied (last 30 days) =====
         total_studied_sec = 0
         try:
-            if os.path.exists(app_paths.study_today_file):
-                with open(app_paths.study_today_file, "r") as f:
-                    data = json.load(f)
-                for day_str, sec in data.items():
-                    try:
-                        day = datetime.strptime(day_str, "%Y-%m-%d").date()
-                        if day >= cutoff_date:
-                            total_studied_sec += int(sec)
-                    except ValueError:
-                        continue
-            
-            # Also include today's live seconds if not already saved
-            if date_str not in data:
+            plan_data = {}
+            raw_data = load_today_studied_data()
+            if isinstance(raw_data, dict):
+                if resolved_plan in raw_data and isinstance(raw_data[resolved_plan], dict):
+                    plan_data = raw_data[resolved_plan]
+                elif all(k.startswith("20") for k in raw_data.keys()):
+                    # Legacy single-plan structure
+                    plan_data = raw_data
+
+            for day_str, sec in plan_data.items():
+                try:
+                    day = datetime.strptime(day_str, "%Y-%m-%d").date()
+                    if day >= cutoff_date:
+                        total_studied_sec += int(sec)
+                except ValueError:
+                    continue
+
+            # Also include today's live seconds if not already saved for this plan
+            if date_str not in plan_data:
                 total_studied_sec += today_studied_sec
         except Exception as e:
             print(f"Error calculating 30-day studied time: {e}")
@@ -23273,15 +24498,30 @@ class StudyTimerApp(tk.Tk):
 
         # ===== 3) Get Today's Wastage Time =====
         today_wastage_sec = 0
+        wastage_summary = {}
+        try:
+            wastage_summary = load_wastage_day_summary(resolved_plan) or {}
+        except Exception as e:
+            print(f"[PDF] Unable to load wastage summary: {e}")
+
         if data_snapshot and "today_rows" in data_snapshot:
             for row in data_snapshot["today_rows"]:
                 if len(row) > 3:  # Ensure wastage column exists
                     today_wastage_sec += parse_hhmmss(row[3])
+        elif wastage_summary:
+            todays_row = wastage_summary.get(date_str, {})
+            for key, val in todays_row.items():
+                if key == "Missed Sessions":
+                    continue
+                today_wastage_sec += int(val or 0)
         else:
             for entry in wastage_log:
-                if entry.get("Date") == date_str:
+                if (
+                    entry.get("Date") == date_str
+                    and entry.get("Plan", "Default") == resolved_plan
+                ):
                     today_wastage_sec += parse_hhmmss(entry.get("Wastage (hh:mm:ss)", "00:00:00"))
-        
+
         today_wastage = hhmmss_from_seconds(today_wastage_sec)
 
         # ===== 4) Get Total Wastage (last 30 days) =====
@@ -23294,15 +24534,29 @@ class StudyTimerApp(tk.Tk):
                         total_wastage_sec += parse_hhmmss(row[-1])  # last column is total
                 except (ValueError, IndexError):
                     continue
+        elif wastage_summary:
+            for day_str, totals in wastage_summary.items():
+                try:
+                    entry_date = datetime.strptime(day_str, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                if entry_date < cutoff_date:
+                    continue
+                for key, val in totals.items():
+                    if key == "Missed Sessions":
+                        continue
+                    total_wastage_sec += int(val or 0)
         else:
             for entry in wastage_log:
                 try:
                     entry_date = datetime.strptime(entry["Date"], "%Y-%m-%d").date()
+                    if entry.get("Plan", "Default") != resolved_plan:
+                        continue
                     if entry_date >= cutoff_date:
                         total_wastage_sec += parse_hhmmss(entry["Wastage (hh:mm:ss)"])
                 except (KeyError, ValueError):
                     continue
-        
+
         total_wastage = hhmmss_from_seconds(total_wastage_sec)
 
         # Rest of your PDF generation code...
@@ -23376,12 +24630,34 @@ class StudyTimerApp(tk.Tk):
         c.setFont("Helvetica-Bold", 16)
         c.drawString(left_margin, y, f"Study Timer Report - {date_str}")
         y -= 20
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(left_margin, y, f"Plan: {resolved_plan}")
+
+        exam_name = (getattr(self, "current_exam_name", "") or "").strip()
+        if not exam_name:
+            try:
+                prof = _load_profile() or {}
+                exam_name = (prof.get("exam_name") or "").strip()
+                self.current_exam_name = exam_name
+            except Exception as e:
+                print(f"[PDF] Unable to resolve exam name: {e}")
+                exam_name = ""
+        if not exam_name:
+            exam_name = "No Exam"
+
+        c.drawCentredString(width / 2, y, f"Exam: {exam_name}")
+        y -= 28
 
         # ===== 2) Generated at + Days left =====
-        days_left = (date(2025, 10, 27) - report_date).days
+        exam_date = (
+            self._get_exam_date_for_current_exam()
+            or getattr(self, "progress_exam_date", None)
+            or _load_exam_date_only()
+        )
+        exam_days_left = max((exam_date - report_date).days, 0) if exam_date else 0
         c.setFont("Helvetica", 10)
         c.drawString(left_margin, y, f"Generated at: {snapshot_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
-        c.drawRightString(width - left_margin, y, f"Days left for exam: {days_left}")
+        c.drawRightString(width - left_margin, y, f"Days left for exam: {exam_days_left}")
         y -= 20
 
         # ===== 3) Random Quote =====
@@ -23482,29 +24758,57 @@ class StudyTimerApp(tk.Tk):
 
             _day_labels = [_label_for(d) for d in _dates7]
 
-            # Wastage (seconds) per day
-            _waste_by_date = {d:0 for d in _dates7}
-            try:
-                if os.path.exists(app_paths.wastage_file):
-                    with open(app_paths.wastage_file,"r", newline="") as _f:
-                        _reader = _csv.DictReader(_f)
-                        for _row in _reader:
-                            _d = _row.get("Date","")
-                            if _d in _waste_by_date:
-                                _hms = _row.get("Wastage (hh:mm:ss)", "00:00:00")
-                                try:
-                                    _h, _m, _s = [int(x) for x in _hms.split(":")]
-                                    _waste_by_date[_d] += _h*3600 + _m*60 + _s
-                                except Exception:
-                                    pass
-            except Exception:
-                pass
-
             # Normalize session names: e.g., "Tech 1" -> "Tech"
             def _norm(name):
                 nm = (name or "").strip()
                 nm = _re.sub(r"[_\-]*\d+\s*$", "", nm, flags=_re.IGNORECASE)  # drop trailing numbers
                 return nm.strip().title() or "Session"
+
+            # Wastage (seconds) per day — scoped to active plan
+            _waste_by_date = {d:0 for d in _dates7}
+            _waste_by_session_day = {d:{} for d in _dates7}
+            _wastage_summary = {}
+            try:
+                _wastage_summary = load_wastage_day_summary(resolved_plan) or {}
+            except Exception:
+                _wastage_summary = {}
+
+            def _coerce_sec(val):
+                if isinstance(val, (int, float)):
+                    return int(val)
+                if isinstance(val, str):
+                    if ":" in val:
+                        try:
+                            return int(parse_hhmmss(val))
+                        except Exception:
+                            return 0
+                    try:
+                        return int(float(val))
+                    except Exception:
+                        return 0
+                return 0
+
+            if _wastage_summary:
+                for d in _dates7:
+                    for _sess_name, _sec in (_wastage_summary.get(d, {}) or {}).items():
+                        if _sess_name == "Missed Sessions":
+                            continue
+                        _sec_int = _coerce_sec(_sec)
+                        _waste_by_date[d] += _sec_int
+                        _norm_name = _norm(_sess_name)
+                        _waste_by_session_day[d][_norm_name] = _waste_by_session_day[d].get(_norm_name, 0) + _sec_int
+            else:
+                try:
+                    load_wastage_log()
+                except Exception:
+                    pass
+                for _entry in get_current_plan_wastage_log(resolved_plan):
+                    _d = _entry.get("Date", "")
+                    if _d in _waste_by_date:
+                        _sec = parse_hhmmss(_entry.get("Wastage (hh:mm:ss)", "00:00:00"))
+                        _waste_by_date[_d] += _sec
+                        _norm_name = _norm(_entry.get("Session", ""))
+                        _waste_by_session_day[_d][_norm_name] = _waste_by_session_day[_d].get(_norm_name, 0) + _sec
 
             # Scheduled seconds per (normalized) session per day
             _sched_by_sess_day = {d:{} for d in _dates7}  # {date:{sess:secs}}
@@ -23520,25 +24824,64 @@ class StudyTimerApp(tk.Tk):
             except Exception:
                 pass
 
-            # Per-day studied seconds = scheduled - wastage (>=0)
-            _studied_by_date_secs = []
-            for d in _dates7:
-                _stud = max(0, _sched_total_by_day.get(d,0) - _waste_by_date.get(d,0))
-                _studied_by_date_secs.append(_stud)
+            # Actual studied seconds per day (plan scoped) — include live seconds for today
+            _actual_by_day = {d: 0 for d in _dates7}
+            try:
+                _studied_data = load_today_studied_data()
+                if isinstance(_studied_data, dict):
+                    if resolved_plan in _studied_data and isinstance(_studied_data[resolved_plan], dict):
+                        for _d, _sec in _studied_data[resolved_plan].items():
+                            if _d in _actual_by_day:
+                                _actual_by_day[_d] = max(_actual_by_day[_d], int(_sec or 0))
+                    else:
+                        for _d, _sec in _studied_data.items():
+                            if _d in _actual_by_day and isinstance(_sec, (int, float)):
+                                _actual_by_day[_d] = max(_actual_by_day[_d], int(_sec))
+                _today_str = date.today().strftime("%Y-%m-%d")
+                if _today_str in _actual_by_day:
+                    _actual_by_day[_today_str] = max(
+                        _actual_by_day[_today_str],
+                        int(getattr(self, "today_study_stopwatch_seconds", 0)),
+                    )
+            except Exception:
+                pass
 
-            # Per-session studied & total seconds over 7 days (proportional wastage removal per day)
+            # Per-day studied seconds: prefer actual tracked study time; fallback to scheduled minus wastage
+            _studied_by_date_secs = []
             _studied_by_session = {}
             _total_by_session   = {}
             for d in _dates7:
-                _day_total = _sched_total_by_day.get(d,0)
-                _day_waste = _waste_by_date.get(d,0)
+                _day_sched_total = _sched_total_by_day.get(d, 0)
+                _day_actual = int(_actual_by_day.get(d, 0))
+                _has_actual = _day_actual > 0
+
+                _day_waste = _waste_by_date.get(d, 0)
+                _day_waste_by_session = _waste_by_session_day.get(d, {})
+                _has_waste = (_day_waste > 0) or bool(_day_waste_by_session)
+
+                if not _has_actual:
+                    if _has_waste:
+                        _day_actual = max(0, _day_sched_total - _day_waste)
+                    else:
+                        _day_actual = 0
+                if _day_sched_total > 0:
+                    _day_actual = min(_day_actual, _day_sched_total)
+
+                _studied_by_date_secs.append(_day_actual)
                 for _sess, _sec in _sched_by_sess_day[d].items():
                     _total_by_session[_sess] = _total_by_session.get(_sess, 0) + _sec
-                    if _day_total > 0:
-                        _share = _sec / _day_total
+
+                    if _has_actual and _day_sched_total > 0:
+                        _share = _sec / _day_sched_total
+                        _sess_stud = min(_sec, int(round(_day_actual * _share)))
+                    elif _has_waste and _sess in _day_waste_by_session:
+                        _sess_stud = max(0, _sec - _day_waste_by_session.get(_sess, 0))
+                    elif _has_waste and _day_sched_total > 0:
+                        _share = _sec / _day_sched_total
                         _sess_stud = max(0, int(_sec - _share * _day_waste))
                     else:
                         _sess_stud = 0
+
                     _studied_by_session[_sess] = _studied_by_session.get(_sess, 0) + _sess_stud
 
             # --- Prepare series ---
@@ -23554,6 +24897,7 @@ class StudyTimerApp(tk.Tk):
             # ------------------- Render charts to buffers -------------------
             _bar_buf = None
             _donut_buf = None
+            _cmp_buf = None
             try:
                 import matplotlib
                 matplotlib.use("Agg")
@@ -23588,24 +24932,24 @@ class StudyTimerApp(tk.Tk):
 
                 
                 # --- VERTICAL BAR: days (studied hours per day) ---
-                if sum(_donut_vals) > 0:
+                if _donut_vals:
                     _donut_buf = _io.BytesIO()
                     _fig2, _ax2 = _plt.subplots(figsize=(9.8, 4.2))
-                    
+
                     # Create color list for bars
                     _bar_colors = [_plt.get_cmap('tab20').colors[i % 20] for i in range(len(_day_labels))]
-                    
+
                     # Create vertical bars with reduced width
                     _x_pos = range(len(_day_labels))
-                    bars = _ax2.bar(_x_pos, _donut_vals, width=0.5, color=_bar_colors, 
+                    bars = _ax2.bar(_x_pos, _donut_vals, width=0.5, color=_bar_colors,
                                     edgecolor='black', linewidth=0.5)
-                    
+
                     # Add value labels on top of bars (only for non-zero values)
                     for i, (bar, val) in enumerate(zip(bars, _donut_vals)):
                         if val > 0:
                             _ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
                                      f'{val:.1f}h', ha='center', va='bottom', fontsize=9)
-                    
+
                     # Styling
                     _ax2.set_title("Studied Hours per Day — Last 7 Days", fontsize=18, pad=12)
                     _ax2.set_xlabel("Days", fontsize=11)
@@ -23613,54 +24957,53 @@ class StudyTimerApp(tk.Tk):
                     _ax2.set_xticks(_x_pos)
                     _ax2.set_xticklabels(_day_labels, fontsize=10)
                     _ax2.grid(axis='y', alpha=0.3, linestyle='--')
-                    _ax2.set_ylim(0, max(_donut_vals) * 1.15 if max(_donut_vals) > 0 else 1)
-                    
+                    _max_val = max(_donut_vals) if _donut_vals else 0
+                    _ax2.set_ylim(0, _max_val * 1.15 if _max_val > 0 else 1)
+
                     _fig2.tight_layout()
                     _fig2.savefig(_donut_buf, format="PNG", dpi=170)
                     _plt.close(_fig2)
                     _donut_buf.seek(0)
-                    
-                    # --- HORIZONTAL COMPARISON: You vs Your Target (last 7 days planned) ---
-                    try:
-                        import matplotlib
-                        matplotlib.use("Agg")
-                        import matplotlib.pyplot as _plt
-                        _cmp_buf = _io.BytesIO()
-                       
-                        # Compute 'You' = total studied so far; 'Your goal' = overall goal duration
-                        try:
-                            _you_hours = round(get_total_stopwatch_studied() / 3600.0, 1)
-                        except Exception:
-                            _you_hours = 0.0
 
-                        try:
-                            _goal_hours = round(float(calculate_goal_duration_hours()), 1)
-                        except Exception:
-                            _goal_hours = 0.0
-                        _vals = [_you_hours, _goal_hours]
-                        _labels = ["You", "Your goal"]
-                        _fig3, _ax3 = _plt.subplots(figsize=(11.0, 2.7))  # wide
-                        _ax3.barh(_labels, _vals)
-                        _ax3.set_xlabel("Hours")
-                        _ax3.set_title("Current progress vs your goal")
-                        for i, v in enumerate(_vals):
-                            _ax3.text(v + (max(_vals)*0.01 if max(_vals)>0 else 0.1), i, f"{v:.1f}h", va="center", fontsize=9)
-                        _fig3.tight_layout()
-                        _fig3.savefig(_cmp_buf, format="PNG", dpi=170)
-                        _plt.close(_fig3)
-                        _cmp_buf.seek(0)
-                    except Exception as _e:
-                        _cmp_buf = None
-                    _donut_buf.seek(0)
+                # --- HORIZONTAL COMPARISON: You vs Your Target (last 7 days planned) ---
+                try:
+                    _cmp_buf = _io.BytesIO()
+
+                    # Compute 'You' = total studied for active plan; 'Your goal' = remaining target hours
+                    try:
+                        _you_hours = round(get_total_stopwatch_studied(resolved_plan) / 3600.0, 1)
+                    except Exception:
+                        _you_hours = 0.0
+
+                    try:
+                        _daily_hours = max(self._daily_planned_minutes(), 0) / 60.0
+                        _goal_hours = round(float(_daily_hours * exam_days_left), 1)
+                    except Exception:
+                        _goal_hours = 0.0
+                    _vals = [_you_hours, _goal_hours]
+                    _labels = ["You", "Your goal"]
+                    _fig3, _ax3 = _plt.subplots(figsize=(11.0, 2.7))  # wide
+                    _ax3.barh(_labels, _vals)
+                    _ax3.set_xlabel("Hours")
+                    _ax3.set_title("Current progress vs your goal")
+                    for i, v in enumerate(_vals):
+                        _ax3.text(v + (max(_vals)*0.01 if max(_vals)>0 else 0.1), i, f"{v:.1f}h", va="center", fontsize=9)
+                    _fig3.tight_layout()
+                    _fig3.savefig(_cmp_buf, format="PNG", dpi=170)
+                    _plt.close(_fig3)
+                    _cmp_buf.seek(0)
+                except Exception as _e:
+                    _cmp_buf = None
 
 
             except Exception as _e:
                 _bar_buf = None
                 _donut_buf = None
+                _cmp_buf = None
             # ------------------- Place charts inline -------------------
             # Render charts on their own page (stacked vertically). Keep fonts as-is.
             try:
-                if (_bar_buf is not None) or (_donut_buf is not None) or ('_cmp_buf' in locals() and _cmp_buf is not None):
+                if (_bar_buf is not None) or (_donut_buf is not None) or (_cmp_buf is not None):
                     c.showPage()
                     y = height - 50
                     # Section title for the charts page
@@ -23964,7 +25307,7 @@ class StudyTimerApp(tk.Tk):
         """
         try:
             load_wastage_log()
-            backfill_gap_days(self.schedule)
+            backfill_gap_days(self.schedule, app=self, plan_name=self.current_plan_name)
             changed = 0
             for entry in wastage_log:
                 if entry.get("Session") == old_name:
@@ -24060,24 +25403,40 @@ class StudyTimerApp(tk.Tk):
 
 
     def _load_last_seen(self):
-        """Load the timestamp when the app was last seen running"""
+        """Load the last seen timestamp and remember the plan it was recorded for."""
         try:
             if os.path.exists(LAST_SEEN_FILE):
                 with open(LAST_SEEN_FILE, "r", encoding="utf-8") as f:
                     txt = f.read().strip()
-                    return datetime.fromisoformat(txt)
+                    # Try new JSON structure first
+                    try:
+                        data = json.loads(txt)
+                        if isinstance(data, dict):
+                            self._last_seen_plan = data.get("plan")
+                            ts_str = data.get("ts") or data.get("timestamp")
+                            if ts_str:
+                                return datetime.fromisoformat(ts_str)
+                    except Exception:
+                        # Fallback to legacy plain ISO string
+                        self._last_seen_plan = None
+                        return datetime.fromisoformat(txt)
         except Exception:
             pass
         return None
 
 
-    def _save_last_seen(self, ts=None):
-        """Save the timestamp when the app was last seen running"""
+    def _save_last_seen(self, ts=None, plan_name=None):
+        """Persist the last seen timestamp along with the active plan."""
         try:
             if ts is None:
                 ts = datetime.now()
+            if plan_name is None:
+                plan_name = getattr(self, "current_plan_name", None) or load_last_active_plan() or "Default"
+
+            payload = {"ts": ts.isoformat(), "plan": plan_name}
             with open(LAST_SEEN_FILE, "w", encoding="utf-8") as f:
-                f.write(ts.isoformat())
+                json.dump(payload, f)
+            self._last_seen_plan = plan_name
         except Exception:
             pass
         
@@ -24423,21 +25782,39 @@ class StudyTimerApp(tk.Tk):
         _save_json_safe(TARGET_DRIFT_FILE, store)
 
     def _load_last_seen(self):
+        """Load the last seen timestamp and remember the plan it was recorded for."""
         try:
             if os.path.exists(LAST_SEEN_FILE):
                 with open(LAST_SEEN_FILE, "r", encoding="utf-8") as f:
                     txt = f.read().strip()
-                    return datetime.fromisoformat(txt)
+                    # Try new JSON structure first
+                    try:
+                        data = json.loads(txt)
+                        if isinstance(data, dict):
+                            self._last_seen_plan = data.get("plan")
+                            ts_str = data.get("ts") or data.get("timestamp")
+                            if ts_str:
+                                return datetime.fromisoformat(ts_str)
+                    except Exception:
+                        # Fallback to legacy plain ISO string
+                        self._last_seen_plan = None
+                        return datetime.fromisoformat(txt)
         except Exception:
             pass
         return None
 
-    def _save_last_seen(self, ts=None):
+    def _save_last_seen(self, ts=None, plan_name=None):
+        """Persist the last seen timestamp along with the active plan."""
         try:
             if ts is None:
                 ts = datetime.now()
+            if plan_name is None:
+                plan_name = getattr(self, "current_plan_name", None) or load_last_active_plan() or "Default"
+
+            payload = {"ts": ts.isoformat(), "plan": plan_name}
             with open(LAST_SEEN_FILE, "w", encoding="utf-8") as f:
-                f.write(ts.isoformat())
+                json.dump(payload, f)
+            self._last_seen_plan = plan_name
         except Exception:
             pass
 
@@ -24537,7 +25914,7 @@ class StudyTimerApp(tk.Tk):
     def get_today_session_wastage(self):
         """Get today's wastage during session time only (excludes breaks)"""
         load_wastage_log()
-        backfill_gap_days(self.schedule)
+        backfill_gap_days(self.schedule, app=self, plan_name=self.current_plan_name)
         today_str = datetime.now().strftime("%Y-%m-%d")
         total = 0
         
@@ -24554,7 +25931,7 @@ class StudyTimerApp(tk.Tk):
     def get_total_session_wastage(self):
         """Get total wastage during session time only"""
         load_wastage_log()
-        backfill_gap_days(self.schedule)
+        backfill_gap_days(self.schedule, app=self, plan_name=self.current_plan_name)
         total = 0
         
         for entry in wastage_log:
@@ -24860,6 +26237,8 @@ class StudyTimerApp(tk.Tk):
 
                 # ---------- Refresh UI ----------
                 try:
+                    if hasattr(self, "_calculate_goal_from_schedule"):
+                        self._calculate_goal_from_schedule()
                     if hasattr(self, "update_progress_bar"):
                         self.update_progress_bar()
                     if hasattr(self, "update_goal_daywise_targets"):
@@ -25129,8 +26508,16 @@ class StudyTimerApp(tk.Tk):
             # 2. Calculate total days until exam
             from datetime import date as _date
             today = _date.today()
-            exam_day = getattr(self, "progress_exam_date", today)
-            days_left = max(1, (exam_day - today).days)
+            exam_day = (
+                getattr(self, "progress_exam_date", None)
+                or _load_exam_date_only()
+                or today
+            )
+            # Keep the cached exam date in sync
+            self.progress_exam_date = exam_day
+
+            # Avoid forcing a 1-day minimum so we never default to a per-day target.
+            days_left = max(0, (exam_day - today).days)
             
             # 3. Calculate TOTAL goal = daily × days
             total_goal_hours = daily_hours * days_left
@@ -25416,7 +26803,7 @@ class StudyTimerApp(tk.Tk):
             save_wastage_day_summary({}, current_plan)
             return {}
         
-        backfill_gap_days(self.schedule)
+        backfill_gap_days(self.schedule, app=self, plan_name=self.current_plan_name)
 
         # Get date range ONLY from log (no 30-day addition)
         all_dates = set(e.get("Date") for e in plan_wastage_log if e.get("Date"))       
@@ -25586,11 +26973,13 @@ class StudyTimerApp(tk.Tk):
         """
         # ensure in-memory log is fresh if another thread/process wrote the CSV
         # (safe + cheap; remove if you never write from outside this process)
-        try:          
+        try:
             load_wastage_log()
-            backfill_gap_days(self.schedule)
+            backfill_gap_days(self.schedule, app=self, plan_name=self.current_plan_name)
         except Exception:
             pass
+
+        resolved_plan = _resolve_plan_name(getattr(self, "current_plan_name", None), self)
 
         today_key = datetime.now().strftime("%Y-%m-%d")
         today_sec = 0
@@ -25604,6 +26993,8 @@ class StudyTimerApp(tk.Tk):
             for e in wastage_log:
                 if not isinstance(e, dict):
                     continue  # Skip malformed entries
+                if e.get("Plan", "Default") != resolved_plan:
+                    continue
                 try:
                     sec = parse_hhmmss(e.get("Wastage (hh:mm:ss)", "00:00:00"))
                     total_sec += sec
@@ -25622,21 +27013,25 @@ class StudyTimerApp(tk.Tk):
     def get_today_wastage_seconds(self):
         """Sum hh:mm:ss from wastage_log for today's date."""
         load_wastage_log()
-        backfill_gap_days(self.schedule)
+        backfill_gap_days(self.schedule, app=self, plan_name=self.current_plan_name)
         today_str = datetime.now().strftime("%Y-%m-%d")
         total = 0
+        resolved_plan = _resolve_plan_name(getattr(self, "current_plan_name", None), self)
         for entry in wastage_log:
-            if entry.get("Date") == today_str:
+            if entry.get("Date") == today_str and entry.get("Plan", "Default") == resolved_plan:
                 total += parse_hhmmss(entry.get("Wastage (hh:mm:ss)", "00:00:00"))
         return total
 
     def get_grand_wastage_seconds(self):
         """Sum hh:mm:ss across all rows in wastage_log."""
-        
+
         load_wastage_log()
-        backfill_gap_days(self.schedule)
+        backfill_gap_days(self.schedule, app=self, plan_name=self.current_plan_name)
         total = 0
+        resolved_plan = _resolve_plan_name(getattr(self, "current_plan_name", None), self)
         for entry in wastage_log:
+            if entry.get("Plan", "Default") != resolved_plan:
+                continue
             total += parse_hhmmss(entry.get("Wastage (hh:mm:ss)", "00:00:00"))
         return total
 
@@ -29708,7 +31103,7 @@ class StudyTimerApp(tk.Tk):
                     row_exists = False
                     try:
                         load_wastage_log()
-                        backfill_gap_days(self.schedule)
+                        backfill_gap_days(self.schedule, app=self, plan_name=self.current_plan_name)
                         for entry in wastage_log:
                             if (entry.get("Session") == session_name and
                                 entry.get("Scheduled Start") == scheduled_today and
@@ -29749,7 +31144,7 @@ class StudyTimerApp(tk.Tk):
                 row_exists = False
                 try:
                     load_wastage_log()
-                    backfill_gap_days(self.schedule)
+                    backfill_gap_days(self.schedule, app=self, plan_name=self.current_plan_name)
                     for entry in wastage_log:
                         if (entry.get("Session") == session_name and 
                             entry.get("Scheduled Start") == scheduled_today and 
@@ -30271,26 +31666,34 @@ class StudyTimerApp(tk.Tk):
         
     def _format_plan_button_label(self, plan_name: str) -> str:
         """
-        Show a compact label like 'Aptitude an… ▼' so that:
-        - The beginning of the plan name is visible
-        - The ▼ icon is ALWAYS visible (never clipped)
+        Show a compact label like 'Aptitude an… ▼' with the name centered when short
+        and the ▼ pinned to the right edge of the fixed-width button.
         """
         if not plan_name:
             plan_name = "Default Plan"
 
-        max_name_chars = 12  # keep some room for ' ▼'
+        total_width = getattr(self, "plan_button_char_width", 15)
+        arrow = " ▼"
+        name_space = max(total_width - len(arrow), 1)
 
         safe_name = str(plan_name)
-        if len(safe_name) > max_name_chars:
-            safe_name = safe_name[: max_name_chars - 1] + "…"
+        if len(safe_name) > name_space:
+            safe_name = safe_name[: max(name_space - 1, 1)] + "…"
 
-        return f"{safe_name} ▼"
+        if len(safe_name) < name_space:
+            left_pad = (name_space - len(safe_name)) // 2
+            right_pad = name_space - len(safe_name) - left_pad
+        else:
+            left_pad = right_pad = 0
+
+        return f"{' ' * left_pad}{safe_name}{' ' * right_pad}{arrow}"
         
     def _create_plan_buttons(self):
         """Create the button frame (always shown below treeview/splash)"""
         # Button frame
         btn_frame = tk.Frame(self.plan_tab)
         btn_frame.pack(pady=(3, 8))
+        self.plan_button_frame = btn_frame
         btn_style = {"font": ("Arial", 12), "width": 2, "height": 1}
 
         # Plan selector button
@@ -30299,6 +31702,7 @@ class StudyTimerApp(tk.Tk):
 
         button_text = self._format_plan_button_label(self.current_plan_name)
 
+        self.plan_button_char_width = 15
         self.plan_display_btn = tk.Button(
             btn_frame,
             text=button_text,
@@ -30309,11 +31713,14 @@ class StudyTimerApp(tk.Tk):
             padx=10,
             pady=4,
             cursor="hand2",
-            width=15,
-            anchor="w",  # left align so first characters always visible
+            width=self.plan_button_char_width,
+            anchor="w",  # left align; spacing is handled in text formatting
         )
         self.plan_display_btn.pack(side="left", padx=5)
         self.plan_display_btn.config(command=self.show_plan_menu)
+
+        # Place/update the exam pill next to the plan dropdown
+        self._init_exam_header_on_tabs()
 
         self.new_plan_btn = tk.Button(
             btn_frame, text="🆕", command=self.create_new_plan, **btn_style
@@ -31117,7 +32524,14 @@ class StudyTimerApp(tk.Tk):
         self.target_hours_entry = tk.Entry(self.live_frame, textvariable=self.target_hours_var)
         self.target_hours_entry.pack_forget()  # Hide the entry completely
 
-       
+        # Ensure the goal duration uses the full exam target (not per-day hours)
+        if hasattr(self, "refresh_goal_and_markers"):
+            try:
+                self.refresh_goal_and_markers()
+            except Exception as e:
+                print(f"[GOAL] Failed to refresh goal on live tab setup: {e}")
+
+
 
         # Continue normal UI
         self.after(500, self.update_progress_bar)
@@ -31591,7 +33005,7 @@ class StudyTimerApp(tk.Tk):
 
         # ---------- load freshest log ----------
         load_wastage_log()
-        backfill_gap_days(self.schedule)
+        backfill_gap_days(self.schedule, app=self, plan_name=self.current_plan_name)
 
         # Filter to only current plan's wastage
         plan_wastage_log = get_current_plan_wastage_log(current_plan)
@@ -31640,6 +33054,9 @@ class StudyTimerApp(tk.Tk):
             resets = {}
         today_reset_sessions = resets.get(today_str, [])
 
+        # Respect plan activation time so we don't show pre-switch sessions as missed
+        activation_ts = _ensure_today_activation(current_plan)
+
         # Filter today's entries for current plan only
         todays = [e for e in plan_wastage_log if e.get("Date") == today_str]
 
@@ -31677,6 +33094,13 @@ class StudyTimerApp(tk.Tk):
                 key_candidates = [(sess[0], scheduled_today), (sess[0], scheduled_original)]
             else:
                 key_candidates = [(sess[0], scheduled_original)]
+
+            if activation_ts and activation_ts.date() == now.date() and en_dt <= activation_ts:
+                processed_keys.update(key_candidates)
+                for k in key_candidates:
+                    attended_map.pop(k, None)
+                    missed_map.pop(k, None)
+                continue
 
             key = None
             for k in key_candidates:
@@ -31892,7 +33316,7 @@ class StudyTimerApp(tk.Tk):
         selected_item = self.wastage_tree.item(selected[0])["values"]
         today_str = datetime.now().strftime("%Y-%m-%d")
         load_wastage_log()
-        backfill_gap_days(self.schedule)
+        backfill_gap_days(self.schedule, app=self, plan_name=self.current_plan_name)
         
         session_name = selected_item[0]
         scheduled_time_display = selected_item[1]  # e.g., "10:00 AM"
@@ -32133,7 +33557,7 @@ class StudyTimerApp(tk.Tk):
         reset_sessions = resets.get(today_str, [])
        
         load_wastage_log()
-        backfill_gap_days(self.schedule)
+        backfill_gap_days(self.schedule, app=self, plan_name=self.current_plan_name)
         for entry in wastage_log:
             if entry["Date"] == today_str:
                 if entry["Session"] in reset_sessions:

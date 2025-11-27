@@ -1,0 +1,36 @@
+name: chat_app
+description: Chat App (Flet + Flutter)
+publish_to: "none"
+version: 1.0.0+1
+environment:
+  sdk: ">=2.18.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Firebase & notifications
+  firebase_core: ^2.24.0
+  firebase_messaging: ^14.7.0
+  flutter_local_notifications: ^16.3.0
+  shared_preferences: ^2.2.2
+
+  # Helpers
+  path_provider: ^2.0.15
+  permission_handler: ^11.0.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+
+  # IMPORTANT — include the service account here so it's packaged into the APK
+  assets:
+    - assets/firebase_service_account.json
+
+  fonts:
+    - family: MaterialIcons
+      fonts:
+        - asset: assets/fonts/MaterialIcons-Regular.otf

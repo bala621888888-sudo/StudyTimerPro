@@ -1,0 +1,492 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/StudyTimer.py b/StudyTimer.py
+index 6bcd2c7d50164c5595990a64a6026c7c2cadc98a..fd2be8b51741422bcca8f77c019e74cd5867c93f 100644
+--- a/StudyTimer.py
++++ b/StudyTimer.py
+@@ -8855,64 +8855,76 @@ class FirebaseSync:
+             
+         except Exception as e:
+             print(f"[FIREBASE-SYNC] ❌ update failed: {e}")
+             import traceback
+             traceback.print_exc()
+         finally:
+             self._updating = False
+     
+     def pull(self):
+         """Read data from Firebase (optional, for compatibility)"""
+         if not self.enabled or not self.uid:
+             return None
+         
+         try:
+             ref = db.reference(f'leaderboard/{self.uid}')
+             return ref.get()
+         except Exception as e:
+             print(f"[FIREBASE-SYNC] pull failed: {e}")
+             return None
+     
+     def refresh(self):
+         """Refresh data (optional, for compatibility)"""
+         return self.pull()
+ 
+ # === Exam date + profile helpers (do not touch existing config.json) ===
+-def _load_exam_date_only():
+-    """Return exam date from exam_date.json or None. Never prompts."""
+-    try:
+-        import os, json
+-        from datetime import datetime
+-        if os.path.exists(app_paths.exam_date_file):
+-            with open(app_paths.exam_date_file, "r", encoding="utf-8") as f:
+-                data = json.load(f)
+-                s = data.get("exam_date")
+-                if s:
+-                    return datetime.strptime(s, "%Y-%m-%d").date()
+-        return None
+-    except Exception:
+-        return None
++def _load_exam_date_only():
++    """Return the exam date for the *current exam* or None. Never prompts."""
++    try:
++        from datetime import datetime
++
++        # Prefer exam-specific mapping (new format) and fall back to the legacy
++        # single-date structure if present.
++        mapping = _load_exam_date_mapping()
++
++        try:
++            exam_key = _get_exam_key_for_plans()
++        except Exception:
++            exam_key = "__GLOBAL__"
++
++        date_str = mapping.get(exam_key) or mapping.get("__GLOBAL__")
++        if date_str:
++            return datetime.strptime(date_str, "%Y-%m-%d").date()
++
++        # Legacy: {"exam_date": "YYYY-MM-DD"}
++        date_str = mapping.get("exam_date") if isinstance(mapping, dict) else None
++        if date_str:
++            return datetime.strptime(date_str, "%Y-%m-%d").date()
++
++        return None
++    except Exception:
++        return None
+         
+ # ======== GOAL / MARKERS HELPERS ========
+ from datetime import date
+ 
+ def _get_daily_hours_fallback():
+     """Daily hours from profile.json (fallback if schedule logic isn’t available)."""
+     try:
+         prof = _load_profile()
+         return float(prof.get("daily_study_hours", 0.0))
+     except Exception:
+         return 0.0
+ 
+ def calculate_goal_duration_hours():
+     """
+     Total goal hours = days_left_until_exam × daily_hours.
+     Uses exam_date.json and daily_study_hours (from profile).
+     """
+     exam = _load_exam_date_only()
+     if not exam:
+         return 0.0
+     today = date.today()
+     days_left = (exam - today).days
+     if days_left < 0:
+         days_left = 0
+     daily = _get_daily_hours_fallback()
+@@ -21423,89 +21435,59 @@ class StudyTimerApp(tk.Tk):
+             if len(name) > 50:
+                 validation_label.config(text="⚠ Plan name too long", fg="#e74c3c")
+                 name_entry.focus_set()
+                 return
+             
+             # Create the plan
+             self.plans[name] = []
+             save_all_plans(self.plans)
+             
+             self.plan_var.set(name)
+             self.current_plan_name = name  # ✅ Set current plan name
+             self.schedule = []  # ✅ Empty schedule initially
+             
+             # ✅ Save as last active plan
+             save_last_active_plan(name)
+             
+             # ✅ Register all sessions (currently none)
+             self._register_all_plan_sessions()
+             
+             self.refresh_plan_tree()  # ✅ Use refresh_plan_tree instead of switch_plan
+             
+             popup.grab_release()
+             popup.destroy()
+ 
+         # ✅ NEW: Create with AI button
+-        def on_create_with_ai():
+-            name = plan_name_var.get().strip()
+-            
+-            if not name:
+-                validation_label.config(text="⚠ Please enter a plan name", fg="#e74c3c")
+-                name_entry.focus_set()
+-                return
+-            
+-            if name in self.plans:
+-                validation_label.config(text="⚠ Plan name already exists", fg="#e74c3c")
+-                name_entry.focus_set()
+-                return
+-            
+-            if len(name) > 50:
+-                validation_label.config(text="⚠ Plan name too long", fg="#e74c3c")
+-                name_entry.focus_set()
+-                return
+-            
+-            # Create the plan
+-            self.plans[name] = []
+-            save_all_plans(self.plans)
+-            
+-            self.plan_var.set(name)
+-            self.current_plan_name = name  # ✅ Set current plan name
+-            self.schedule = []  # ✅ Empty schedule initially
+-            
+-            # Save as last active plan
+-            save_last_active_plan(name)
+-            
+-            # ✅ Register all sessions (currently none, but will register after AI creates them)
+-            self._register_all_plan_sessions()
+-            
+-            self.refresh_plan_tree()  # ✅ Use refresh_plan_tree instead of switch_plan
+-            
+-            popup.grab_release()
+-            popup.destroy()
+-            
+-            # Open AI plan creation dialog
+-            self.after(100, self._open_ai_plan_creation)
++        def on_create_with_ai():
++            """Start AI plan creation without requiring a manual name."""
++
++            # Close the popup immediately so AI dialog can take over
++            popup.grab_release()
++            popup.destroy()
++
++            # Open AI plan creation dialog (AI will create and name plans)
++            self.after(100, self._open_ai_plan_creation)
+ 
+         # Bind Enter key
+         name_entry.bind('<Return>', lambda e: on_create())
+         popup.bind('<Escape>', lambda e: on_cancel())
+ 
+         # Cancel button
+         cancel_btn = tk.Button(button_frame, 
+                               text="Cancel",
+                               command=on_cancel,
+                               font=("Segoe UI", 10),
+                               bg="#ecf0f1", fg=TEXT_DARK,
+                               relief="flat", bd=0,
+                               padx=20, pady=8,
+                               cursor="hand2")
+         cancel_btn.pack(side="left", padx=(0, 10))
+ 
+         # ✅ NEW: Create with AI button (in the middle)
+         create_ai_btn = tk.Button(button_frame,
+                                   text="🤖 Create with AI",
+                                   command=on_create_with_ai,
+                                   font=("Segoe UI", 10, "bold"),
+                                   bg=AI_COLOR, fg="white",
+                                   relief="flat", bd=0,
+                                   padx=20, pady=8,
+                                   cursor="hand2")
+@@ -23257,60 +23239,112 @@ class StudyTimerApp(tk.Tk):
+         # try:
+         #     self.after(60_000, self._gsync_pulse)
+         # except Exception:
+         #     pass
+         
+     def gsync_push_profile(self):
+         """Push current profile (name + online flag) to Google Sheets."""
+         try:
+             if not getattr(self, "_sheet_sync", None):
+                 return
+             prof = _load_profile()
+             name = prof.get("user_name", "")
+ 
+             online_now = bool(
+                 getattr(self, 'stopwatch_running', False) or
+                 getattr(self, 'extra_study_running', False) or
+                 (getattr(self, 'registered', False)
+                  and getattr(self, 'elapsed_timer_enabled', False)
+                  and not getattr(self, 'paused', True)
+                  and getattr(self, 'study_active_from', None) is not None)
+             )
+             self._sheet_sync.update(name=name, online=online_now)
+         except Exception as e:
+             print("[GSYNC] profile push failed:", e)
+         
+-    def refresh_goal_and_markers(self):
+-        """Recalculate goal hours & markers, then refresh UI + progress denominator."""
+-        try:
+-            if hasattr(self, "_calculate_goal_from_schedule"):
+-                hours = float(self._calculate_goal_from_schedule() or 0.0)
+-            else:
+-                hours = float(calculate_goal_duration_hours())
+-        except Exception as e:
+-            print(f"[GOAL] refresh_goal_and_markers failed: {e}")
+-            hours = 0.0
++    def refresh_goal_and_markers(self):
++        """Recalculate goal hours & markers, then refresh UI + progress denominator."""
++        try:
++            from datetime import datetime, timedelta, date
++
++            # Prefer a live recomputation so we never get stuck on a stale per-day value
++            # saved in goal_config.json. We compute the daily hours from the current
++            # schedule, then multiply by the active exam window.
++            daily_hours = 0.0
++            try:
++                total_minutes = 0
++                for sess in getattr(self, "schedule", []) or []:
++                    if not sess or len(sess) < 3:
++                        continue
++                    start = parse_time(sess[1])
++                    end = parse_time(sess[2])
++                    if start and end:
++                        st_dt = datetime.combine(date.today(), start)
++                        en_dt = datetime.combine(date.today(), end)
++                        if en_dt <= st_dt:
++                            en_dt += timedelta(days=1)
++                        total_minutes += (en_dt - st_dt).total_seconds() / 60
++                if total_minutes > 0:
++                    daily_hours = total_minutes / 60
++            except Exception:
++                pass
++
++            # Fallbacks if schedule is empty
++            if daily_hours <= 0:
++                try:
++                    import json, os
++                    if os.path.exists(app_paths.goal_config_file):
++                        with open(app_paths.goal_config_file, "r") as f:
++                            content = f.read().strip()
++                            if content:
++                                cfg = json.loads(content)
++                                daily_hours = float(cfg.get("daily_hours", 0.0) or 0.0)
++                except Exception:
++                    pass
++            if daily_hours <= 0:
++                daily_hours = _get_daily_hours_fallback()
++
++            exam_date = getattr(self, "progress_exam_date", None) or _load_exam_date_only()
++            if exam_date:
++                self.progress_exam_date = exam_date
++            days_left = max((exam_date - date.today()).days, 0) if exam_date else 0
++
++            computed_total = round(daily_hours * days_left, 2) if daily_hours > 0 and days_left > 0 else 0.0
++
++            base_hours = float(getattr(self, "progress_goal_hours", 0.0) or 0.0)
++
++            if computed_total > 0:
++                hours = computed_total
++            elif hasattr(self, "_calculate_goal_from_schedule"):
++                hours = float(self._calculate_goal_from_schedule() or 0.0)
++            elif base_hours > 0:
++                hours = base_hours
++            else:
++                hours = float(calculate_goal_duration_hours())
++        except Exception as e:
++            print(f"[GOAL] refresh_goal_and_markers failed: {e}")
++            hours = 0.0
+ 
+         # keep both names in sync (UI uses target_hours_var / progress_goal_hours)
+         self.goal_hours = hours
+         self.progress_goal_hours = hours
+         self.progress_goal_seconds = int(hours * 3600)
+ 
+         # Update the hidden StringVar that update_progress_bar reads
+         if hasattr(self, "target_hours_var"):
+             try:
+                 self.target_hours_var.set(str(round(hours, 2)))
+             except Exception:
+                 pass
+ 
+         # Update any visible label if present
+         if hasattr(self, "goal_label"):
+             self.goal_label.config(text=f"{hours:.1f}h")
+ 
+         # Redraw progress bar
+         if hasattr(self, "update_progress_bar"):
+             self.update_progress_bar()
+         
+     def debug_email_connection(self):
+         """Debug email connection step by step"""
+         print("\n" + "="*50)
+         print("🔍 EMAIL CONNECTION DEBUG")
+@@ -26428,79 +26462,87 @@ class StudyTimerApp(tk.Tk):
+                 self._calculate_goal_from_schedule()
+ 
+                 # Refresh UI
+                 if hasattr(self, "refresh_goal_and_markers"):
+                     self.refresh_goal_and_markers()
+                 elif hasattr(self.master, "refresh_goal_and_markers"):
+                     self.master.refresh_goal_and_markers()
+ 
+                 self.update_goal_daywise_targets()
+                 self.update_progress_bar()
+ 
+                 popup.destroy()
+ 
+             except ValueError:
+                 messagebox.showerror("Invalid Input", "Please enter a positive number")
+         
+         # Buttons
+         btn_frame = tk.Frame(popup)
+         btn_frame.pack(pady=15)
+         
+         tk.Button(btn_frame, text="Save", command=save_changes,
+                  bg="#4CAF50", fg="white", font=("Arial", 10), width=8).pack(side="left", padx=5)
+         tk.Button(btn_frame, text="Cancel", command=popup.destroy,
+                  bg="#f44336", fg="white", font=("Arial", 10), width=8).pack(side="left", padx=5)
+ 
+-    def _calculate_goal_from_schedule(self):
+-        """Calculate TOTAL study hours goal from current schedule and exam date"""
+-        try:
++    def _calculate_goal_from_schedule(self):
++        """Calculate TOTAL study hours goal from current schedule and exam date"""
++        try:
+             # 1. Calculate daily hours from schedule
+             total_minutes = 0
+             for sess in self.schedule:
+                 if not sess or len(sess) < 3:
+                     continue
+                 
+                 start = parse_time(sess[1])
+                 end = parse_time(sess[2])
+                 
+                 if start and end:
+                     st_dt = datetime.combine(date.today(), start)
+                     en_dt = datetime.combine(date.today(), end)
+                     if en_dt <= st_dt:
+                         en_dt += timedelta(days=1)
+                     total_minutes += (en_dt - st_dt).total_seconds() / 60
+             
+             daily_hours = total_minutes / 60
+             
+             # 2. Calculate total days until exam
+             from datetime import date as _date
+-            today = _date.today()
+-            exam_day = getattr(self, "progress_exam_date", today)
+-            days_left = max(1, (exam_day - today).days)
++            today = _date.today()
++            exam_day = (
++                getattr(self, "progress_exam_date", None)
++                or _load_exam_date_only()
++                or today
++            )
++            # Keep the cached exam date in sync
++            self.progress_exam_date = exam_day
++
++            # Avoid forcing a 1-day minimum so we never default to a per-day target.
++            days_left = max(0, (exam_day - today).days)
+             
+             # 3. Calculate TOTAL goal = daily × days
+-            total_goal_hours = daily_hours * days_left
++            total_goal_hours = daily_hours * days_left
+             
+             # Save to goal_config.json
+             config = {}
+             if os.path.exists(app_paths.goal_config_file):
+                 with open(app_paths.goal_config_file, "r") as f:
+                     content = f.read().strip()
+                     if content:
+                         config = json.loads(content)
+             
+             config["goal_hours"] = total_goal_hours  # ✅ Save TOTAL, not daily
+             config["daily_hours"] = daily_hours      # ✅ Also save daily for reference
+             
+             with open(app_paths.goal_config_file, "w") as f:
+                 json.dump(config, f, indent=2)
+             
+             # ✅ Update instance variables
+             self.progress_goal_hours = total_goal_hours
+             self.progress_goal_seconds = int(total_goal_hours * 3600)
+             
+             # ✅ UPDATE THE STRINGVAR
+             if hasattr(self, 'target_hours_var'):
+                 self.target_hours_var.set(f"{total_goal_hours:.1f}")
+                 print(f"[GOAL] Updated target_hours_var to {total_goal_hours:.1f}h")
+             
+             print(f"[GOAL] Calculated goal: {daily_hours:.1f}h/day × {days_left} days = {total_goal_hours:.1f}h total")
+@@ -32455,59 +32497,66 @@ class StudyTimerApp(tk.Tk):
+             command=self.toggle_pause,
+             borderwidth=0,
+             highlightthickness=0,
+             bg="white",
+             activebackground="white", 
+             cursor="hand2"  # ✅ This is all you need for hover cursor change
+         )
+         self.pause_btn.pack(side="left", padx=5)
+ 
+         self.paused = True
+         self.quote_label = tk.Label(self.live_frame, text="", wraplength=500, font=("Arial", 16), fg="#007700", justify="center")
+         self.quote_label.pack(pady=(6, 4), anchor="center")
+         self.refresh_quote()
+         self.progress_canvas = tk.Canvas(self.live_frame, width=380, height=22, bg="white", highlightthickness=0)
+         self.progress_canvas.pack(pady=(0, 1))
+         # ===== Progress Text + Edit Button (Goal Duration) =====
+         progress_frame = tk.Frame(self.live_frame)
+         progress_frame.pack(pady=(0, 0))
+ 
+         self.progress_text_label = tk.Label(progress_frame, text="", font=("Arial", 11), fg="#2266bb")
+         self.progress_text_label.pack(side="left")
+ 
+         self.live_edit_btn = tk.Button(progress_frame, text="✎", font=("Arial", 10), bd=0, fg="#2266bb", cursor="hand2", command=self.edit_goal_duration)
+         self.live_edit_btn.pack(side="left", padx=(5, 0))
+ 
+-        # Hidden variable for syncing with goal hours (not shown on UI)
+-        self.target_hours_var = tk.StringVar(value=str(round(self.progress_goal_hours, 2)))
+-        self.target_hours_entry = tk.Entry(self.live_frame, textvariable=self.target_hours_var)
+-        self.target_hours_entry.pack_forget()  # Hide the entry completely
+-
+-       
+-
+-        # Continue normal UI
+-        self.after(500, self.update_progress_bar)
++        # Hidden variable for syncing with goal hours (not shown on UI)
++        self.target_hours_var = tk.StringVar(value=str(round(self.progress_goal_hours, 2)))
++        self.target_hours_entry = tk.Entry(self.live_frame, textvariable=self.target_hours_var)
++        self.target_hours_entry.pack_forget()  # Hide the entry completely
++
++        # Ensure the goal duration uses the full exam target (not per-day hours)
++        if hasattr(self, "refresh_goal_and_markers"):
++            try:
++                self.refresh_goal_and_markers()
++            except Exception as e:
++                print(f"[GOAL] Failed to refresh goal on live tab setup: {e}")
++
++
++
++        # Continue normal UI
++        self.after(500, self.update_progress_bar)
+         self.extra_study_btn = tk.Button(self.live_frame, text="Start Extra Study", font=("Arial", 12), bg="#f0ca16", fg="#222", width=16, command=self.toggle_extra_study)
+         self.extra_study_btn.pack(pady=(0, 4))
+         self.add_hover_effect(self.extra_study_btn, hover_bg="#e6b800", hover_fg="#222", normal_bg="#f0ca16", normal_fg="#222")
+         self.pause_credit_label = tk.Label(self.live_frame, text="Pause Credit: 00:00 min", font=("Arial", 12), fg="#1976D2")
+         self.pause_credit_label.pack()
+         
+         # Row 2: bottom left (total studied) and right (total wastage)
+         bottom_frame = ttk.Frame(self.live_frame)
+         bottom_frame.pack(side="bottom", fill="x", pady=(4, 4))
+ 
+         # Container for total study label and reset button (using tk.Frame for bg support)
+         total_study_container = tk.Frame(bottom_frame)
+         total_study_container.pack(side="left", padx=(10, 0), pady=(0, 2))
+ 
+         self.total_study_label = ttk.Label(
+             total_study_container,
+             text="Total Studied Time: 00:00:00",
+             font=("Arial", 12, "bold"),
+             foreground="#077b18"
+         )
+         self.total_study_label.pack(side="left")
+ 
+         # Small reset button (compact version)
+         reset_study_btn = tk.Button(
+             total_study_container,
+ 
+EOF
+)

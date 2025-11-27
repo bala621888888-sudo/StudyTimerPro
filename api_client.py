@@ -2,15 +2,39 @@
 API Client for Study Timer Backend
 Connects to your Firebase Cloud Functions
 """
+import os
 import requests
 import json
 
 
 class StudyTimerAPI:
     def __init__(self):
-        # Your backend URL
-        self.base_url = "https://asia-southeast1-leaderboard-98e8c.cloudfunctions.net"
         self.id_token = None
+        self.verify_payment_url = os.getenv(
+            "STUDYTIMER_VERIFY_PAYMENT_URL",
+            "https://verify-payment-order-zdg7ljsrha-as.a.run.app",
+        )
+        # Default backends (ordered by preference)
+        default_bases = [
+            # primary (where you deployed create_payment_order)
+            "https://asia-southeast1-leaderboard-98e8c.cloudfunctions.net",
+            # extra India region (in case you deploy there later)
+            "https://asia-south1-leaderboard-98e8c.cloudfunctions.net",
+            # us-central1 (where verify_payment currently lives)
+            "https://us-central1-leaderboard-98e8c.cloudfunctions.net",
+        ]
+
+        # Optional override via env var, always tried first
+        env_base = os.getenv("STUDYTIMER_API_BASE_URL", "").strip()
+        if env_base:
+            # put env base first, then all defaults (without duplicates)
+            self.base_urls = [env_base] + [
+                b for b in default_bases if b != env_base
+            ]
+            self.base_url = env_base
+        else:
+            self.base_urls = default_bases
+            self.base_url = default_bases[0]
     
     def set_auth_token(self, id_token):
         """Call this after user logs in with Google"""
@@ -72,23 +96,45 @@ class StudyTimerAPI:
             print(f"[API] Request body: {body}")
             print("=" * 60)
 
-            response = requests.post(
-                f'{self.base_url}/create_payment_order',
-                headers=headers,
-                json=body,
-                timeout=10
-            )
-            
-            print(f"[API] Response status: {response.status_code}")
-            print(f"[API] Response text: {response.text[:500]}")
-            
-            if response.status_code == 200:
-                result = response.json()
-                print(f"[API] ✅ Payment order created: {result.get('order_id')}")
-                return result
-            else:
-                print(f"[API] ❌ Payment failed: {response.text}")
-                return {'success': False, 'error': response.text}
+            errors = []
+
+            for base in self.base_urls:
+                url = f"{base}/create_payment_order"
+                print(f"[API] create_payment: trying {url}")
+
+                try:
+                    response = requests.post(
+                        url,
+                        headers=headers,
+                        json=body,
+                        timeout=10
+                    )
+                except Exception as e:
+                    err = f"{url} -> {type(e).__name__}: {e}"
+                    print(f"[API] ❌ Payment request error: {err}")
+                    errors.append(err)
+                    continue
+
+                print(f"[API] Response status: {response.status_code}")
+                print(f"[API] Response text: {response.text[:500]}")
+
+                if response.status_code == 200:
+                    try:
+                        result = response.json()
+                    except ValueError:
+                        err = f"{url} -> Invalid JSON response"
+                        print(f"[API] ❌ {err}")
+                        errors.append(err)
+                        continue
+
+                    print(f"[API] ✅ Payment order created via {url}: {result.get('order_id')}")
+                    return result
+
+                err = f"{url} -> HTTP {response.status_code}: {response.text[:200]}"
+                print(f"[API] ❌ Payment failed: {err}")
+                errors.append(err)
+
+            return {'success': False, 'error': '; '.join(errors) or 'Unknown error'}
                 
         except Exception as e:
             print(f"[API] ❌ Payment creation exception: {type(e).__name__}: {e}")
@@ -97,22 +143,68 @@ class StudyTimerAPI:
             return {'error': str(e)}
     
     def verify_payment(self, order_id, payment_id, signature):
-        """Verify Razorpay payment after user completes payment"""
+        """Verify Razorpay payment after user completes payment."""
+        import requests
+
+        # 🔹 Use ONLY your new Cloud Run endpoint here:
+        url = "https://verify-payment-order-zdg7ljsrha-as.a.run.app"  # <-- paste full URL if different
+
         try:
-            response = requests.post(
-                f'{self.base_url}/verify_payment',
+            resp = requests.post(
+                url,
                 headers=self._headers(),
                 json={
-                    'order_id': order_id,
-                    'payment_id': payment_id,
-                    'signature': signature
+                    "order_id": order_id,
+                    "payment_id": payment_id,
+                    "signature": signature,
                 },
-                timeout=10
+                timeout=15,
             )
-            return response.json()
+
+            # Try to parse JSON safely
+            try:
+                data = resp.json()
+            except ValueError:
+                print("[API] verify_payment_order: Non-JSON response")
+                print("      Status:", resp.status_code)
+                print("      Body (first 1000 chars):")
+                print(resp.text[:1000])
+                return {
+                    "success": False,
+                    "error": "Invalid JSON from payment server",
+                    "status": resp.status_code,
+                }
+
+            # If backend returned something weird like null or a list
+            if not isinstance(data, dict):
+                print("[API] verify_payment_order: Unexpected JSON type:", type(data))
+                return {
+                    "success": False,
+                    "error": "Unexpected response format from payment server",
+                    "status": resp.status_code,
+                    "raw": data,
+                }
+
+            # Normalise: always have 'success' and 'error' keys
+            success = data.get("success")
+
+            if success is None:
+                # If backend didn’t include success, infer it
+                success = (resp.status_code == 200) and not data.get("error")
+                data["success"] = success
+
+            if not success and "error" not in data:
+                # If not successful but no error message, add a generic one
+                data["error"] = f"Backend HTTP {resp.status_code}"
+
+            return data
+
         except Exception as e:
-            print(f"[API] Payment verification failed: {e}")
-            return {'error': str(e)}
+            print(f"[API] Payment verification failed (request error): {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
     
     def send_telegram(self, msg, chat_id=None):
         response = requests.post(

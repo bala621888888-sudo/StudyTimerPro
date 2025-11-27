@@ -1,0 +1,20 @@
+name: Chat App
+description: A chat application
+version: 1.0.0
+
+module: chat_app
+
+android:
+  package: com.chatapp.mobile
+  permissions:
+    - INTERNET
+    - ACCESS_NETWORK_STATE
+    - POST_NOTIFICATIONS        # Add this
+    - RECEIVE_BOOT_COMPLETED    # Add this
+    - VIBRATE                    # Add this
+
+flutter_dependencies:           # Add this entire section
+  firebase_core: 2.24.0
+  firebase_messaging: 14.7.0
+  flutter_local_notifications: 16.3.0
+  shared_preferences: 2.2.2

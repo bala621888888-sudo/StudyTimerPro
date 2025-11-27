@@ -1,0 +1,75 @@
+name: Build APK - Simple FCM
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.24.0"
+
+      - name: Install Flet and Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Firebase & Google Sheets config files
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          GCP_GSHEET_CREDS: ${{ secrets.GCP_GSHEET_CREDS }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: |
+          mkdir -p assets
+          # Firebase service account (for your backend use if needed)
+          echo "$FIREBASE_SERVICE_ACCOUNT" > assets/firebase_service_account.json
+
+          # Google Sheets credentials for Promoter feature
+          echo "$GCP_GSHEET_CREDS" > assets/gsheet_creds.json
+
+          # Sheet config (used to load sheet ID inside APK)
+          echo "{\"sheet_id\": \"${GOOGLE_SHEET_ID}\"}" > assets/gsheet_config.json
+
+          # Firebase google-services.json
+          mkdir -p android/app
+          echo "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+
+      - name: Build APK with Flet
+        env:
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          GCP_GSHEET_CREDS: ${{ secrets.GCP_GSHEET_CREDS }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: |
+          flet build apk --verbose
+
+      - name: Collect APK
+        run: |
+          APK_PATH=$(find . -name "*.apk" | head -n 1)
+          echo "Found APK at: $APK_PATH"
+          cp "$APK_PATH" ChatApp.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChatApp-APK
+          path: ChatApp.apk
