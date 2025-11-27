@@ -5405,18 +5405,61 @@ def main(page: ft.Page):
 
         # ========== BOTTOM NAVIGATION (CRITICAL FIX) ==========
         selected_index = 0
+        bottom_nav = None
+
+        page_controller = getattr(ft, "PageController", None)
+        page_controller = page_controller() if page_controller else None
+
+        # SELECT WHICH SCREEN TO SHOW (with optimized lazy loading)
+
+        def activate_tab(new_index):
+            """Update selection, load data, and sync the bottom nav."""
+            nonlocal selected_index
+            selected_index = new_index
+            try:
+                if bottom_nav:
+                    bottom_nav.selected_index = selected_index
+            except Exception as nav_ex:
+                print(f"[NAV SYNC] {nav_ex}")
+
+            if not page_view_cls:
+                try:
+                    tab_placeholder.content = tab_pages[selected_index]
+                except Exception as tab_ex:
+                    print(f"[TAB FALLBACK] {tab_ex}")
+
+            if selected_index == 0:
+                refresh_promoter_screen()
+            elif selected_index == 1:
+                # Groups already loaded
+                pass
+            elif selected_index == 2:
+                if not members_cache["loaded"]:
+                    load_all_members()
+            elif selected_index == 3:
+                active_screen["current"] = "chat_list"
+                if not users_list.controls:
+                    try:
+                        load_users()
+                    except Exception as ex:
+                        print(f"[PRIVATE TAB AUTO-LOAD ERROR] {ex}")
+            page.update()
 
         def switch_tab(e):
-            nonlocal selected_index
             try:
                 # Ensure index is a valid integer
                 new_index = int(e.control.selected_index)
                 if 0 <= new_index <= 4:  # Valid range (5 tabs now)
-                    selected_index = new_index
-                    refresh_screen()
+                    if page_controller:
+                        page_controller.animate_to_page(
+                            new_index,
+                            duration=400,
+                            curve=ft.AnimationCurve.EASE_IN_OUT,
+                        )
+                    else:
+                        activate_tab(new_index)
             except Exception as ex:
                 print(f"Tab switch error: {ex}")
-                selected_index = 0  # Reset to default
 
         try:
             bottom_nav = ft.NavigationBar(
@@ -5453,9 +5496,7 @@ def main(page: ft.Page):
         except Exception as e:
             print(f"Error creating bottom nav: {e}")
             bottom_nav = ft.Container()  # Fallback
-    
-        # SELECT WHICH SCREEN TO SHOW (with optimized lazy loading)
-        
+
         # Global swipe and pull-to-refresh handlers
         def refresh_current_tab(e=None):
             """Pull-to-refresh handler for current tab"""
@@ -5487,26 +5528,23 @@ def main(page: ft.Page):
 
         def _handle_pan_end(e):
             """Swipe left/right to switch tabs"""
-            nonlocal selected_index
             try:
                 vx = getattr(e, "velocity_x", 0) or 0
                 threshold = 300  # Adjust sensitivity if needed
                 # Swipe left -> next tab
-                if vx < -threshold and selected_index < 4:
-                    selected_index += 1
-                    try:
-                        bottom_nav.selected_index = selected_index
-                    except Exception as nav_ex:
-                        print(f"[SWIPE NAV bottom_nav] {nav_ex}")
-                    refresh_screen()
+                if vx < -threshold and selected_index < 4 and page_controller:
+                    page_controller.animate_to_page(
+                        selected_index + 1,
+                        duration=400,
+                        curve=ft.AnimationCurve.EASE_IN_OUT,
+                    )
                 # Swipe right -> previous tab
-                elif vx > threshold and selected_index > 0:
-                    selected_index -= 1
-                    try:
-                        bottom_nav.selected_index = selected_index
-                    except Exception as nav_ex:
-                        print(f"[SWIPE NAV bottom_nav] {nav_ex}")
-                    refresh_screen()
+                elif vx > threshold and selected_index > 0 and page_controller:
+                    page_controller.animate_to_page(
+                        selected_index - 1,
+                        duration=400,
+                        curve=ft.AnimationCurve.EASE_IN_OUT,
+                    )
             except Exception as ex:
                 print(f"[SWIPE NAV ERROR] {ex}")
 
@@ -5518,79 +5556,62 @@ def main(page: ft.Page):
             except Exception as ex:
                 print(f"[REFRESH INDICATOR] {ex}")
 
-        # Animated switcher for smooth tab transitions
-        slide_transition = getattr(ft.AnimatedSwitcherTransition, "SLIDE", None)
-        if slide_transition is None:
-            slide_transition = getattr(ft.AnimatedSwitcherTransition, "SLIDE_LEFT", None) or getattr(
-                ft.AnimatedSwitcherTransition, "SLIDE_RIGHT", None
-            )
-        if slide_transition is None:
-            slide_transition = ft.AnimatedSwitcherTransition.FADE
+        # Build horizontal pager for WhatsApp-like slide transitions
+        tab_pages = [
+            ft.Container(content=screen_promoter, expand=True),
+            ft.Container(content=screen_groups, expand=True),
+            ft.Container(content=screen_members, expand=True),
+            ft.Container(content=chat_list_view, expand=True),
+            ft.Container(content=screen_settings, expand=True),
+        ]
 
-        # Provide an initial placeholder so AnimatedSwitcher initializes without errors
-        main_switcher = ft.AnimatedSwitcher(
-            transition=slide_transition,
-            duration=400,
-            switch_in_curve=ft.AnimationCurve.EASE_IN_OUT,
-            switch_out_curve=ft.AnimationCurve.EASE_IN_OUT,
-            expand=True,
-            content=ft.Container(),
+        page_view_cls = getattr(ft, "PageView", None)
+        tab_placeholder = ft.Container(expand=True)
+
+        def _handle_page_change(e):
+            try:
+                new_index = int(e.data)
+                activate_tab(new_index)
+            except Exception as ex:
+                print(f"[PAGE VIEW CHANGE] {ex}")
+
+        page_physics_cls = getattr(ft, "PageScrollPhysics", None)
+        page_physics = page_physics_cls() if page_physics_cls else None
+
+        if page_view_cls:
+            pager_content = page_view_cls(
+                expand=True,
+                controller=page_controller,
+                scroll_direction=ft.Axis.HORIZONTAL,
+                on_page_changed=_handle_page_change,
+                physics=page_physics,
+                controls=tab_pages,
+            )
+        else:
+            print("[PAGE VIEW] ft.PageView not available; falling back to single-view container")
+            tab_placeholder.content = tab_pages[selected_index]
+            pager_content = tab_placeholder
+
+        main_gesture_content = ft.GestureDetector(
+            on_pan_end=_handle_pan_end,
+            content=pager_content,
         )
 
-        def set_main_content(view):
-            """Wrap main content with swipe and pull-to-refresh detectors"""
-            tab_view = ft.Container(
-                key=f"tab-{selected_index}",
-                content=view,
-                expand=True,
+        refresh_indicator_cls = getattr(ft, "RefreshIndicator", None)
+        if refresh_indicator_cls is not None:
+            main_content = refresh_indicator_cls(
+                on_refresh=_handle_refresh,
+                child=main_gesture_content,
             )
-            main_switcher.content = tab_view
+        else:
+            print("[REFRESH INDICATOR] ft.RefreshIndicator not available; using plain container")
+            main_content = main_gesture_content
 
-        def refresh_screen():
-            """Optimized screen switching with smart caching"""
-            try:
-                # Update content
-                if selected_index == 0:
-                    set_main_content(screen_promoter)
-                    # Reload promoter status when tab is opened
-                    refresh_promoter_screen()
-                elif selected_index == 1:
-                    set_main_content(screen_groups)
-                    # Groups already loaded
-                elif selected_index == 2:
-                    set_main_content(screen_members)
-                    # Load members only first time
-                    if not members_cache["loaded"]:
-                        load_all_members()  # Changed from threading to direct call
-                elif selected_index == 3:
-                    # Private tab: show chat list view and auto-load users
-                    set_main_content(chat_list_view)  # Use correct chat list view
-                    active_screen["current"] = "chat_list"
-                    if not users_list.controls:
-                        try:
-                            load_users()
-                        except Exception as ex:
-                            print(f"[PRIVATE TAB AUTO-LOAD ERROR] {ex}")
-                elif selected_index == 4:
-                    set_main_content(screen_settings)
-                
-                # Update the entire page
-                page.update()
-            except Exception as e:
-                print(f"Tab switch error: {e}")
-
-        # Initialize main area with first screen content BEFORE adding to page
         main_area = ft.Container(
             expand=True,
-            content=ft.RefreshIndicator(
-                on_refresh=_handle_refresh,
-                child=ft.GestureDetector(
-                    content=main_switcher,
-                    on_pan_end=_handle_pan_end,
-                ),
-            ),
+            content=main_content,
         )
-        set_main_content(screen_promoter)
+        activate_tab(0)
 
         # FINAL PAGE LAYOUT (add offline banner)
         page.add(
