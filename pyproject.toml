@@ -23,13 +23,14 @@ build-backend = "setuptools.build_meta"
 # Flet app configuration
 # =========================
 [tool.flet]
-flutter.dependencies = ["flet-onesignal"]
+org = "com.flet"
+product = "Chat App"
 
 [tool.flet.app]
 name = "Chat App"
 description = "Firebase-based Chat Application"
 version = "1.0.0"
-module = "chat_app"          # chat_app.py is your entry module
+module = "chat_app"
 
 # =========================
 # Android-specific settings
@@ -38,25 +39,18 @@ module = "chat_app"          # chat_app.py is your entry module
 package = "com.flet.chat_app"
 min_sdk_version = 21
 target_sdk_version = 34
+compile_sdk_version = 34
 
-# ⚠️ Keep ONLY the permissions really needed for FCM notifications
+# ⚠️ Android 13+ requires POST_NOTIFICATIONS permission
 [tool.flet.android.permission]
 "android.permission.INTERNET" = true
 "android.permission.ACCESS_NETWORK_STATE" = true
 "android.permission.POST_NOTIFICATIONS" = true
+"android.permission.WAKE_LOCK" = true
 "android.permission.VIBRATE" = true
 
-# If you *really* need boot handling later you can add:
-# "android.permission.RECEIVE_BOOT_COMPLETED" = true
-# but leave it out for now to reduce Play Protect suspicion.
-
 # =========================
-# Extra Flutter packages
-# (Firebase, notifications, etc.)
+# Flutter dependencies
 # =========================
-[tool.flet.flutter.packages]
-firebase_core = "2.24.0"
-firebase_messaging = "14.7.0"
-flutter_local_notifications = "16.3.0"
-shared_preferences = "2.2.2"
-permission_handler = "11.0.1"
+[tool.flet.flutter.dependencies]
+flet_onesignal = "0.3.3"
