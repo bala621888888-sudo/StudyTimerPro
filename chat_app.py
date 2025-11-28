@@ -2411,6 +2411,7 @@ gsheet_manager = GoogleSheetsManager()
 
 def main(page: ft.Page):
     global CREDENTIALS_FILE, CACHE_DIR, GROUP_ICON_CACHE_DIR, USER_LIST_CACHE_FILE
+    global NOTIFICATIONS_CACHE_FILE
     
     # ============================================
     # 🔥 CRITICAL FIX: Global NaN Protection
@@ -2612,6 +2613,7 @@ def main(page: ft.Page):
         CACHE_DIR = profile_cache
         GROUP_ICON_CACHE_DIR = group_cache
         USER_LIST_CACHE_FILE = cache_root / "users.json"
+        NOTIFICATIONS_CACHE_FILE = cache_root / "notifications.json"
         
         # Verify we can write to these locations
         test_file = base_dir / ".test_write"
@@ -3604,6 +3606,34 @@ def main(page: ft.Page):
         unread_private_messages = {"count": 0}
         activate_tab_ref = {"fn": None}
 
+        def load_notification_cache():
+            try:
+                if NOTIFICATIONS_CACHE_FILE and NOTIFICATIONS_CACHE_FILE.exists():
+                    with open(NOTIFICATIONS_CACHE_FILE, "r") as f:
+                        cached = json.load(f)
+                    stored_notifications = cached.get("system_notifications")
+                    if isinstance(stored_notifications, list):
+                        system_notifications.extend(stored_notifications)
+                    unread_count = cached.get("unread_system_count")
+                    if isinstance(unread_count, int) and unread_count >= 0:
+                        unread_system_notifications["count"] = unread_count
+            except Exception as e:
+                print(f"⚠️ Could not load notifications cache: {e}")
+
+        def save_notification_cache():
+            try:
+                NOTIFICATIONS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                with open(NOTIFICATIONS_CACHE_FILE, "w") as f:
+                    json.dump(
+                        {
+                            "system_notifications": system_notifications,
+                            "unread_system_count": unread_system_notifications["count"],
+                        },
+                        f,
+                    )
+            except Exception as e:
+                print(f"⚠️ Could not save notifications cache: {e}")
+
         notification_badge_text = ft.Text(
             "0", size=10, color="white", weight="bold"
         )
@@ -3620,6 +3650,8 @@ def main(page: ft.Page):
             visible=False,
         )
 
+        load_notification_cache()
+
         def update_notification_badge():
             total_unread = unread_system_notifications["count"] + unread_private_messages["count"]
             notification_badge_text.value = str(total_unread)
@@ -3627,9 +3659,12 @@ def main(page: ft.Page):
             if notification_badge_container.page:
                 notification_badge_container.update()
 
+        update_notification_badge()
+
         def open_notifications_dialog(e=None):
             unread_system_notifications["count"] = 0
             update_notification_badge()
+            save_notification_cache()
 
             notification_items = []
 
@@ -5605,15 +5640,17 @@ def main(page: ft.Page):
                 for assignment in new_assignments:
                     system_notifications.append(
                         {
-                            "title": "New downline activation key",
-                            "message": (
-                                f"Your referred promoter {assignment.get('name', 'Promoter')} has been approved. "
-                                f"Activation key: {assignment.get('activation_key', '')}. "
-                                "Ask them to use it in the 'Register as Promoter' screen."
-                            ),
-                        }
+                    "title": "New downline activation key",
+                    "message": (
+                        f"Your referred promoter {assignment.get('name', 'Promoter')} has been approved. "
+                        f"Activation key: {assignment.get('activation_key', '')}. "
+                        "Ask them to use it in the 'Register as Promoter' screen."
+                    ),
+                }
                     )
                     unread_system_notifications["count"] += 1
+                if new_assignments:
+                    save_notification_cache()
                 if new_assignments:
                     update_notification_badge()
 
@@ -6280,8 +6317,8 @@ def main(page: ft.Page):
         selected_index = 0
         bottom_nav = None
 
-        page_controller = getattr(ft, "PageController", None)
-        page_controller = page_controller() if page_controller else None
+        page_controller_cls = getattr(ft, "PageController", None)
+        page_controller = page_controller_cls(initial_page=selected_index) if page_controller_cls else None
 
         # SELECT WHICH SCREEN TO SHOW (with optimized lazy loading)
 
@@ -6331,6 +6368,8 @@ def main(page: ft.Page):
                             duration=400,
                             curve=ft.AnimationCurve.EASE_IN_OUT,
                         )
+                        # Optimistically update UI while animation runs
+                        activate_tab(new_index)
                     else:
                         activate_tab(new_index)
             except Exception as ex:
@@ -6407,19 +6446,25 @@ def main(page: ft.Page):
                 vx = getattr(e, "velocity_x", 0) or 0
                 threshold = 300  # Adjust sensitivity if needed
                 # Swipe left -> next tab
-                if vx < -threshold and selected_index < 4 and page_controller:
-                    page_controller.animate_to_page(
-                        selected_index + 1,
-                        duration=400,
-                        curve=ft.AnimationCurve.EASE_IN_OUT,
-                    )
+                if vx < -threshold and selected_index < 4:
+                    if page_controller:
+                        page_controller.animate_to_page(
+                            selected_index + 1,
+                            duration=400,
+                            curve=ft.AnimationCurve.EASE_IN_OUT,
+                        )
+                    else:
+                        activate_tab(selected_index + 1)
                 # Swipe right -> previous tab
-                elif vx > threshold and selected_index > 0 and page_controller:
-                    page_controller.animate_to_page(
-                        selected_index - 1,
-                        duration=400,
-                        curve=ft.AnimationCurve.EASE_IN_OUT,
-                    )
+                elif vx > threshold and selected_index > 0:
+                    if page_controller:
+                        page_controller.animate_to_page(
+                            selected_index - 1,
+                            duration=400,
+                            curve=ft.AnimationCurve.EASE_IN_OUT,
+                        )
+                    else:
+                        activate_tab(selected_index - 1)
             except Exception as ex:
                 print(f"[SWIPE NAV ERROR] {ex}")
 
@@ -6462,25 +6507,26 @@ def main(page: ft.Page):
                 physics=page_physics,
                 controls=tab_pages,
             )
+            main_swipe_target = pager_content  # Native PageView swipe handling
         else:
             print("[PAGE VIEW] ft.PageView not available; falling back to single-view container")
             tab_placeholder.content = tab_pages[selected_index]
             pager_content = tab_placeholder
-
-        main_gesture_content = ft.GestureDetector(
-            on_pan_end=_handle_pan_end,
-            content=pager_content,
-        )
+            # Manual swipe handling fallback
+            main_swipe_target = ft.GestureDetector(
+                on_pan_end=_handle_pan_end,
+                content=pager_content,
+            )
 
         refresh_indicator_cls = getattr(ft, "RefreshIndicator", None)
         if refresh_indicator_cls is not None:
             main_content = refresh_indicator_cls(
                 on_refresh=_handle_refresh,
-                child=main_gesture_content,
+                child=main_swipe_target,
             )
         else:
             print("[REFRESH INDICATOR] ft.RefreshIndicator not available; using plain container")
-            main_content = main_gesture_content
+            main_content = main_swipe_target
 
         main_area = ft.Container(
             expand=True,
@@ -7113,15 +7159,28 @@ def main(page: ft.Page):
                 page.update()
                 return
             
-            # Sort alphabetically
-            other_users.sort(key=lambda u: u.get('username', u.get('email', '')).lower())
+            # Sort alphabetically with robust string handling
+            def user_sort_key(u):
+                name_val = u.get('username') or u.get('email') or ""
+                if isinstance(name_val, str):
+                    return name_val.lower()
+                return str(name_val).lower()
+
+            other_users.sort(key=user_sort_key)
             
             # Display all users
             for user in other_users:
                 if not user.get('id'):
                     continue
                 
-                username = user.get('username', user.get('email', 'Unknown').split('@')[0])
+                username_raw = user.get('username') or user.get('email') or "Unknown"
+                username = (
+                    username_raw.split('@')[0]
+                    if isinstance(username_raw, str) and username_raw
+                    else str(username_raw)
+                )
+
+                safe_initial = username[0].upper() if isinstance(username, str) and username else "?"
                 
                 # Check for cached avatar
                 if user.get('profile_image_url'):
@@ -7130,14 +7189,14 @@ def main(page: ft.Page):
                         avatar = ft.Image(src=cached_path, width=50, height=50, fit=ft.ImageFit.COVER, border_radius=25)
                     else:
                         avatar = ft.Container(
-                            content=ft.Text(username[0].upper(), size=20, color="white"),
+                            content=ft.Text(safe_initial, size=20, color="white"),
                             width=50, height=50, bgcolor="blue", border_radius=25,
                             alignment=ft.alignment.center
                         )
                         ImageCache.download_image(user['profile_image_url'], None, "profile")
                 else:
                     avatar = ft.Container(
-                        content=ft.Text(username[0].upper(), size=20, color="white"),
+                        content=ft.Text(safe_initial, size=20, color="white"),
                         width=50, height=50, bgcolor="blue", border_radius=25,
                         alignment=ft.alignment.center
                     )
@@ -7225,22 +7284,22 @@ def main(page: ft.Page):
     
     # Users list component
     users_list = ft.Column(scroll="auto", expand=True, spacing=10)
-    
-    # Chat list view definition
-    chat_list_view = ft.Container(
-        content=ft.Column([
-            ft.Container(
-                content=ft.Row([
-                    ft.IconButton("arrow_back", on_click=lambda e: handle_back_navigation(e)),
-                    ft.Text("Private Chats", size=24, weight="bold", expand=True)
-                ], alignment="spaceBetween"),
-                padding=ft.padding.only(left=20, right=20, top=40, bottom=20),
-                bgcolor="#E3F2FD"
-            ),
-            users_list
-        ], spacing=0),
-        expand=True
-    )
+
+    # Placeholder for private chat list content (populated later)
+    chat_list_view = ft.Container(expand=True)
+
+    # Chat list view definition (populate placeholder container)
+    chat_list_view.content = ft.Column([
+        ft.Container(
+            content=ft.Row([
+                ft.IconButton("arrow_back", on_click=lambda e: handle_back_navigation(e)),
+                ft.Text("Private Chats", size=24, weight="bold", expand=True)
+            ], alignment="spaceBetween"),
+            padding=ft.padding.only(left=20, right=20, top=40, bottom=20),
+            bgcolor="#E3F2FD"
+        ),
+        users_list
+    ], spacing=0)
     
     def show_chat_list():
         stop_auto_refresh()
