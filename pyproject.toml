@@ -23,6 +23,7 @@ build-backend = "setuptools.build_meta"
 # Flet app configuration
 # =========================
 [tool.flet]
+flutter.dependencies = ["flet-onesignal"]
 
 [tool.flet.app]
 name = "Chat App"
