@@ -54,7 +54,7 @@ target_sdk_version = 34
 # Extra Flutter packages
 # (Firebase, notifications, etc.)
 # =========================
-[tool.flet.flutter.dependencies]
+[tool.flet.flutter.packages]
 firebase_core = "2.24.0"
 firebase_messaging = "14.7.0"
 flutter_local_notifications = "16.3.0"
