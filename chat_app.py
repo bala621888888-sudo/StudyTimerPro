@@ -48,7 +48,7 @@ except AttributeError:  # pragma: no cover - compatibility shim
 
     ICONS = _Icons()
 
-ONESIGNAL_APP_ID = "YOUR-ONESIGNAL-APP-ID"
+ONESIGNAL_APP_ID = "6bb7df1b-6014-498a-ac2e-67abb63e4751"
 
 
 class PushNotificationManager:
