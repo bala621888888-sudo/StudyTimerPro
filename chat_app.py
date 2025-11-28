@@ -5791,8 +5791,8 @@ def main(page: ft.Page):
             expand=True
         )
 
-        screen_groups = ft.Container(
-            content=ft.Column([
+        groups_column = ft.Column(
+            [
                 ft.Container(
                     content=ft.Row([
                         ft.Text("Groups", size=20, weight="bold", expand=True)
@@ -5800,11 +5800,18 @@ def main(page: ft.Page):
                     padding=15
                 ),
                 ft.Container(
-                    content=groups_list_column, 
-                    padding=10, 
+                    content=groups_list_column,
+                    padding=10,
                     expand=True
                 )
-            ], spacing=0),
+            ],
+            spacing=0,
+            expand=True,
+            scroll="auto",
+        )
+
+        screen_groups = ft.Container(
+            content=groups_column,
             expand=True
         )
 
@@ -5917,8 +5924,8 @@ def main(page: ft.Page):
             threading.Thread(target=refresh_members, daemon=True).start()
             
         # ADD THIS - Create the screen_members container:
-        screen_members = ft.Container(
-            content=ft.Column([
+        members_column = ft.Column(
+            [
                 ft.Container(
                     content=ft.Row([
                         ft.Text("Members", size=20, weight="bold", expand=True)
@@ -5926,11 +5933,18 @@ def main(page: ft.Page):
                     padding=15
                 ),
                 ft.Container(
-                    content=all_members_column, 
-                    padding=10, 
+                    content=all_members_column,
+                    padding=10,
                     expand=True
                 )
-            ], spacing=0),
+            ],
+            spacing=0,
+            expand=True,
+            scroll="auto",
+        )
+
+        screen_members = ft.Container(
+            content=members_column,
             expand=True
         )
 
@@ -6411,6 +6425,8 @@ def main(page: ft.Page):
             print(f"Error creating bottom nav: {e}")
             bottom_nav = ft.Container()  # Fallback
 
+        refresh_indicator_cls = getattr(ft, "RefreshIndicator", None)
+
         # Global swipe and pull-to-refresh handlers
         def refresh_current_tab(e=None):
             """Pull-to-refresh handler for current tab"""
@@ -6476,6 +6492,40 @@ def main(page: ft.Page):
             except Exception as ex:
                 print(f"[REFRESH INDICATOR] {ex}")
 
+        promoter_refreshable = promoter_content
+        groups_refreshable = groups_column
+        members_refreshable = members_column
+        chat_list_refreshable = chat_list_layout
+
+        if refresh_indicator_cls is not None:
+            promoter_refreshable = refresh_indicator_cls(
+                on_refresh=_handle_refresh,
+                displacement=70,
+                content=promoter_content,
+            )
+            groups_refreshable = refresh_indicator_cls(
+                on_refresh=_handle_refresh,
+                displacement=70,
+                content=groups_column,
+            )
+            members_refreshable = refresh_indicator_cls(
+                on_refresh=_handle_refresh,
+                displacement=70,
+                content=members_column,
+            )
+            chat_list_refreshable = refresh_indicator_cls(
+                on_refresh=_handle_refresh,
+                displacement=70,
+                content=chat_list_layout,
+            )
+        else:
+            print("[REFRESH INDICATOR] ft.RefreshIndicator not available; using plain content")
+
+        screen_promoter.content = promoter_refreshable
+        screen_groups.content = groups_refreshable
+        screen_members.content = members_refreshable
+        chat_list_view.content = chat_list_refreshable
+
         # Build horizontal pager for WhatsApp-like slide transitions
         tab_pages = [
             ft.Container(content=screen_promoter, expand=True),
@@ -6518,11 +6568,11 @@ def main(page: ft.Page):
                 content=pager_content,
             )
 
-        refresh_indicator_cls = getattr(ft, "RefreshIndicator", None)
         if refresh_indicator_cls is not None:
             main_content = refresh_indicator_cls(
                 on_refresh=_handle_refresh,
-                child=main_swipe_target,
+                displacement=70,
+                content=main_swipe_target,
             )
         else:
             print("[REFRESH INDICATOR] ft.RefreshIndicator not available; using plain container")
@@ -7289,17 +7339,23 @@ def main(page: ft.Page):
     chat_list_view = ft.Container(expand=True)
 
     # Chat list view definition (populate placeholder container)
-    chat_list_view.content = ft.Column([
-        ft.Container(
-            content=ft.Row([
-                ft.IconButton("arrow_back", on_click=lambda e: handle_back_navigation(e)),
-                ft.Text("Private Chats", size=24, weight="bold", expand=True)
-            ], alignment="spaceBetween"),
-            padding=ft.padding.only(left=20, right=20, top=40, bottom=20),
-            bgcolor="#E3F2FD"
-        ),
-        users_list
-    ], spacing=0)
+    chat_list_layout = ft.Column(
+        [
+            ft.Container(
+                content=ft.Row([
+                    ft.IconButton("arrow_back", on_click=lambda e: handle_back_navigation(e)),
+                    ft.Text("Private Chats", size=24, weight="bold", expand=True)
+                ], alignment="spaceBetween"),
+                padding=ft.padding.only(left=20, right=20, top=40, bottom=20),
+                bgcolor="#E3F2FD"
+            ),
+            users_list
+        ],
+        spacing=0,
+        scroll="auto",
+    )
+
+    chat_list_view.content = chat_list_layout
     
     def show_chat_list():
         stop_auto_refresh()
