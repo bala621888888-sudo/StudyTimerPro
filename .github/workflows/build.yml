@@ -58,7 +58,7 @@ jobs:
           GCP_GSHEET_CREDS: ${{ secrets.GCP_GSHEET_CREDS }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
         run: |
-          flet build apk --verbose
+          flet build apk --include-packages flet-onesignal --verbose
 
       - name: Collect APK
         run: |
