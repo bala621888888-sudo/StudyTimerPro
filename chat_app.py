@@ -5,6 +5,7 @@
 import sys
 import os
 import math
+import asyncio
 
 # BLOCK any code that tries to change working directory on Android
 original_chdir = os.chdir
@@ -23,6 +24,7 @@ def safe_chdir(path):
 os.chdir = safe_chdir
 
 import flet as ft
+import flet_onesignal as fos
 import requests
 import json
 import time
@@ -45,6 +47,85 @@ except AttributeError:  # pragma: no cover - compatibility shim
         NOTIFICATIONS = "notifications"
 
     ICONS = _Icons()
+
+ONESIGNAL_APP_ID = "YOUR-ONESIGNAL-APP-ID"
+
+
+class PushNotificationManager:
+    def __init__(self, page: ft.Page):
+        self.page = page
+        self.onesignal = None
+
+    def init_onesignal(self):
+        if self.onesignal:
+            return
+
+        try:
+            self.onesignal = fos.OneSignal(
+                settings=fos.OneSignalSettings(app_id=ONESIGNAL_APP_ID),
+                on_notification_opened=self.handle_notification_opened,
+                on_notification_received=self.handle_notification_received,
+            )
+            self.page.overlay.append(self.onesignal)
+        except Exception as exc:
+            print(f"OneSignal initialization error: {exc}")
+
+    def login_user(self, user_id: str, tags: dict | None = None):
+        if self.onesignal and user_id:
+            try:
+                self.onesignal.login(user_id)
+            except Exception as exc:
+                print(f"OneSignal login error: {exc}")
+
+        if self.onesignal and tags:
+            try:
+                self.onesignal.add_tags(tags)
+            except Exception as exc:
+                print(f"OneSignal add tags error: {exc}")
+
+    def logout_user(self):
+        if self.onesignal:
+            try:
+                self.onesignal.logout()
+            except Exception as exc:
+                print(f"OneSignal logout error: {exc}")
+
+    def handle_notification_opened(self, e):
+        try:
+            notification_opened = getattr(e, "notification_opened", None) or {}
+            data = notification_opened.get("data") if isinstance(notification_opened, dict) else None
+            print(f"Notification opened with data: {data}")
+        except Exception as exc:
+            print(f"OneSignal notification opened handler error: {exc}")
+
+    def handle_notification_received(self, e):
+        try:
+            notification = getattr(e, "notification_received", None) or {}
+            title = "Notification"
+            body = ""
+
+            if isinstance(notification, dict):
+                title = notification.get("title") or title
+                body = notification.get("body") or body
+            else:
+                body = str(notification)
+
+            snack = ft.SnackBar(
+                content=ft.Column(
+                    [
+                        ft.Text(title, weight="bold", color="white"),
+                        ft.Text(body, color="white"),
+                    ],
+                    spacing=2,
+                ),
+                bgcolor="#2196F3",
+                duration=4000,
+            )
+            self.page.overlay.append(snack)
+            snack.open = True
+            self.page.update()
+        except Exception as exc:
+            print(f"OneSignal notification received handler error: {exc}")
 
 # Message listener system
 active_listeners = {}  # Store active listeners
@@ -2497,6 +2578,9 @@ def main(page: ft.Page):
     
     page.update = safe_update
 
+    push_manager = PushNotificationManager(page)
+    push_manager.init_onesignal()
+
     # ============================================
     # CRITICAL: Set page properties FIRST
     # ============================================
@@ -2875,14 +2959,15 @@ def main(page: ft.Page):
                     storage = FirebaseStorage(FIREBASE_CONFIG['storageBucket'], auth.id_token)
                     current_username = credentials.get('username', 'User')
                     is_admin = (auth.email == ADMIN_EMAIL)
-                    
+
                     # Group membership will be checked when group is selected
 
-                    
+
                     user_is_group_admin = False
-                    
+
                     group_info = {}
                     print("✓ Auto-login successful")
+                    push_manager.login_user(auth.user_id, tags={"user_type": "free"})
                     show_main_menu()
                     
                     # Restore timeout
@@ -3041,14 +3126,15 @@ def main(page: ft.Page):
                             storage = FirebaseStorage(FIREBASE_CONFIG['storageBucket'], auth.id_token)
                             db.create_user_profile(auth.user_id, auth.email, username)
                             db.store_user_token(auth.user_id, auth.email, username, auth.refresh_token)
-                            
+
                             current_username = username
                             is_admin = (auth.email == ADMIN_EMAIL)
                             user_is_group_admin = False
                             group_info = {}
                             CredentialsManager.save_credentials(auth.email, auth.refresh_token, current_username)
-                            
+
                             show_snackbar("Account created successfully!")
+                            push_manager.login_user(auth.user_id, tags={"user_type": "free"})
                             show_main_menu()
                             return
                         else:
@@ -3081,8 +3167,9 @@ def main(page: ft.Page):
                                     
                                     group_info = {}
                                     CredentialsManager.save_credentials(auth.email, auth.refresh_token, current_username)
-                                    
+
                                     show_snackbar("Account recovered successfully!")
+                                    push_manager.login_user(auth.user_id, tags={"user_type": "free"})
                                     show_main_menu()
                                     return
                                 else:
@@ -3115,14 +3202,15 @@ def main(page: ft.Page):
                         storage = FirebaseStorage(FIREBASE_CONFIG['storageBucket'], auth.id_token)
                         current_username = saved_creds['username']
                         is_admin = (auth.email == ADMIN_EMAIL)
-                        
+
                         # Group membership will be checked when group is selected
 
-                        
+
                         user_is_group_admin = False
-                        
+
                         group_info = {}
                         show_snackbar("Login successful!")
+                        push_manager.login_user(auth.user_id, tags={"user_type": "free"})
                         show_main_menu()
                         return
                 
@@ -3142,7 +3230,7 @@ def main(page: ft.Page):
                         if success_signin:
                             db = FirebaseDatabase(FIREBASE_CONFIG['databaseURL'], auth.id_token)
                             storage = FirebaseStorage(FIREBASE_CONFIG['storageBucket'], auth.id_token)
-                            
+
                             profile = db.get_user_profile(auth.user_id)
                             if profile and profile.get('username'):
                                 current_username = profile['username']
@@ -3151,19 +3239,20 @@ def main(page: ft.Page):
                                 db.create_user_profile(auth.user_id, auth.email, current_username)
                             
                             db.store_user_token(auth.user_id, auth.email, current_username, auth.refresh_token)
-                            
+
                             is_admin = (auth.email == ADMIN_EMAIL)
                             user_is_group_admin = False
-                            
+
                             # Group membership will be checked when group is selected
 
-                            
+
                             user_is_group_admin = False
-                            
+
                             group_info = {}
                             CredentialsManager.save_credentials(auth.email, auth.refresh_token, current_username)
-                            
+
                             show_snackbar("Login successful!")
+                            push_manager.login_user(auth.user_id, tags={"user_type": "free"})
                             show_main_menu()
                             return
                         else:
@@ -6694,6 +6783,7 @@ def main(page: ft.Page):
             nonlocal group_info
             group_info = {}
     def handle_logout():
+        push_manager.logout_user()
         CredentialsManager.clear_credentials()
         show_snackbar("Logged out successfully")
         show_login_view()
