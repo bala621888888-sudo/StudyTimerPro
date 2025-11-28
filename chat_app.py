@@ -6,32 +6,6 @@ import sys
 import os
 import math
 
-# SET UP FILE LOGGING (prints don't show in logcat)
-log_file = None
-original_print = print  # SAVE original print first!
-
-try:
-    log_dir = "/data/data/com.flet.chat_app/files"
-    log_path = os.path.join(log_dir, "fcm_debug.log")
-    log_file = open(log_path, "w", buffering=1)
-    
-    def log_print(*args, **kwargs):
-        """Print to both stdout and file"""
-        message = " ".join(str(arg) for arg in args)
-        original_print(message, **kwargs)  # Use saved original
-        if log_file:
-            log_file.write(message + "\n")
-            log_file.flush()
-    
-    # Replace print
-    print = log_print
-    print("="*50)
-    print("FCM DEBUG LOG STARTED")
-    print(f"Log file: {log_path}")
-    print("="*50)
-except Exception as e:
-    original_print(f"Logging setup failed: {e}")
-
 # BLOCK any code that tries to change working directory on Android
 original_chdir = os.chdir
 
@@ -52,11 +26,9 @@ import flet as ft
 import requests
 import json
 import time
-import os
 import threading
 import random
 import smtplib
-import sys
 import traceback
 import queue
 from secrets_util import get_secret, get_encrypted_gspread_client
@@ -78,41 +50,6 @@ except AttributeError:  # pragma: no cover - compatibility shim
 active_listeners = {}  # Store active listeners
 message_queue = queue.Queue()  # Queue for UI updates
 listener_lock = threading.Lock()
-
-# -------------------- FCM TOKEN LOADER --------------------
-import os
-
-def get_fcm_token_from_file():
-    """
-    Load FCM token stored by Flutter / Kotlin inside internal app folder.
-    Tries multiple paths to ensure compatibility.
-    """
-    possible_paths = [
-        # Dart via path_provider (new way)
-        "/data/user/0/com.flet.chat_app/app_flutter/.chatapp/fcm_token.txt",
-        "/data/data/com.flet.chat_app/app_flutter/.chatapp/fcm_token.txt",
-
-        # If you later actually use com.chatapp.mobile:
-        "/data/user/0/com.chatapp.mobile/app_flutter/.chatapp/fcm_token.txt",
-        "/data/data/com.chatapp.mobile/app_flutter/.chatapp/fcm_token.txt",
-
-        # Kotlin MainActivity via filesDir (current behaviour)
-        "/data/user/0/com.flet.chat_app/files/.chatapp/fcm_token.txt",
-        "/data/data/com.flet.chat_app/files/.chatapp/fcm_token.txt",
-        "/data/user/0/com.chatapp.mobile/files/.chatapp/fcm_token.txt",
-        "/data/data/com.chatapp.mobile/files/.chatapp/fcm_token.txt",
-    ]
-
-    for token_path in possible_paths:
-        try:
-            if os.path.exists(token_path):
-                with open(token_path, "r") as f:
-                    token = f.read().strip()
-                    if token:
-                        return token
-        except Exception as e:
-            pass
-    return None
 
 # Global error handler for APK builds
 def setup_error_handling(page):
@@ -180,239 +117,6 @@ EMAIL_CONFIG = {
 ADMIN_EMAIL = "bala6218888@gmail.com"
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB in bytes
 
-# ============================================
-# FCM CONFIGURATION
-# ============================================
-def _load_fcm_service_account():
-    """
-    Load Firebase service account JSON.
-
-    Priority:
-    1) FIREBASE_SERVICE_ACCOUNT or FCM_SERVICE_ACCOUNT env var (PC/dev)
-    2) Secret Manager value (FCM_SERVICE_ACCOUNT)
-    3) assets/firebase_service_account.json (inside APK)
-    """
-    # 1) Environment variable - for local dev / desktop
-    for env_key in ("FIREBASE_SERVICE_ACCOUNT", "FCM_SERVICE_ACCOUNT"):
-        env_value = os.environ.get(env_key)
-        if env_value and env_value.strip():
-            print(f"✅ Loaded FCM service account from env: {env_key}.")
-            return env_value
-
-    # 2) Secret Manager (works when GitHub Actions injects FCM_SERVICE_ACCOUNT)
-    try:
-        secret_value = get_secret("FCM_SERVICE_ACCOUNT")
-        if secret_value and secret_value.strip():
-            print("✅ Loaded FCM service account from Secret Manager: FCM_SERVICE_ACCOUNT.")
-            return secret_value
-    except Exception as e:
-        print(f"⚠️ Error loading FCM service account from Secret Manager: {e}")
-
-    # 3) Asset file - for packaged mobile app
-    try:
-        assets_dir = os.environ.get("FLET_ASSETS_DIR", "assets")
-        candidates = [
-            os.path.join(assets_dir, "firebase_service_account.json"),
-            os.path.join(os.path.dirname(__file__), "assets", "firebase_service_account.json"),
-        ]
-        for path in candidates:
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    print(f"✅ Loaded FCM service account from file: {path}")
-                    return f.read()
-    except Exception as e:
-        print(f"⚠️ Error loading FCM service account: {e}")
-
-    print("⚠️ No FCM service account found. Push notifications disabled.")
-    return ""
-
-
-FCM_SERVICE_ACCOUNT = _load_fcm_service_account()
-
-# ============================================
-# FCM V1 SENDER CLASS - Push Notifications
-# ============================================
-class FCMSender:
-    """
-    Firebase Cloud Messaging V1 API Sender
-    Uses OAuth 2.0 service account authentication (not legacy server key)
-    """
-    def __init__(self, service_account_json):
-        """
-        Initialize FCM sender with service account
-        Args:
-            service_account_json: Service account JSON string or dict
-        """
-        try:
-            from google.oauth2 import service_account
-            from google.auth.transport.requests import Request
-            import json
-            
-            # Parse service account JSON
-            if isinstance(service_account_json, str):
-                service_account_info = json.loads(service_account_json)
-            else:
-                service_account_info = service_account_json
-            
-            # Create credentials
-            self.credentials = service_account.Credentials.from_service_account_info(
-                service_account_info,
-                scopes=['https://www.googleapis.com/auth/firebase.messaging']
-            )
-            
-            # Extract project ID
-            self.project_id = service_account_info.get('project_id')
-            if not self.project_id:
-                raise ValueError("Could not extract project_id from service account")
-            
-            self.fcm_url = f'https://fcm.googleapis.com/v1/projects/{self.project_id}/messages:send'
-            print(f"✅ FCM V1 initialized for project: {self.project_id}")
-            
-        except ImportError:
-            print("⚠️ google-auth package not installed. FCM notifications disabled.")
-            print("   Run: pip install google-auth google-auth-oauthlib")
-            self.credentials = None
-            self.project_id = None
-            self.fcm_url = None
-        except Exception as e:
-            print(f"❌ Failed to initialize FCM: {e}")
-            self.credentials = None
-            self.project_id = None
-            self.fcm_url = None
-    
-    def _get_access_token(self):
-        """Get OAuth 2.0 access token"""
-        if not self.credentials:
-            return None
-        try:
-            from google.auth.transport.requests import Request
-            self.credentials.refresh(Request())
-            return self.credentials.token
-        except Exception as e:
-            print(f"Error getting access token: {e}")
-            return None
-    
-    def send_notification(self, fcm_token, title, body, data=None):
-        """
-        Send notification to a single device
-        Args:
-            fcm_token: Device FCM token
-            title: Notification title
-            body: Notification body  
-            data: Optional data payload (dict)
-        Returns:
-            bool: True if successful
-        """
-        if not self.fcm_url or not fcm_token:
-            print(f"❌ [FCM SEND] Missing URL or token")
-            print(f"   fcm_url: {self.fcm_url}")
-            print(f"   fcm_token: {'Present' if fcm_token else 'Missing'}")
-            return False
-
-        access_token = self._get_access_token()
-        if not access_token:
-            print(f"❌ [FCM SEND] Failed to get access token")
-            return False
-
-        headers = {
-            'Authorization': f'Bearer {access_token}',
-            'Content-Type': 'application/json; charset=UTF-8',
-        }
-        
-        message = {
-            'message': {
-                'token': fcm_token,
-                'notification': {
-                    'title': title,
-                    'body': body
-                },
-                'android': {
-                    'priority': 'high',
-                    'notification': {
-                        'sound': 'default',
-                        'click_action': 'FLUTTER_NOTIFICATION_CLICK'
-                    }
-                }
-            }
-        }
-        
-        # Add custom data if provided
-        if data:
-            message['message']['data'] = {k: str(v) for k, v in data.items()}
-            print(f"📦 [FCM SEND] Added data payload: {data}")
-        
-        print(f"🌐 [FCM SEND] Sending to: {self.fcm_url}")
-        try:
-            response = requests.post(self.fcm_url, headers=headers, json=message, timeout=10)
-            print(f"📊 [FCM SEND] Response status: {response.status_code}")
-            
-            if response.status_code == 200:
-                print(f"✅ [FCM SEND] Notification sent successfully!")
-                print(f"   Response: {response.json()}")
-                return True
-            else:
-                print(f"❌ [FCM SEND] Failed with status {response.status_code}")
-                print(f"   Error: {response.text}")
-                return False
-        except Exception as e:
-            print(f"❌ [FCM SEND] Exception: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-    
-    def send_to_multiple(self, fcm_tokens, title, body, data=None):
-        """
-        Send notification to multiple devices
-        Args:
-            fcm_tokens: List of FCM tokens
-            title: Notification title
-            body: Notification body
-            data: Optional data payload
-        Returns:
-            dict: Results with success/failure counts
-        """
-        results = {'success': 0, 'failure': 0}
-        
-        for token in fcm_tokens:
-            if self.send_notification(token, title, body, data):
-                results['success'] += 1
-            else:
-                results['failure'] += 1
-        
-        return results
-
-# Initialize global FCM sender
-fcm_sender = None
-print("\n🔥 [FCM INIT] Starting FCM initialization...")
-print(f"   Service account present: {bool(FCM_SERVICE_ACCOUNT)}")
-
-if FCM_SERVICE_ACCOUNT:
-    try:
-        print("🔄 [FCM INIT] Creating FCMSender instance...")
-        fcm_sender = FCMSender(FCM_SERVICE_ACCOUNT)
-        
-        if fcm_sender and fcm_sender.credentials and fcm_sender.project_id:
-            print(f"✅ [FCM INIT] FCM initialized successfully!")
-            print(f"   Project ID: {fcm_sender.project_id}")
-            print(f"   FCM URL: {fcm_sender.fcm_url}")
-            print(f"   Credentials: OK")
-        else:
-            print("❌ [FCM INIT] FCM object created but missing credentials")
-            print(f"   fcm_sender: {fcm_sender}")
-            print(f"   credentials: {fcm_sender.credentials if fcm_sender else 'N/A'}")
-            print(f"   project_id: {fcm_sender.project_id if fcm_sender else 'N/A'}")
-            fcm_sender = None
-            
-    except Exception as e:
-        print(f"❌ [FCM INIT] FCM initialization failed: {e}")
-        import traceback
-        traceback.print_exc()
-        fcm_sender = None
-else:
-    print("⚠️ [FCM INIT] FCM_SERVICE_ACCOUNT not set. Notifications disabled.")
-    
-print(f"📊 [FCM INIT] Final fcm_sender state: {'READY' if fcm_sender else 'NULL'}\n")
-    
 # ============================================
 # MESSAGE LISTENER CLASS - Real-time updates
 # ============================================
@@ -982,90 +686,573 @@ class FirebaseStorage:
         except Exception as e:
             return False, f"Error: {str(e)}"
             
-class FCMNotificationSender:
-    def __init__(self):
-        self.access_token = None
-        self.token_expiry = 0
-        
-    def get_access_token(self):
-        """Get OAuth2 access token from service account"""
-        try:
-            import json
-            from google.oauth2 import service_account
-            from google.auth.transport.requests import Request
-            
-            # Check if token is still valid
-            if self.access_token and time.time() < self.token_expiry:
-                return self.access_token
-            
-            # Parse service account JSON
-            service_account_info = json.loads(FCM_SERVICE_ACCOUNT)
-            
-            # Create credentials
-            credentials = service_account.Credentials.from_service_account_info(
-                service_account_info,
-                scopes=['https://www.googleapis.com/auth/firebase.messaging']
-            )
-            
-            # Refresh token
-            credentials.refresh(Request())
-            
-            self.access_token = credentials.token
-            self.token_expiry = time.time() + 3000  # Token valid for ~50 minutes
-            
-            return self.access_token
-            
-        except Exception as e:
-            print(f"Error getting access token: {e}")
-            return None
+
+class MessageListener:
+    """Firebase real-time message listener using polling"""
     
-    def send_notification(self, fcm_token, title, body, data=None):
-        """Send FCM notification using V1 API"""
+    def __init__(self, chat_id, callback, db_instance):
+        self.chat_id = chat_id
+        self.callback = callback
+        self.db = db_instance
+        self.running = False
+        self.thread = None
+        self.last_message_count = 0
+        self.last_check = 0
+    
+    def start(self):
+        """Start listening for new messages"""
+        if self.running:
+            return
+        
+        self.running = True
+        self.thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self.thread.start()
+        print(f"[LISTENER] Started for chat {self.chat_id}")
+    
+    def stop(self):
+        """Stop listening"""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1)
+        print(f"[LISTENER] Stopped for chat {self.chat_id}")
+    
+    def _listen_loop(self):
+        """Background loop to check for new messages"""
+        while self.running:
+            try:
+                # Only check every 3 seconds to reduce load
+                current_time = time.time()
+                if current_time - self.last_check < 3:
+                    time.sleep(0.5)
+                    continue
+                
+                self.last_check = current_time
+                
+                # Fetch latest messages
+                messages = self.db.get_messages(self.chat_id)
+                
+                if messages:
+                    message_count = len(messages)
+                    
+                    # Check if there are new messages
+                    if message_count > self.last_message_count:
+                        print(f"[LISTENER] New messages detected: {message_count} (was {self.last_message_count})")
+                        self.last_message_count = message_count
+                        
+                        # Put update request in queue for UI thread
+                        message_queue.put({
+                            'type': 'update_messages',
+                            'chat_id': self.chat_id,
+                            'messages': messages
+                        })
+                    else:
+                        self.last_message_count = message_count
+                
+                # Sleep before next check
+                time.sleep(1)
+                
+            except Exception as e:
+                print(f"[LISTENER ERROR] {e}")
+                time.sleep(2)  # Wait longer on error
+
+"""
+Cache-First Loading Strategy for Chat App
+Replace the relevant sections in your code with these improved versions.
+Shows cached data immediately, then syncs with server in background.
+"""
+
+# Add these lines after your imports and before FirebaseAuth class
+import pickle
+
+# ============================================
+# CACHE MANAGER CLASS - Add this entire section
+# ============================================
+class CacheManager:
+    """Manages all app caching with offline support"""
+    
+    CACHE_VERSION = "v1"
+    
+    @staticmethod
+    def get_cache_file(cache_type):
+        """Get cache file path for different data types"""
+        cache_files = {
+            'users': CACHE_DIR / 'users_cache.pkl',
+            'groups': CACHE_DIR / 'groups_cache.pkl',
+            'group_members': CACHE_DIR / 'group_members_cache.pkl',
+            'private_chats': CACHE_DIR / 'private_chats_cache.pkl',
+            'group_info': CACHE_DIR / 'group_info_cache.pkl'
+        }
+        return cache_files.get(cache_type)
+    
+    @staticmethod
+    def save_to_cache(cache_type, data):
+        """Save data to cache with timestamp"""
         try:
-            access_token = self.get_access_token()
-            if not access_token:
-                print("Failed to get access token")
-                return False
-            
-            project_id = "leaderboard-98e8c"
-            url = f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
-            
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json"
-            }
-            
-            message = {
-                "message": {
-                    "token": fcm_token,
-                    "notification": {
-                        "title": title,
-                        "body": body
-                    },
-                    "android": {
-                        "priority": "high",
-                        "notification": {
-                            "sound": "default",
-                            "click_action": "FLUTTER_NOTIFICATION_CLICK",
-                            "channel_id": "chat_messages"
-                        }
-                    },
-                    "data": data or {}
+            cache_file = CacheManager.get_cache_file(cache_type)
+            if cache_file:
+                cache_data = {
+                    'version': CacheManager.CACHE_VERSION,
+                    'timestamp': time.time(),
+                    'data': data
                 }
-            }
-            
-            response = requests.post(url, headers=headers, json=message)
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(cache_data, f)
+                return True
+        except Exception as e:
+            print(f"Cache save error ({cache_type}): {e}")
+        return False
+    
+    @staticmethod
+    def sanitize_data(data):
+        """Remove NaN values from cached data"""
+        import math
+        
+        if isinstance(data, dict):
+            return {k: CacheManager.sanitize_data(v) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [CacheManager.sanitize_data(item) for item in data]
+        elif isinstance(data, float):
+            if math.isnan(data) or math.isinf(data):
+                return 0
+            return data
+        return data
+    
+    @staticmethod
+    def load_from_cache(cache_type):
+        """Load data from cache if available"""
+        try:
+            cache_file = CacheManager.get_cache_file(cache_type)
+            if cache_file and cache_file.exists():
+                with open(cache_file, 'rb') as f:
+                    cache_data = pickle.load(f)
+                
+                if cache_data.get('version') != CacheManager.CACHE_VERSION:
+                    return None
+                
+                # 🔥 SANITIZE BEFORE RETURNING
+                data = cache_data.get('data')
+                return CacheManager.sanitize_data(data)
+        except Exception as e:
+            print(f"Cache load error ({cache_type}): {e}")
+        return None
+
+# ============================================
+# NETWORK CHECKER - Add this too
+# ============================================
+class NetworkChecker:
+    """Check internet connectivity"""
+    
+    @staticmethod
+    def is_online():
+        """Quick check if internet is available"""
+        try:
+            import socket
+            socket.create_connection(("8.8.8.8", 53), timeout=2)
+            return True
+        except:
+            return False
+
+class FirebaseAuth:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.user_id = None
+        self.id_token = None
+        self.refresh_token = None
+        self.email = None
+        
+    def sign_up(self, email, password):
+        url = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={self.api_key}"
+        payload = {"email": email, "password": password, "returnSecureToken": True}
+        
+        try:
+            response = requests.post(url, json=payload)
+            data = response.json()
             
             if response.status_code == 200:
-                print(f"Notification sent successfully to {title}")
-                return True
+                self.user_id = data['localId']
+                self.id_token = data['idToken']
+                self.refresh_token = data.get('refreshToken')
+                self.email = email
+                return True, "Account created successfully!"
             else:
-                print(f"FCM error: {response.status_code} - {response.text}")
+                error_msg = data.get('error', {}).get('message', 'Unknown error')
+                return False, error_msg
+        except Exception as e:
+            return False, str(e)
+    
+    def sign_in(self, email, password):
+        url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={self.api_key}"
+        payload = {"email": email, "password": password, "returnSecureToken": True}
+        
+        try:
+            response = requests.post(url, json=payload)
+            data = response.json()
+            
+            if response.status_code == 200:
+                self.user_id = data['localId']
+                self.id_token = data['idToken']
+                self.refresh_token = data.get('refreshToken')
+                self.email = email
+                return True, "Signed in successfully!"
+            else:
+                error_msg = data.get('error', {}).get('message', 'Unknown error')
+                return False, error_msg
+        except Exception as e:
+            return False, str(e)
+    
+    def refresh_id_token(self):
+        """Refresh the ID token using refresh token"""
+        if not self.refresh_token:
+            return False
+        
+        url = f"https://securetoken.googleapis.com/v1/token?key={self.api_key}"
+        payload = {
+            "grant_type": "refresh_token",
+            "refresh_token": self.refresh_token
+        }
+        
+        try:
+            response = requests.post(url, json=payload)
+            data = response.json()
+            
+            if response.status_code == 200:
+                self.id_token = data['id_token']
+                self.refresh_token = data['refresh_token']
+                self.user_id = data['user_id']
+                return True
+            return False
+        except:
+            return False
+
+class OTPManager:
+    def __init__(self):
+        self.otp_storage = {}  # email: {"otp": code, "timestamp": time}
+    
+    def generate_otp(self):
+        """Generate 6-digit OTP"""
+        return str(random.randint(100000, 999999))
+    
+    def send_otp(self, email, otp):
+        """Send OTP via email with retry logic"""
+        max_retries = 3
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                msg = MIMEMultipart()
+                msg['From'] = EMAIL_CONFIG['sender_email']
+                msg['To'] = email
+                msg['Subject'] = "Your Chat App Login OTP"
+                
+                body = f"""
+                <html>
+                    <body style="font-family: Arial, sans-serif; padding: 20px;">
+                        <h2 style="color: #2196F3;">Chat App Login</h2>
+                        <p>Your OTP code is:</p>
+                        <h1 style="color: #4CAF50; font-size: 48px; letter-spacing: 10px;">{otp}</h1>
+                        <p>This code will expire in 5 minutes.</p>
+                        <p style="color: #666;">If you didn't request this code, please ignore this email.</p>
+                    </body>
+                </html>
+                """
+                
+                msg.attach(MIMEText(body, 'html'))
+                
+                # Create new SMTP connection for each attempt
+                server = smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port'], timeout=10)
+                server.starttls()
+                server.login(EMAIL_CONFIG['sender_email'], EMAIL_CONFIG['sender_password'])
+                server.send_message(msg)
+                server.quit()
+                
+                # Store OTP with timestamp
+                self.otp_storage[email] = {
+                    "otp": otp,
+                    "timestamp": time.time()
+                }
+                
+                return True
+                
+            except smtplib.SMTPAuthenticationError as e:
+                print(f"SMTP Authentication Error (Attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
                 return False
                 
-        except Exception as e:
-            print(f"Error sending FCM notification: {e}")
+            except smtplib.SMTPException as e:
+                print(f"SMTP Error (Attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                return False
+                
+            except Exception as e:
+                print(f"Error sending OTP (Attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                return False
+        
+        return False
+    
+    def verify_otp(self, email, entered_otp):
+        """Verify OTP - expires after 5 minutes"""
+        if email not in self.otp_storage:
             return False
+        
+        stored_data = self.otp_storage[email]
+        
+        # Check if OTP expired (5 minutes)
+        if time.time() - stored_data['timestamp'] > 300:
+            del self.otp_storage[email]
+            return False
+        
+        # Verify OTP
+        if stored_data['otp'] == entered_otp:
+            del self.otp_storage[email]  # Remove after successful verification
+            return True
+        
+        return False
+        
+class SMSReader:
+    def __init__(self):
+        self.last_otp = None
+        self.monitoring = False
+        self.receiver = None
+    
+    def start_monitoring(self, callback):
+        """Start monitoring for SMS with OTP - mobile only"""
+        try:
+            import platform
+            if platform.system() != 'Android':
+                return False
+            
+            from android.permissions import request_permissions, Permission, check_permission
+            from android.broadcast import BroadcastReceiver
+            from jnius import autoclass
+            
+            # Check if permissions are already granted
+            if not check_permission(Permission.RECEIVE_SMS) or not check_permission(Permission.READ_SMS):
+                # Request SMS permissions
+                request_permissions([Permission.RECEIVE_SMS, Permission.READ_SMS])
+                time.sleep(1)  # Wait for permission dialog
+            
+            SmsMessage = autoclass('android.telephony.SmsMessage')
+            
+            def on_sms_received(context, intent):
+                try:
+                    messages = intent.getParcelableArrayExtra("pdus")
+                    if not messages:
+                        return
+                        
+                    for message in messages:
+                        sms = SmsMessage.createFromPdu(message)
+                        sender = sms.getOriginatingAddress()
+                        body = sms.getMessageBody()
+                        
+                        # Extract 6-digit OTP from message
+                        import re
+                        otp_match = re.search(r'\b(\d{6})\b', body)
+                        
+                        if otp_match:
+                            otp_code = otp_match.group(1)
+                            self.last_otp = otp_code
+                            callback(otp_code)
+                            break
+                except Exception as e:
+                    print(f"SMS read error: {e}")
+            
+            # Register broadcast receiver
+            self.receiver = BroadcastReceiver(on_sms_received, actions=['android.provider.Telephony.SMS_RECEIVED'])
+            self.receiver.start()
+            self.monitoring = True
+            return True
+            
+        except Exception as e:
+            print(f"SMS monitoring not available: {e}")
+            return False
+    
+    def stop_monitoring(self):
+        """Stop monitoring SMS"""
+        self.monitoring = False
+        try:
+            if self.receiver:
+                self.receiver.stop()
+        except:
+            pass
+
+class ClipboardMonitor:
+    def __init__(self, page):
+        self.page = page
+        self.monitoring = False
+        self.last_value = ""
+        self.thread = None
+    
+    def start_monitoring(self, callback):
+        """Monitor clipboard for OTP codes"""
+        self.monitoring = True
+        
+        def monitor_loop():
+            import re
+            while self.monitoring:
+                try:
+                    # Get clipboard content
+                    clipboard_text = self.page.get_clipboard()
+                    
+                    if clipboard_text and clipboard_text != self.last_value:
+                        self.last_value = clipboard_text
+                        
+                        # Look for 6-digit OTP
+                        otp_match = re.search(r'\b(\d{6})\b', clipboard_text)
+                        if otp_match:
+                            otp_code = otp_match.group(1)
+                            callback(otp_code)
+                    
+                    time.sleep(1)  # Check every second
+                except Exception as e:
+                    print(f"Clipboard monitor error: {e}")
+                    time.sleep(1)
+        
+        self.thread = threading.Thread(target=monitor_loop, daemon=True)
+        self.thread.start()
+        return True
+    
+    def stop_monitoring(self):
+        self.monitoring = False
+
+class CredentialsManager:
+    @staticmethod
+    def save_credentials(email, refresh_token, username):
+        """Save credentials locally"""
+        try:
+            credentials = {
+                "email": email,
+                "refresh_token": refresh_token,
+                "username": username
+            }
+            with open(CREDENTIALS_FILE, 'w') as f:
+                json.dump(credentials, f)
+            return True
+        except:
+            return False
+    
+    @staticmethod
+    def load_credentials():
+        """Load saved credentials"""
+        try:
+            if CREDENTIALS_FILE.exists():
+                with open(CREDENTIALS_FILE, 'r') as f:
+                    return json.load(f)
+            return None
+        except:
+            return None
+    
+    @staticmethod
+    def clear_credentials():
+        """Clear saved credentials (logout)"""
+        try:
+            if CREDENTIALS_FILE.exists():
+                CREDENTIALS_FILE.unlink()
+            return True
+        except:
+            return False
+            
+class ImageCache:
+    @staticmethod
+    def get_cache_path(image_url, cache_type="profile"):
+        """Generate cache file path from URL"""
+        import hashlib
+        url_hash = hashlib.md5(image_url.encode()).hexdigest()
+        cache_dir = CACHE_DIR if cache_type == "profile" else GROUP_ICON_CACHE_DIR
+        return cache_dir / f"{url_hash}.jpg"
+    
+    @staticmethod
+    def get_cached_image(image_url, cache_type="profile"):
+        """Get cached image path if exists"""
+        if not image_url:
+            return None
+        
+        path = ImageCache.get_cache_path(image_url, cache_type)
+        if path.exists():
+            return str(path)
+        return None
+    
+    @staticmethod
+    def download_image(image_url, callback, cache_type="profile"):
+        """Download image in background and cache it"""
+        if not image_url:
+            return
+        
+        def download_thread():
+            try:
+                response = requests.get(image_url, timeout=10)
+                if response.status_code == 200:
+                    path = ImageCache.get_cache_path(image_url, cache_type)
+                    with open(path, "wb") as f:
+                        f.write(response.content)
+                    
+                    # Callback with cached path
+                    if callback:
+                        callback(str(path))
+            except Exception as e:
+                print(f"Image download error: {e}")
+        
+        threading.Thread(target=download_thread, daemon=True).start()
+    
+    @staticmethod
+    def clear_cache():
+        """Clear all cached images"""
+        try:
+            import shutil
+            if CACHE_DIR.exists():
+                shutil.rmtree(CACHE_DIR)
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            if GROUP_ICON_CACHE_DIR.exists():
+                shutil.rmtree(GROUP_ICON_CACHE_DIR)
+                GROUP_ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            return True
+        except:
+            return False
+
+class FirebaseStorage:
+    def __init__(self, bucket_name, auth_token):
+        self.bucket_name = bucket_name
+        self.auth_token = auth_token
+    
+    def upload_file(self, file_path, file_name, file_data):
+        """Upload file to Firebase Storage"""
+        try:
+            # Use simple upload API without auth token issues
+            encoded_path = file_path.replace('/', '%2F')
+            
+            # Upload URL - simplified
+            upload_url = f"https://firebasestorage.googleapis.com/v0/b/{self.bucket_name}/o?name={file_path}"
+            
+            response = requests.post(
+                upload_url,
+                data=file_data,
+                headers={"Content-Type": "application/octet-stream"}
+            )
+            
+            if response.status_code == 200:
+                # Generate public download URL
+                download_url = f"https://firebasestorage.googleapis.com/v0/b/{self.bucket_name}/o/{encoded_path}?alt=media"
+                return True, download_url
+            else:
+                error_info = f"Status {response.status_code}"
+                try:
+                    error_data = response.json()
+                    error_info = error_data.get('error', {}).get('message', error_info)
+                except:
+                    error_info = response.text[:100] if response.text else error_info
+                
+                return False, f"Upload failed: {error_info}"
+                    
+        except Exception as e:
+            return False, f"Error: {str(e)}"
+            
 
 class FirebaseDatabase:
     def __init__(self, database_url, auth_token):
@@ -1191,59 +1378,13 @@ class FirebaseDatabase:
         try:
             response = requests.post(url, json=message_data)
             print(f"[DEBUG] send_group_message_by_id status={response.status_code}, text={response.text[:200]}")
-            
+
             if response.status_code == 200:
-                # ✅ Send FCM notification to all group members
-                self._send_group_chat_notification(group_id, sender_id, sender_username, message_text)
                 return True
             return False
         except Exception as e:
             print(f"[DEBUG] send_group_message_by_id exception: {e}")
             return False
-    
-    def _send_group_chat_notification(self, group_id, sender_id, sender_username, message_text):
-        """Send FCM notification to all group members except sender"""
-        if not fcm_sender:
-            return
-        
-        try:
-            # Get group members
-            members = self.get_group_members_by_id(group_id)
-            if not members:
-                return
-            
-            # Get group info
-            group_info = self.get_group_info_by_id(group_id)
-            group_name = group_info.get('name', 'Group')
-            
-            # Get FCM tokens for all members except sender
-            member_ids = [m['id'] for m in members if m['id'] != sender_id]
-            fcm_tokens = self.get_multiple_fcm_tokens(member_ids)
-            
-            if not fcm_tokens:
-                return
-            
-            # Truncate message if too long
-            body = message_text[:100] + "..." if len(message_text) > 100 else message_text
-            
-            # Send notifications in background thread
-            def send_notifications_async():
-                results = fcm_sender.send_to_multiple(
-                    fcm_tokens=fcm_tokens,
-                    title=f"👥 {group_name}",
-                    body=f"{sender_username}: {body}",
-                    data={
-                        'type': 'group_message',
-                        'group_id': group_id,
-                        'group_name': group_name,
-                        'sender_id': sender_id,
-                        'sender_name': sender_username
-                    }
-                )
-            threading.Thread(target=send_notifications_async, daemon=True).start()
-            
-        except Exception as e:
-            print(f"Error sending group notification: {e}")
 
     def update_group_info_by_id(self, group_id, name, description, icon, icon_url=None, category="None"):
         """Update info for a specific group"""
@@ -1311,36 +1452,6 @@ class FirebaseDatabase:
         except:
             return False
         
-    def send_fcm_notification(self, user_id, title, body, data=None):
-        """Send FCM push notification to a specific user"""
-        try:
-            # Get user's FCM token from database
-            token_url = f"{self.database_url}/user_tokens/{user_id}/fcm_token.json?auth={self.auth_token}"
-            response = requests.get(token_url)
-            
-            if response.status_code != 200 or not response.json():
-                return False
-            
-            fcm_token = response.json()
-            
-            # Use FCM V1 API
-            fcm_sender = FCMNotificationSender()
-            return fcm_sender.send_notification(fcm_token, title, body, data)
-            
-        except Exception as e:
-            print(f"FCM notification error: {e}")
-            return False
-
-    def store_fcm_token(self, user_id, fcm_token):
-        """Store user's FCM token"""
-        url = f"{self.database_url}/user_tokens/{user_id}/fcm_token.json?auth={self.auth_token}"
-        
-        try:
-            response = requests.put(url, json=fcm_token)
-            return response.status_code == 200
-        except:
-            return False
-
    
     def get_messages(self, chat_id, limit=20):
         url = f"{self.database_url}/chats/{chat_id}/messages.json?auth={self.auth_token}&orderBy=\"timestamp\"&limitToLast={limit}"
@@ -1380,49 +1491,11 @@ class FirebaseDatabase:
         try:
             response = requests.post(url, json=message_data)
             if response.status_code == 200:
-                # ✅ Send FCM notification to recipient
-                self._send_private_chat_notification(chat_id, sender_id, sender_username, message_text)
                 return True
             return False
         except:
             return False
-    
-    def _send_private_chat_notification(self, chat_id, sender_id, sender_username, message_text):
-        """Send FCM notification for private chat message"""
-        if not fcm_sender:
-            return
-        
-        try:
-            # Get both participants from chat ID
-            user_ids = chat_id.split('_')
-            recipient_id = user_ids[0] if user_ids[1] == sender_id else user_ids[1]
-            
-            # Get recipient's FCM token
-            recipient_token = self.get_fcm_token(recipient_id)
 
-            if not recipient_token:
-                return
-            
-            # Truncate message if too long
-            body = message_text[:100] + "..." if len(message_text) > 100 else message_text
-            
-            # Send notification in background thread
-            def send_notification_async():
-                result = fcm_sender.send_notification(
-                    fcm_token=recipient_token,
-                    title=f"💬 {sender_username}",
-                    body=body,
-                    data={
-                        'type': 'private_message',
-                        'chat_id': chat_id,
-                        'sender_id': sender_id,
-                        'sender_name': sender_username
-                    }
-                )
-            threading.Thread(target=send_notification_async, daemon=True).start()
-        except Exception as e:
-            pass
-    
     def get_chat_status(self, chat_id):
         """Get chat request status"""
         url = f"{self.database_url}/chats/{chat_id}/status.json?auth={self.auth_token}"
@@ -1573,65 +1646,6 @@ class FirebaseDatabase:
         except Exception as e:
             print(f"Error fetching users: {e}")
             return []
-    
-    # ============================================
-    # FCM TOKEN MANAGEMENT METHODS
-    # ============================================
-    def save_fcm_token(self, user_id, fcm_token):
-        """
-        Save user's FCM token to Firebase
-        Args:
-            user_id: User ID
-            fcm_token: FCM device token
-        Returns:
-            bool: True if successful
-        """
-        url = f"{self.database_url}/users/{user_id}/fcm_token.json?auth={self.auth_token}"
-
-        try:
-            response = requests.put(url, json=fcm_token, timeout=10)
-
-            if response.status_code == 200:
-                return True
-            else:
-                return False
-        except Exception:
-            return False
-    
-    def get_fcm_token(self, user_id):
-        """
-        Get user's FCM token from Firebase
-        Args:
-            user_id: User ID
-        Returns:
-            str: FCM token or None
-        """
-        url = f"{self.database_url}/users/{user_id}/fcm_token.json?auth={self.auth_token}"
-
-        try:
-            response = requests.get(url, timeout=10)
-
-            if response.status_code == 200:
-                return response.json()
-            else:
-                return None
-        except Exception:
-            return None
-    
-    def get_multiple_fcm_tokens(self, user_ids):
-        """
-        Get FCM tokens for multiple users
-        Args:
-            user_ids: List of user IDs
-        Returns:
-            list: List of FCM tokens (excluding None values)
-        """
-        tokens = []
-        for user_id in user_ids:
-            token = self.get_fcm_token(user_id)
-            if token:
-                tokens.append(token)
-        return tokens
     
     def mark_messages_as_seen(self, chat_id, user_id):
         """Mark all messages in a chat as seen by the user"""
@@ -2488,22 +2502,7 @@ def main(page: ft.Page):
     # ============================================
     page.title = "Chat App"
     page.padding = 0
-    
-    # ✅ ADD THIS: Initialize FCM on app start
-    def init_fcm_on_startup():
-        """Initialize FCM when app starts"""
-        try:
-            import time
-            time.sleep(2)  # Wait for Flutter to be ready
 
-            # Try to get token from storage
-            page.client_storage.get("fcm_token")
-        except Exception:
-            pass
-    
-    # Run FCM init in background
-    threading.Thread(target=init_fcm_on_startup, daemon=True).start()
-    
     # ============================================
     # SHOW LOADING IMMEDIATELY (before storage)
     # ============================================
@@ -2960,17 +2959,6 @@ def main(page: ft.Page):
         
         threading.Thread(target=resend_otp_thread, daemon=True).start()
         
-    def register_fcm_token():
-        """Register FCM token for push notifications"""
-        try:
-            # Get FCM token from client storage (set by Flutter)
-            fcm_token = get_fcm_token_from_file()
-
-            if fcm_token and auth.user_id:
-                db.store_fcm_token(auth.user_id, fcm_token)
-        except Exception:
-            pass
-    
     def send_otp_for_signin(e):
         if not signin_email_field.value:
             show_snackbar("Please enter email")
@@ -3486,36 +3474,6 @@ def main(page: ft.Page):
         if not display_username or not isinstance(display_username, str):
             display_username = current_username if isinstance(current_username, str) else "User"
         
-        # ============================================
-        # 📱 GET AND SAVE FCM TOKEN FROM FLUTTER
-        # ============================================
-        def save_fcm_token_to_firebase():
-            """Wait for FCM token from Flutter and save to Firebase."""
-            import time
-
-            try:
-                max_attempts = 15     # e.g. try for ~30 seconds
-                delay_seconds = 2
-
-                for attempt in range(1, max_attempts + 1):
-                    fcm_token = get_fcm_token_from_file()
-
-                    if fcm_token:
-                        # Save token in background thread
-                        def save_token():
-                            success = db.save_fcm_token(auth.user_id, fcm_token)
-
-                        threading.Thread(target=save_token, daemon=True).start()
-                        return
-
-                    time.sleep(delay_seconds)
-
-            except Exception:
-                pass
-
-        # Save FCM token (async, doesn't block UI)
-        threading.Thread(target=save_fcm_token_to_firebase, daemon=True).start()
-
         # ---------------- PROFILE TOP RIGHT ICON (FIXED for mobile) ----------------
         profile_avatar_ref = {"widget": None}  # Store reference for updates
         
@@ -7473,25 +7431,9 @@ def main(page: ft.Page):
                     seen=False
                 )
             
-                if success:
-                    # Send FCM notification to other user
-                    threading.Thread(
-                        target=db.send_fcm_notification,
-                        args=(
-                            current_chat_user['id'],
-                            f"💬 {current_username}",
-                            message_text[:100],
-                            {
-                                "chat_id": current_chat_id,
-                                "sender_id": auth.user_id,
-                                "type": "private_message"
-                            }
-                        ),
-                        daemon=True
-                    ).start()
-                else:
+                if not success:
                     show_snackbar("Failed to send message")
-        
+
             threading.Thread(target=send_in_background, daemon=True).start()
     
         except Exception as ex:
