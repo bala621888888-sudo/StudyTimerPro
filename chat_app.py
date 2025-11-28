@@ -54,9 +54,13 @@ ONESIGNAL_APP_ID = "6bb7df1b-6014-498a-ac2e-67abb63e4751"
 class PushNotificationManager:
     def __init__(self, page: ft.Page):
         self.page = page
+        self.enabled = page.platform in ("android", "ios")
         self.onesignal = None
 
     def init_onesignal(self):
+        if not self.enabled:
+            print(f"[OneSignal] Disabled on platform: {self.page.platform}")
+            return
         if self.onesignal:
             return
 
@@ -71,24 +75,21 @@ class PushNotificationManager:
             print(f"OneSignal initialization error: {exc}")
 
     def login_user(self, user_id: str, tags: dict | None = None):
-        if self.onesignal and user_id:
-            try:
-                self.onesignal.login(user_id)
-            except Exception as exc:
-                print(f"OneSignal login error: {exc}")
-
-        if self.onesignal and tags:
-            try:
-                self.onesignal.add_tags(tags)
-            except Exception as exc:
-                print(f"OneSignal add tags error: {exc}")
+        if not self.enabled or not self.onesignal or not user_id:
+            return
+        try:
+            result = self.onesignal.login(user_id)
+            print(f"[OneSignal] login result: {result}")
+        except Exception as exc:
+            print(f"OneSignal login error: {exc}")
 
     def logout_user(self):
-        if self.onesignal:
-            try:
-                self.onesignal.logout()
-            except Exception as exc:
-                print(f"OneSignal logout error: {exc}")
+        if not self.enabled or not self.onesignal:
+            return
+        try:
+            self.onesignal.logout()
+        except Exception as exc:
+            print(f"OneSignal logout error: {exc}")
 
     def handle_notification_opened(self, e):
         try:
