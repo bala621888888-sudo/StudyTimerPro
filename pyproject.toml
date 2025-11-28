@@ -10,7 +10,7 @@ dependencies = [
     "google-auth",
     "google-auth-oauthlib",
     "google-auth-httplib2",
-    "google-cloud-secretmanager>=2.16.0",
+    "google-cloud-secret-manager>=2.16.0",
     "cryptography>=42.0.0",
 ]
 
