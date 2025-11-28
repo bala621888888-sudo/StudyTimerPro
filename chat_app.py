@@ -63,6 +63,8 @@ class PushNotificationManager:
         self.page = page
         self.enabled = page.platform in ("android", "ios")
         self.onesignal = None
+        self.player_id = None
+        self.db_instance = None  # Store DB reference
         push_debug(f"PushNotificationManager init: platform={page.platform}, enabled={self.enabled}")
 
     def init_onesignal(self):
@@ -82,47 +84,120 @@ class PushNotificationManager:
             )
             self.page.overlay.append(self.onesignal)
             push_debug("OneSignal control created and added to page.overlay")
+            
+            # Request Android 13+ notification permission
+            self.request_notification_permission()
+            
         except Exception as exc:
             push_debug(f"Error initializing OneSignal: {exc}")
-            return
-
+    
+    def request_notification_permission(self):
+        """Request notification permission for Android 13+"""
         try:
-            onesignal_id = None
-            if self.onesignal:
-                if hasattr(self.onesignal, "get_onesignal_id"):
-                    onesignal_id = self.onesignal.get_onesignal_id()
-                elif hasattr(self.onesignal, "onesignal_id"):
-                    onesignal_id = getattr(self.onesignal, "onesignal_id")
-
-            if onesignal_id:
-                push_debug(f"OneSignal ID: {onesignal_id}")
-            else:
-                push_debug("OneSignal ID is None or not available")
+            import platform
+            if platform.system() != 'Android':
+                return
+            
+            # Use Flet's PermissionHandler
+            async def request_async():
+                try:
+                    ph = ft.PermissionHandler()
+                    self.page.overlay.append(ph)
+                    self.page.update()
+                    
+                    status = await ph.check_permission_async(ft.PermissionType.NOTIFICATION)
+                    push_debug(f"Notification permission status: {status}")
+                    
+                    if status != ft.PermissionStatus.GRANTED:
+                        result = await ph.request_permission_async(ft.PermissionType.NOTIFICATION)
+                        push_debug(f"Permission request result: {result}")
+                        return result == ft.PermissionStatus.GRANTED
+                    
+                    return True
+                except Exception as ex:
+                    push_debug(f"Permission request error: {ex}")
+                    return False
+            
+            # Run async in thread
+            import asyncio
+            try:
+                asyncio.run(request_async())
+            except:
+                # Already in event loop, schedule it
+                asyncio.create_task(request_async())
+                
         except Exception as exc:
-            push_debug(f"Error retrieving OneSignal ID: {exc}")
+            push_debug(f"Permission request error: {exc}")
+    
+    def get_player_id_delayed(self, delay=5):
+        """Retrieve OneSignal ID after delay (async registration takes time)"""
+        def delayed_retrieval():
+            time.sleep(delay)
+            try:
+                if self.onesignal:
+                    # Try to get OneSignal ID
+                    self.player_id = self.onesignal.get_onesignal_id()
+                    
+                    if self.player_id:
+                        push_debug(f"✅ OneSignal Player ID retrieved: {self.player_id}")
+                        
+                        # Save to Firebase if we have db instance and user_id
+                        if self.db_instance and hasattr(self, 'current_user_id') and self.current_user_id:
+                            success = self.db_instance.save_user_onesignal_id(
+                                self.current_user_id, 
+                                self.player_id
+                            )
+                            if success:
+                                push_debug(f"✅ Saved Player ID to Firebase for user {self.current_user_id}")
+                            else:
+                                push_debug("⚠ Failed to save Player ID to Firebase")
+                    else:
+                        push_debug("⚠ OneSignal Player ID is still None - device may not be registered yet")
+                        # Retry once more after another delay
+                        time.sleep(5)
+                        self.player_id = self.onesignal.get_onesignal_id()
+                        if self.player_id:
+                            push_debug(f"✅ OneSignal Player ID retrieved on retry: {self.player_id}")
+                            if self.db_instance and hasattr(self, 'current_user_id') and self.current_user_id:
+                                self.db_instance.save_user_onesignal_id(self.current_user_id, self.player_id)
+                        else:
+                            push_debug("❌ OneSignal Player ID still None after retry")
+            except Exception as exc:
+                push_debug(f"Error retrieving OneSignal ID: {exc}")
+        
+        threading.Thread(target=delayed_retrieval, daemon=True).start()
 
-    def login_user(self, user_id: str, tags: dict | None = None):
-        push_debug(
-            f"login_user() called with user_id={user_id}, enabled={self.enabled}, onesignal_present={self.onesignal is not None}"
-        )
+    def login_user(self, user_id: str, db_instance=None):
+        """Login user to OneSignal and retrieve Player ID"""
+        push_debug(f"login_user() called with user_id={user_id}")
+        
         if not self.enabled or not self.onesignal or not user_id:
+            push_debug("login_user skipped: not enabled or missing params")
             return
+        
+        # Store references
+        self.db_instance = db_instance
+        self.current_user_id = user_id
+        
         try:
             push_debug("Calling OneSignal.login()")
             result = self.onesignal.login(user_id)
-            push_debug(f"OneSignal login succeeded for user_id={user_id}")
-            push_debug(f"[OneSignal] login result: {result}")
+            push_debug(f"OneSignal login result: {result}")
+            
+            # Get Player ID after delay (async registration takes time)
+            self.get_player_id_delayed(delay=5)
+            
         except Exception as exc:
             push_debug(f"OneSignal login error: {exc}")
 
     def logout_user(self):
-        push_debug(
-            f"logout_user() called, enabled={self.enabled}, onesignal_present={self.onesignal is not None}"
-        )
+        push_debug("logout_user() called")
         if not self.enabled or not self.onesignal:
             return
         try:
             self.onesignal.logout()
+            self.player_id = None
+            self.current_user_id = None
             push_debug("OneSignal logout succeeded")
         except Exception as exc:
             push_debug(f"OneSignal logout error: {exc}")
@@ -130,16 +205,16 @@ class PushNotificationManager:
     def handle_notification_opened(self, e):
         try:
             notification_opened = getattr(e, "notification_opened", None) or {}
-            push_debug(f"Notification OPENED event: {getattr(e, 'notification_opened', None)}")
-            data = notification_opened.get("data") if isinstance(notification_opened, dict) else None
-            push_debug(f"Notification OPENED data: {data}")
+            push_debug(f"Notification OPENED: {notification_opened}")
+            # Handle navigation based on notification data
         except Exception as exc:
-            push_debug(f"OneSignal notification opened handler error: {exc}")
+            push_debug(f"Notification opened handler error: {exc}")
 
     def handle_notification_received(self, e):
         try:
             notification = getattr(e, "notification_received", None) or {}
-            push_debug(f"Notification RECEIVED event: {getattr(e, 'notification_received', None)}")
+            push_debug(f"Notification RECEIVED: {notification}")
+            
             title = "Notification"
             body = ""
 
@@ -150,22 +225,19 @@ class PushNotificationManager:
                 body = str(notification)
 
             snack = ft.SnackBar(
-                content=ft.Column(
-                    [
-                        ft.Text(title, weight="bold", color="white"),
-                        ft.Text(body, color="white"),
-                    ],
-                    spacing=2,
-                ),
+                content=ft.Column([
+                    ft.Text(title, weight="bold", color="white"),
+                    ft.Text(body, color="white"),
+                ], spacing=2),
                 bgcolor="#2196F3",
                 duration=4000,
             )
             self.page.overlay.append(snack)
             snack.open = True
             self.page.update()
-            push_debug(f"Foreground notification: title={title}, body={body}")
+            
         except Exception as exc:
-            push_debug(f"OneSignal notification received handler error: {exc}")
+            push_debug(f"Notification received handler error: {exc}")
 
 # Message listener system
 active_listeners = {}  # Store active listeners
@@ -1379,7 +1451,7 @@ class FirebaseDatabase:
     def __init__(self, database_url, auth_token):
         self.database_url = database_url
         self.auth_token = auth_token
-        
+    
     def get_all_groups(self):
         """Get all groups from Firebase"""
         url = f"{self.database_url}/groups.json?auth={self.auth_token}"
@@ -1818,6 +1890,86 @@ class FirebaseDatabase:
             return None
         except:
             return None
+            
+    def save_user_onesignal_id(self, user_id, onesignal_player_id):
+        """Save OneSignal player ID for a user"""
+        url = f"{self.database_url}/users/{user_id}/onesignal_player_id.json?auth={self.auth_token}"
+        
+        try:
+            response = requests.put(url, json=onesignal_player_id)
+            if response.status_code == 200:
+                print(f"✅ Saved OneSignal ID to Firebase: {onesignal_player_id}")
+                return True
+            else:
+                print(f"⚠ Failed to save OneSignal ID: {response.status_code}")
+                return False
+        except Exception as e:
+            print(f"❌ Error saving OneSignal ID: {e}")
+            return False
+    
+    def get_user_onesignal_id(self, user_id):
+        """Get OneSignal player ID for a user"""
+        url = f"{self.database_url}/users/{user_id}/onesignal_player_id.json?auth={self.auth_token}"
+        
+        try:
+            response = requests.get(url)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception as e:
+            print(f"❌ Error getting OneSignal ID: {e}")
+            return None
+    
+    def send_onesignal_notification(self, receiver_user_id, title, message, data=None):
+        """Send notification via OneSignal REST API"""
+        try:
+            # Get receiver's OneSignal Player ID from Firebase
+            onesignal_player_id = self.get_user_onesignal_id(receiver_user_id)
+            
+            if not onesignal_player_id:
+                print(f"⚠ No OneSignal player ID for user {receiver_user_id}")
+                return False
+            
+            # Get OneSignal REST API key from environment
+            onesignal_api_key = os.environ.get("ONESIGNAL_REST_API_KEY")
+            if not onesignal_api_key:
+                # Try to get from secrets_util
+                try:
+                    onesignal_api_key = get_secret("ONESIGNAL_REST_API_KEY")
+                except:
+                    pass
+            
+            if not onesignal_api_key:
+                print("⚠ ONESIGNAL_REST_API_KEY not configured")
+                return False
+            
+            url = "https://onesignal.com/api/v1/notifications"
+            
+            headers = {
+                "Content-Type": "application/json; charset=utf-8",
+                "Authorization": f"Basic {onesignal_api_key}"
+            }
+            
+            payload = {
+                "app_id": ONESIGNAL_APP_ID,
+                "include_player_ids": [onesignal_player_id],
+                "headings": {"en": title},
+                "contents": {"en": message},
+                "data": data or {}
+            }
+            
+            response = requests.post(url, json=payload, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                print(f"✅ Notification sent to {receiver_user_id}")
+                return True
+            else:
+                print(f"❌ Notification failed: {response.status_code} - {response.text}")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Notification error: {e}")
+            return False
 
 def format_file_size(size_bytes):
     """Convert bytes to human readable format"""
@@ -3009,7 +3161,7 @@ def main(page: ft.Page):
                     group_info = {}
                     print("✓ Auto-login successful")
                     push_debug(f"Login success: calling login_user() with uid={auth.user_id}")
-                    push_manager.login_user(auth.user_id, tags={"user_type": "free"})
+                    push_manager.login_user(auth.user_id, db_instance=db)
                     show_main_menu()
                     
                     # Restore timeout
@@ -3177,7 +3329,7 @@ def main(page: ft.Page):
 
                             show_snackbar("Account created successfully!")
                             push_debug(f"Login success: calling login_user() with uid={auth.user_id}")
-                            push_manager.login_user(auth.user_id, tags={"user_type": "free"})
+                            push_manager.login_user(auth.user_id, db_instance=db)
                             show_main_menu()
                             return
                         else:
@@ -3213,7 +3365,7 @@ def main(page: ft.Page):
 
                                     show_snackbar("Account recovered successfully!")
                                     push_debug(f"Login success: calling login_user() with uid={auth.user_id}")
-                                    push_manager.login_user(auth.user_id, tags={"user_type": "free"})
+                                    push_manager.login_user(auth.user_id, db_instance=db)
                                     show_main_menu()
                                     return
                                 else:
@@ -3255,7 +3407,7 @@ def main(page: ft.Page):
                         group_info = {}
                         show_snackbar("Login successful!")
                         push_debug(f"Login success: calling login_user() with uid={auth.user_id}")
-                        push_manager.login_user(auth.user_id, tags={"user_type": "free"})
+                        push_manager.login_user(auth.user_id, db_instance=db)
                         show_main_menu()
                         return
                 
@@ -3298,7 +3450,7 @@ def main(page: ft.Page):
 
                             show_snackbar("Login successful!")
                             push_debug(f"Login success: calling login_user() with uid={auth.user_id}")
-                            push_manager.login_user(auth.user_id, tags={"user_type": "free"})
+                            push_manager.login_user(auth.user_id, db_instance=db)
                             show_main_menu()
                             return
                         else:
@@ -7568,11 +7720,41 @@ def main(page: ft.Page):
                     seen=False
                 )
             
-                if not success:
+                if success:
+                    # ✅ Send push notification to receiver
+                    try:
+                        receiver_id = current_chat_user.get('id') if current_chat_user else None
+                        if receiver_id:
+                            # Determine notification title based on admin status
+                            if is_admin or user_is_group_admin:
+                                notification_title = f"👑 Admin {current_username}"
+                            else:
+                                notification_title = f"💬 {current_username}"
+                            
+                            threading.Thread(
+                                target=db.send_onesignal_notification,
+                                args=(
+                                    receiver_id,
+                                    notification_title,
+                                    message_text[:100],  # First 100 chars
+                                    {
+                                        "chat_id": current_chat_id,
+                                        "sender_id": auth.user_id,
+                                        "sender_name": current_username,
+                                        "type": "new_message",
+                                        "is_admin": is_admin or user_is_group_admin
+                                    }
+                                ),
+                                daemon=True
+                            ).start()
+                            print(f"[NOTIFICATION] Queued push notification to {receiver_id}")
+                    except Exception as notif_error:
+                        print(f"[NOTIFICATION ERROR] {notif_error}")
+                else:
                     show_snackbar("Failed to send message")
-
+                    
             threading.Thread(target=send_in_background, daemon=True).start()
-    
+
         except Exception as ex:
             print(f'[ERROR] send_message: {ex}')
             show_snackbar(f'Message send error: {ex}')
@@ -8144,11 +8326,58 @@ def main(page: ft.Page):
                     is_admin=(is_admin or user_is_group_admin)
                 )
             
-                if not success:
+                if success:
+                    # ✅ Send push notifications to all group members
+                    try:
+                        # Get current group info for group name
+                        group_info_data = db.get_group_info_by_id(current_group_id)
+                        group_name = group_info_data.get('name', 'Group') if group_info_data else 'Group'
+                        
+                        # Get all group members
+                        members = db.get_group_members_by_id(current_group_id)
+                        
+                        # Determine notification title based on admin status
+                        if is_admin or user_is_group_admin:
+                            notification_title = f"👑 {group_name}"
+                            sender_prefix = f"👑 {current_username}"
+                        else:
+                            notification_title = f"💬 {group_name}"
+                            sender_prefix = current_username
+                        
+                        notification_body = f"{sender_prefix}: {message_text[:80]}"
+                        
+                        # Send notification to each member (except sender)
+                        for member in members:
+                            member_id = member.get('id')
+                            if member_id and member_id != auth.user_id:  # Don't send to self
+                                threading.Thread(
+                                    target=db.send_onesignal_notification,
+                                    args=(
+                                        member_id,
+                                        notification_title,
+                                        notification_body,
+                                        {
+                                            "group_id": current_group_id,
+                                            "group_name": group_name,
+                                            "sender_id": auth.user_id,
+                                            "sender_name": current_username,
+                                            "type": "group_message",
+                                            "is_admin": is_admin or user_is_group_admin
+                                        }
+                                    ),
+                                    daemon=True
+                                ).start()
+                        
+                        if members:
+                            print(f"[NOTIFICATION] Queued push notifications to {len(members)-1} group members")
+                            
+                    except Exception as notif_error:
+                        print(f"[NOTIFICATION ERROR] {notif_error}")
+                else:
                     show_snackbar("Failed to send message")
         
             threading.Thread(target=send_in_background, daemon=True).start()
-    
+
         except Exception as ex:
             print(f'[ERROR] send_group_message: {ex}')
             show_snackbar(f'Group send error: {ex}')
