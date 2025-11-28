@@ -50,58 +50,96 @@ except AttributeError:  # pragma: no cover - compatibility shim
 
 ONESIGNAL_APP_ID = "6bb7df1b-6014-498a-ac2e-67abb63e4751"
 
+PUSH_DEBUG = True
+
+
+def push_debug(msg: str):
+    if PUSH_DEBUG:
+        print(f"[PUSH-DEBUG] {msg}")
+
 
 class PushNotificationManager:
     def __init__(self, page: ft.Page):
         self.page = page
         self.enabled = page.platform in ("android", "ios")
         self.onesignal = None
+        push_debug(f"PushNotificationManager init: platform={page.platform}, enabled={self.enabled}")
 
     def init_onesignal(self):
+        push_debug("init_onesignal() called")
         if not self.enabled:
-            print(f"[OneSignal] Disabled on platform: {self.page.platform}")
+            push_debug("OneSignal disabled on this platform; skipping init")
             return
         if self.onesignal:
             return
 
         try:
+            push_debug(f"Creating OneSignal control with APP_ID={ONESIGNAL_APP_ID}")
             self.onesignal = fos.OneSignal(
                 settings=fos.OneSignalSettings(app_id=ONESIGNAL_APP_ID),
                 on_notification_opened=self.handle_notification_opened,
                 on_notification_received=self.handle_notification_received,
             )
             self.page.overlay.append(self.onesignal)
+            push_debug("OneSignal control created and added to page.overlay")
         except Exception as exc:
-            print(f"OneSignal initialization error: {exc}")
+            push_debug(f"Error initializing OneSignal: {exc}")
+            return
+
+        try:
+            onesignal_id = None
+            if self.onesignal:
+                if hasattr(self.onesignal, "get_onesignal_id"):
+                    onesignal_id = self.onesignal.get_onesignal_id()
+                elif hasattr(self.onesignal, "onesignal_id"):
+                    onesignal_id = getattr(self.onesignal, "onesignal_id")
+
+            if onesignal_id:
+                push_debug(f"OneSignal ID: {onesignal_id}")
+            else:
+                push_debug("OneSignal ID is None or not available")
+        except Exception as exc:
+            push_debug(f"Error retrieving OneSignal ID: {exc}")
 
     def login_user(self, user_id: str, tags: dict | None = None):
+        push_debug(
+            f"login_user() called with user_id={user_id}, enabled={self.enabled}, onesignal_present={self.onesignal is not None}"
+        )
         if not self.enabled or not self.onesignal or not user_id:
             return
         try:
+            push_debug("Calling OneSignal.login()")
             result = self.onesignal.login(user_id)
-            print(f"[OneSignal] login result: {result}")
+            push_debug(f"OneSignal login succeeded for user_id={user_id}")
+            push_debug(f"[OneSignal] login result: {result}")
         except Exception as exc:
-            print(f"OneSignal login error: {exc}")
+            push_debug(f"OneSignal login error: {exc}")
 
     def logout_user(self):
+        push_debug(
+            f"logout_user() called, enabled={self.enabled}, onesignal_present={self.onesignal is not None}"
+        )
         if not self.enabled or not self.onesignal:
             return
         try:
             self.onesignal.logout()
+            push_debug("OneSignal logout succeeded")
         except Exception as exc:
-            print(f"OneSignal logout error: {exc}")
+            push_debug(f"OneSignal logout error: {exc}")
 
     def handle_notification_opened(self, e):
         try:
             notification_opened = getattr(e, "notification_opened", None) or {}
+            push_debug(f"Notification OPENED event: {getattr(e, 'notification_opened', None)}")
             data = notification_opened.get("data") if isinstance(notification_opened, dict) else None
-            print(f"Notification opened with data: {data}")
+            push_debug(f"Notification OPENED data: {data}")
         except Exception as exc:
-            print(f"OneSignal notification opened handler error: {exc}")
+            push_debug(f"OneSignal notification opened handler error: {exc}")
 
     def handle_notification_received(self, e):
         try:
             notification = getattr(e, "notification_received", None) or {}
+            push_debug(f"Notification RECEIVED event: {getattr(e, 'notification_received', None)}")
             title = "Notification"
             body = ""
 
@@ -125,8 +163,9 @@ class PushNotificationManager:
             self.page.overlay.append(snack)
             snack.open = True
             self.page.update()
+            push_debug(f"Foreground notification: title={title}, body={body}")
         except Exception as exc:
-            print(f"OneSignal notification received handler error: {exc}")
+            push_debug(f"OneSignal notification received handler error: {exc}")
 
 # Message listener system
 active_listeners = {}  # Store active listeners
@@ -2581,6 +2620,7 @@ def main(page: ft.Page):
 
     push_manager = PushNotificationManager(page)
     push_manager.init_onesignal()
+    push_debug("PushNotificationManager created and initialized in main()")
 
     # ============================================
     # CRITICAL: Set page properties FIRST
@@ -2968,6 +3008,7 @@ def main(page: ft.Page):
 
                     group_info = {}
                     print("✓ Auto-login successful")
+                    push_debug(f"Login success: calling login_user() with uid={auth.user_id}")
                     push_manager.login_user(auth.user_id, tags={"user_type": "free"})
                     show_main_menu()
                     
@@ -3135,6 +3176,7 @@ def main(page: ft.Page):
                             CredentialsManager.save_credentials(auth.email, auth.refresh_token, current_username)
 
                             show_snackbar("Account created successfully!")
+                            push_debug(f"Login success: calling login_user() with uid={auth.user_id}")
                             push_manager.login_user(auth.user_id, tags={"user_type": "free"})
                             show_main_menu()
                             return
@@ -3170,6 +3212,7 @@ def main(page: ft.Page):
                                     CredentialsManager.save_credentials(auth.email, auth.refresh_token, current_username)
 
                                     show_snackbar("Account recovered successfully!")
+                                    push_debug(f"Login success: calling login_user() with uid={auth.user_id}")
                                     push_manager.login_user(auth.user_id, tags={"user_type": "free"})
                                     show_main_menu()
                                     return
@@ -3211,6 +3254,7 @@ def main(page: ft.Page):
 
                         group_info = {}
                         show_snackbar("Login successful!")
+                        push_debug(f"Login success: calling login_user() with uid={auth.user_id}")
                         push_manager.login_user(auth.user_id, tags={"user_type": "free"})
                         show_main_menu()
                         return
@@ -3253,6 +3297,7 @@ def main(page: ft.Page):
                             CredentialsManager.save_credentials(auth.email, auth.refresh_token, current_username)
 
                             show_snackbar("Login successful!")
+                            push_debug(f"Login success: calling login_user() with uid={auth.user_id}")
                             push_manager.login_user(auth.user_id, tags={"user_type": "free"})
                             show_main_menu()
                             return
@@ -6784,6 +6829,7 @@ def main(page: ft.Page):
             nonlocal group_info
             group_info = {}
     def handle_logout():
+        push_debug("Logout triggered: calling logout_user()")
         push_manager.logout_user()
         CredentialsManager.clear_credentials()
         show_snackbar("Logged out successfully")
