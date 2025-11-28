@@ -6005,40 +6005,87 @@ def main(page: ft.Page):
                     update_notification_badge()
 
             if is_registered_promoter:
-                # ✅ Header Row: Refresh Button (Left) + Icon + Title + Refer Button (Right)
-                header_row = ft.Row([
-                    # Left: Refresh Button
-                    ft.IconButton(
-                        icon=ft.Icons.REFRESH,
-                        icon_color="blue",
-                        tooltip="Refresh Stats",
-                        on_click=lambda e: load_promoter_stats(force_refresh=True)
-                    ),
-                    
-                    # Center: Icon + Title (expand to take remaining space)
+                def copy_referral_to_clipboard(e=None):
+                    """Copy the promoter referral ID to clipboard."""
+                    try:
+                        if promoter_referral_id:
+                            page.set_clipboard(promoter_referral_id)
+                            show_snackbar("Referral ID copied to clipboard.")
+                        else:
+                            show_snackbar("Referral ID not available.")
+                    except Exception as err:
+                        print(f"⚠️ Could not copy referral ID: {err}")
+
+                # ✅ Header: First row with refresh, verified icon, refer button; second row with title
+                header_icon_row = ft.Stack([
                     ft.Row([
-                        ft.Icon(ft.Icons.VERIFIED, size=40, color="green"),
-                        ft.Text("Promoter Dashboard", size=20, weight="bold"),
-                    ], spacing=10, expand=True, alignment=ft.MainAxisAlignment.CENTER),
-                    
-                    # Right: Refer Promoter Button
+                        # Left: Refresh Button
+                        ft.IconButton(
+                            icon=ft.Icons.REFRESH,
+                            icon_color="blue",
+                            tooltip="Refresh Stats",
+                            on_click=lambda e: load_promoter_stats(force_refresh=True)
+                        ),
+
+                        # Spacer to spread left/right actions
+                        ft.Container(expand=True),
+
+                        # Right: Refer Promoter Button
+                        ft.Container(
+                            content=refer_promoter_button,
+                            alignment=ft.alignment.center_right
+                        )
+                    ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        expand=True,
+                    ),
                     ft.Container(
-                        content=refer_promoter_button,
-                        alignment=ft.alignment.center_right
+                        content=ft.Icon(ft.Icons.VERIFIED, size=40, color="green"),
+                        alignment=ft.alignment.center
                     )
-                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, vertical_alignment=ft.CrossAxisAlignment.CENTER)
-                
+                ], expand=True)
+
+                header_section = ft.Column([
+                    header_icon_row,
+                    ft.Row(
+                        [ft.Text("Promoter Dashboard", size=20, weight="bold")],
+                        alignment=ft.MainAxisAlignment.CENTER,
+                    ),
+                ], spacing=4)
+
                 # Show dashboard with stats
                 promoter_content.controls.extend([
-                    ft.Container(height=10),
-                    header_row,
+                    header_section,
                     ft.Container(height=10),
                     
                     # Referral ID Card
                     ft.Container(
                         content=ft.Column([
                             ft.Text("Your Referral ID", size=14, weight="bold", color="grey"),
-                            ft.Text(promoter_referral_id, size=22, weight="bold", color="blue", selectable=True)
+                            ft.Row([
+                                ft.GestureDetector(
+                                    content=ft.Text(
+                                        promoter_referral_id,
+                                        size=22,
+                                        weight="bold",
+                                        color="blue",
+                                        selectable=True,
+                                    ),
+                                    on_tap=copy_referral_to_clipboard,
+                                ),
+                                ft.IconButton(
+                                    icon=ft.Icons.CONTENT_COPY,
+                                    icon_size=18,
+                                    tooltip="Copy referral ID",
+                                    on_click=copy_referral_to_clipboard,
+                                    style=ft.ButtonStyle(padding=0),
+                                ),
+                            ],
+                                alignment=ft.MainAxisAlignment.CENTER,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                spacing=6,
+                            ),
                         ], horizontal_alignment="center", spacing=5),
                         padding=15,
                         bgcolor="#E3F2FD",
