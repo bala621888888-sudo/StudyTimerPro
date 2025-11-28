@@ -2384,7 +2384,7 @@ class GoogleSheetsManager:
             if len(normalized) > worksheet.col_count:
                 worksheet.add_cols(len(normalized) - worksheet.col_count)
 
-            worksheet.update('A1', [normalized])
+            worksheet.update([normalized], 'A1')  # Values first, then range
 
             return normalized
         except Exception as e:
@@ -2699,6 +2699,8 @@ gsheet_manager = GoogleSheetsManager()
 def main(page: ft.Page):
     global CREDENTIALS_FILE, CACHE_DIR, GROUP_ICON_CACHE_DIR, USER_LIST_CACHE_FILE
     global NOTIFICATIONS_CACHE_FILE
+    import warnings
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
     
     # ============================================
     # 🔥 CRITICAL FIX: Global NaN Protection
@@ -3096,6 +3098,46 @@ def main(page: ft.Page):
             page.update()
         except:
             pass
+            
+    # Add near the top of main() after other global variables
+    auto_refresh_timer = {"active": False, "thread": None}
+
+    def start_auto_refresh_messages(interval=5):
+        """Start auto-refresh for current chat/group"""
+        stop_auto_refresh_messages()  # Stop any existing
+        
+        auto_refresh_timer["active"] = True
+        
+        def refresh_loop():
+            while auto_refresh_timer["active"]:
+                try:
+                    time.sleep(interval)
+                    
+                    if not auto_refresh_timer["active"]:
+                        break
+                    
+                    # Check which screen is active
+                    if active_screen.get("current") == "private_chat" and current_chat_id:
+                        # Process private message queue
+                        process_private_message_queue()
+                    
+                    elif active_screen.get("current") == "group_chat" and current_group_id:
+                        # Process group message queue
+                        process_group_message_queue(current_group_id)
+                    
+                except Exception as e:
+                    print(f"[AUTO-REFRESH ERROR] {e}")
+        
+        auto_refresh_timer["thread"] = threading.Thread(target=refresh_loop, daemon=True)
+        auto_refresh_timer["thread"].start()
+        print(f"[AUTO-REFRESH] Started with {interval}s interval")
+
+    def stop_auto_refresh_messages():
+        """Stop auto-refresh timer"""
+        auto_refresh_timer["active"] = False
+        if auto_refresh_timer["thread"]:
+            auto_refresh_timer["thread"].join(timeout=1)
+        print("[AUTO-REFRESH] Stopped")        
     
     def handle_back_navigation(e=None):
         """Handle Android back button and swipe back - OPTIMIZED"""
@@ -3176,6 +3218,14 @@ def main(page: ft.Page):
         # If failed, show login
         CredentialsManager.clear_credentials()
         show_login_view()
+        
+    # Add these cache variables after other global state variables
+    promoter_stats_cache = {
+        "data": None,
+        "timestamp": 0,
+        "loaded": False
+    }
+    PROMOTER_CACHE_DURATION = 300  # 5 minutes in seconds    
         
     profile_file_picker = ft.FilePicker()
     group_icon_file_picker = ft.FilePicker()
@@ -3674,7 +3724,7 @@ def main(page: ft.Page):
         elif not isinstance(current_username, str):
             current_username = "User"
         
-        stop_auto_refresh()
+        stop_auto_refresh_messages()  # ✅ Stop timer
         stop_all_listeners()  # Stop all message listeners when going to main menu
         active_screen["current"] = None
         navigation_stack.clear()
@@ -4497,7 +4547,8 @@ def main(page: ft.Page):
             start_message_listener(group_id, db, page)
             print(f"[DEBUG] Started listener for group chat: {group_id}")
             
-
+            # ✅ Start auto-refresh timer
+            start_auto_refresh_messages(interval=5)
 
         def load_specific_group_messages(group_id):
             """Load messages for a specific group (always rebuild UI)"""
@@ -5505,11 +5556,22 @@ def main(page: ft.Page):
 
             threading.Thread(target=load_downline_thread, daemon=True).start()
         
-        def load_promoter_stats():
-            """Load and display promoter statistics"""
+        def load_promoter_stats(force_refresh=False):
+            """Load and display promoter statistics with caching"""
             if not promoter_referral_id:
                 return
             
+            # Check if we have valid cached data
+            current_time = time.time()
+            cache_age = current_time - promoter_stats_cache["timestamp"]
+            
+            if not force_refresh and promoter_stats_cache["loaded"] and cache_age < PROMOTER_CACHE_DURATION:
+                # Use cached data
+                print(f"✅ Using cached promoter stats (age: {int(cache_age)}s)")
+                display_cached_promoter_stats(promoter_stats_cache["data"])
+                return
+            
+            # Show loading indicator
             stats_container.controls.clear()
             stats_container.controls.append(
                 ft.Container(
@@ -5523,137 +5585,180 @@ def main(page: ft.Page):
             page.update()
 
             def fetch_stats_thread():
-                stats = gsheet_manager.get_promoter_stats(promoter_referral_id)
-                downline_bonus = 0
                 try:
-                    downline_data = gsheet_manager.get_downline_data(promoter_referral_id)
-                    if downline_data:
-                        downline_bonus = downline_data.get("total_bonus", 0) or 0
-                except Exception as downline_error:
-                    print(f"⚠️ Failed to load downline bonus: {downline_error}")
+                    # Fetch fresh stats
+                    stats = gsheet_manager.get_promoter_stats(promoter_referral_id)
+                    downline_bonus = 0
+                    
+                    try:
+                        downline_data = gsheet_manager.get_downline_data(promoter_referral_id)
+                        if downline_data:
+                            downline_bonus = downline_data.get("total_bonus", 0) or 0
+                    except Exception as downline_error:
+                        print(f"⚠️ Failed to load downline bonus: {downline_error}")
 
-                stats_container.controls.clear()
-
-                if stats:
-                    total_earnings = stats['earnings'] + downline_bonus
-
-                    # Create stats cards
-                    stats_container.controls.extend([
-                        # Earnings Section
+                    # Combine stats with downline bonus
+                    if stats:
+                        combined_stats = {
+                            **stats,
+                            "downline_bonus": downline_bonus
+                        }
+                    else:
+                        combined_stats = None
+                    
+                    # Save to cache
+                    promoter_stats_cache["data"] = combined_stats
+                    promoter_stats_cache["timestamp"] = time.time()
+                    promoter_stats_cache["loaded"] = True
+                    
+                    # Display
+                    display_cached_promoter_stats(combined_stats)
+                    
+                except Exception as e:
+                    print(f"Error loading promoter stats: {e}")
+                    stats_container.controls.clear()
+                    stats_container.controls.append(
                         ft.Container(
                             content=ft.Column([
-                                ft.Text("💰 Earnings", size=16, weight="bold"),
-                                ft.Row([
-                                    ft.Container(
-                                        content=ft.Column([
-                                            ft.Text("Total", size=12, color="grey"),
-                                            ft.Text(f"₹{stats['earnings']:.2f}", size=18, weight="bold", color="green")
-                                        ], horizontal_alignment="center", spacing=2),
-                                        expand=True
-                                    ),
-                                    ft.Container(
-                                        content=ft.Column([
-                                            ft.Text("Paid", size=12, color="grey"),
-                                            ft.Text(f"₹{stats['paid']:.2f}", size=18, weight="bold", color="blue")
-                                        ], horizontal_alignment="center", spacing=2),
-                                        expand=True
-                                    ),
-                                    ft.Container(
-                                        content=ft.Column([
-                                            ft.Text("Pending", size=12, color="grey"),
-                                            ft.Text(f"₹{stats['pending']:.2f}", size=18, weight="bold", color="orange")
-                                        ], horizontal_alignment="center", spacing=2),
-                                        expand=True
-                                    )
-                                ], spacing=10),
-                                ft.Container(height=6),
-                                ft.Row([
-                                    ft.Text("Downline Bonus", size=12, color="grey"),
-                                    ft.Text(f"₹{downline_bonus:.2f}", size=16, weight="w600", color="purple")
-                                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                                ft.Row([
-                                    ft.Text("Total Earnings", size=12, color="grey"),
-                                    ft.Text(f"₹{total_earnings:.2f}", size=16, weight="bold", color="green")
-                                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                                ft.Icon(ft.Icons.ERROR, size=40, color="red"),
+                                ft.Text("Failed to load stats", size=14, color="red"),
+                                ft.TextButton("Retry", on_click=lambda e: load_promoter_stats(force_refresh=True))
+                            ], horizontal_alignment="center", spacing=10),
+                            padding=20
+                        )
+                    )
+                    page.update()
+            
+            threading.Thread(target=fetch_stats_thread, daemon=True).start()
+
+        def display_cached_promoter_stats(combined_stats):
+            """Display promoter stats from cache with improved layout"""
+            stats_container.controls.clear()
+
+            if combined_stats:
+                stats = combined_stats
+                downline_bonus = stats.get('downline_bonus', 0)
+                total_earnings = stats['earnings'] + downline_bonus
+
+                # Create stats cards
+                stats_container.controls.extend([
+                    # Earnings Section
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("💰 Earnings", size=16, weight="bold"),
+                            ft.Row([
+                                ft.Container(
+                                    content=ft.Column([
+                                        ft.Text("Total", size=12, color="grey"),
+                                        ft.Text(f"₹{stats['earnings']:.2f}", size=18, weight="bold", color="green")
+                                    ], horizontal_alignment="center", spacing=2),
+                                    expand=True
+                                ),
+                                ft.Container(
+                                    content=ft.Column([
+                                        ft.Text("Paid", size=12, color="grey"),
+                                        ft.Text(f"₹{stats['paid']:.2f}", size=18, weight="bold", color="blue")
+                                    ], horizontal_alignment="center", spacing=2),
+                                    expand=True
+                                ),
+                                ft.Container(
+                                    content=ft.Column([
+                                        ft.Text("Pending", size=12, color="grey"),
+                                        ft.Text(f"₹{stats['pending']:.2f}", size=18, weight="bold", color="orange")
+                                    ], horizontal_alignment="center", spacing=2),
+                                    expand=True
+                                )
                             ], spacing=10),
-                            padding=15,
-                            bgcolor="#E8F5E9",
-                            border_radius=10
-                        ),
-                        
-                        # Performance Section
-                        ft.Container(
-                            content=ft.Column([
-                                ft.Text("📊 Performance", size=16, weight="bold"),
-                                ft.Row([
-                                    ft.Container(
-                                        content=ft.Column([
-                                            ft.Icon(ft.Icons.DOWNLOAD, size=30, color="blue"),
-                                            ft.Text(str(stats['installs']), size=20, weight="bold"),
-                                            ft.Text("Installs", size=12, color="grey")
-                                        ], horizontal_alignment="center", spacing=2),
-                                        expand=True
-                                    ),
-                                    ft.Container(
-                                        content=ft.Column([
-                                            ft.Icon(ft.Icons.STAR, size=30, color="orange"),
-                                            ft.Text(str(stats['subscriptions']), size=20, weight="bold"),
-                                            ft.Text("Subscriptions", size=12, color="grey")
-                                        ], horizontal_alignment="center", spacing=2),
-                                        expand=True
-                                    )
-                                ], spacing=10)
-                            ], spacing=10),
-                            padding=15,
-                            bgcolor="#FFF3E0",
-                            border_radius=10
-                        ),
-                        
-                        # Subscribers Button
-                        ft.Container(
-                            content=ft.ElevatedButton(
+                            ft.Container(height=6),
+                            ft.Row([
+                                ft.Text("Downline Bonus", size=12, color="grey"),
+                                ft.Text(f"₹{downline_bonus:.2f}", size=16, weight="w600", color="purple")
+                            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                            ft.Row([
+                                ft.Text("Total Earnings", size=12, color="grey"),
+                                ft.Text(f"₹{total_earnings:.2f}", size=16, weight="bold", color="green")
+                            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                        ], spacing=10),
+                        padding=15,
+                        bgcolor="#E8F5E9",
+                        border_radius=10
+                    ),
+                    
+                    # Performance Section
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("📊 Performance", size=16, weight="bold"),
+                            ft.Row([
+                                ft.Container(
+                                    content=ft.Column([
+                                        ft.Icon(ft.Icons.DOWNLOAD, size=30, color="blue"),
+                                        ft.Text(str(stats['installs']), size=20, weight="bold"),
+                                        ft.Text("Installs", size=12, color="grey")
+                                    ], horizontal_alignment="center", spacing=2),
+                                    expand=True
+                                ),
+                                ft.Container(
+                                    content=ft.Column([
+                                        ft.Icon(ft.Icons.STAR, size=30, color="orange"),
+                                        ft.Text(str(stats['subscriptions']), size=20, weight="bold"),
+                                        ft.Text("Subscriptions", size=12, color="grey")
+                                    ], horizontal_alignment="center", spacing=2),
+                                    expand=True
+                                )
+                            ], spacing=10)
+                        ], spacing=10),
+                        padding=15,
+                        bgcolor="#FFF3E0",
+                        border_radius=10
+                    ),
+                    
+                    # ✅ Action Buttons - Side by Side
+                    ft.Container(
+                        content=ft.Row([
+                            ft.ElevatedButton(
                                 content=ft.Row([
-                                    ft.Icon(ft.Icons.PEOPLE, size=20),
-                                    ft.Text(f"View Subscribers ({len(stats['subscribers'])})", size=14)
-                                ], spacing=10),
-                                on_click=lambda e: (
-                                    print(f"🖱️ View Subscribers button clicked"),
-                                    print(f"📊 Stats data: {stats['subscribers']}"),
-                                    show_subscribers_popup(stats['subscribers'])
-                                )[-1],
+                                    ft.Icon(ft.Icons.PEOPLE, size=18),
+                                    ft.Text(f"Subscribers ({len(stats['subscribers'])})", size=13)
+                                ], spacing=5),
+                                on_click=lambda e: show_subscribers_popup(stats['subscribers']),
                                 bgcolor="#2196F3",
                                 color="white",
-                                width=300
+                                expand=True
                             ),
-                            alignment=ft.alignment.center
-                        ),
-
-                        # Downline button
-                        ft.Container(
-                            content=ft.ElevatedButton(
+                            ft.ElevatedButton(
                                 content=ft.Row([
-                                    ft.Icon(ft.Icons.GROUP_ADD, size=20),
-                                    ft.Text("Your Downline", size=14)
-                                ], spacing=10),
+                                    ft.Icon(ft.Icons.GROUP_ADD, size=18),
+                                    ft.Text("Downline", size=13)
+                                ], spacing=5),
                                 on_click=show_downline_view,
                                 bgcolor="#673AB7",
                                 color="white",
-                                width=300
-                            ),
-                            alignment=ft.alignment.center
-                        )
-                    ])
-                else:
-                    stats_container.controls.append(
-                        ft.Container(
-                            content=ft.Text("No stats available yet", size=14, color="grey"),
-                            padding=10
-                        )
+                                expand=True
+                            )
+                        ], spacing=10),
+                        padding=ft.padding.symmetric(horizontal=10)
+                    ),
+                    
+                    # ✅ Last Updated Info (Compact)
+                    ft.Container(
+                        content=ft.Text(
+                            f"Last updated {int((time.time() - promoter_stats_cache['timestamp']) / 60)} min ago",
+                            size=10,
+                            color="grey",
+                            text_align="center"
+                        ),
+                        padding=ft.padding.only(top=5, bottom=5)
                     )
-                
-                page.update()
+                ])
+            else:
+                stats_container.controls.append(
+                    ft.Container(
+                        content=ft.Text("No stats available yet", size=14, color="grey"),
+                        padding=10
+                    )
+                )
             
-            threading.Thread(target=fetch_stats_thread, daemon=True).start()
+            page.update()
         
         # Registration form fields
         activation_key_field = ft.TextField(
@@ -5899,22 +6004,34 @@ def main(page: ft.Page):
                 if new_assignments:
                     update_notification_badge()
 
-            promoter_content.controls.append(
-                ft.Container(
-                    content=ft.Row(
-                        [refer_promoter_button],
-                        alignment=ft.MainAxisAlignment.END,
-                    ),
-                    width=page.width,
-                )
-            )
-
             if is_registered_promoter:
+                # ✅ Header Row: Refresh Button (Left) + Icon + Title + Refer Button (Right)
+                header_row = ft.Row([
+                    # Left: Refresh Button
+                    ft.IconButton(
+                        icon=ft.Icons.REFRESH,
+                        icon_color="blue",
+                        tooltip="Refresh Stats",
+                        on_click=lambda e: load_promoter_stats(force_refresh=True)
+                    ),
+                    
+                    # Center: Icon + Title (expand to take remaining space)
+                    ft.Row([
+                        ft.Icon(ft.Icons.VERIFIED, size=40, color="green"),
+                        ft.Text("Promoter Dashboard", size=20, weight="bold"),
+                    ], spacing=10, expand=True, alignment=ft.MainAxisAlignment.CENTER),
+                    
+                    # Right: Refer Promoter Button
+                    ft.Container(
+                        content=refer_promoter_button,
+                        alignment=ft.alignment.center_right
+                    )
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+                
                 # Show dashboard with stats
                 promoter_content.controls.extend([
-                    ft.Container(height=20),
-                    ft.Icon(ft.Icons.VERIFIED, size=60, color="green"),
-                    ft.Text("Promoter Dashboard", size=24, weight="bold"),
+                    ft.Container(height=10),
+                    header_row,
                     ft.Container(height=10),
                     
                     # Referral ID Card
@@ -5929,13 +6046,10 @@ def main(page: ft.Page):
                         width=350
                     ),
                     
-                    ft.Container(height=20),
+                    ft.Container(height=10),
                     
                     # Stats container
                     stats_container,
-                    
-                    ft.Container(height=10),
-                    
                 ])
                 
                 # Load stats initially
@@ -8130,7 +8244,7 @@ def main(page: ft.Page):
         """Go back from private chat to chat list."""
         print('[DEBUG] back_to_chat_list clicked')
         try:
-            stop_auto_refresh()
+            stop_auto_refresh_messages()  # ✅ Stop timer
             stop_message_listener(current_chat_id)  # Stop listener for current chat
             show_chat_list()  # Go directly to chat list
         except Exception as ex:
@@ -8211,7 +8325,8 @@ def main(page: ft.Page):
         # Start real-time listener for this chat
         start_message_listener(current_chat_id, db, page)
         print(f"[DEBUG] Started listener for private chat: {current_chat_id}")
-        
+        # ✅ Start auto-refresh timer
+        start_auto_refresh_messages(interval=5)
         refresh_control["active"] = True
     
     def pick_file_group(e):
@@ -8386,7 +8501,7 @@ def main(page: ft.Page):
         """Back from group chat to main menu using navigation stack."""
         print('[DEBUG] back_to_main_menu clicked')
         try:
-            stop_auto_refresh()
+            stop_auto_refresh_messages()  # ✅ Stop timer
             handle_back_navigation(e)
         except Exception as ex:
             print(f'[ERROR] back_to_main_menu: {ex}')
