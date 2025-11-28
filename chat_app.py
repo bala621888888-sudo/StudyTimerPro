@@ -179,16 +179,27 @@ def _load_fcm_service_account():
     Load Firebase service account JSON.
 
     Priority:
-    1) FIREBASE_SERVICE_ACCOUNT env var (PC/dev)
-    2) assets/firebase_service_account.json (inside APK)
+    1) FIREBASE_SERVICE_ACCOUNT or FCM_SERVICE_ACCOUNT env var (PC/dev)
+    2) Secret Manager value (FCM_SERVICE_ACCOUNT)
+    3) assets/firebase_service_account.json (inside APK)
     """
     # 1) Environment variable - for local dev / desktop
-    env_value = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
-    if env_value and env_value.strip():
-        print("✅ Loaded FCM service account from env.")
-        return env_value
+    for env_key in ("FIREBASE_SERVICE_ACCOUNT", "FCM_SERVICE_ACCOUNT"):
+        env_value = os.environ.get(env_key)
+        if env_value and env_value.strip():
+            print(f"✅ Loaded FCM service account from env: {env_key}.")
+            return env_value
 
-    # 2) Asset file - for packaged mobile app
+    # 2) Secret Manager (works when GitHub Actions injects FCM_SERVICE_ACCOUNT)
+    try:
+        secret_value = get_secret("FCM_SERVICE_ACCOUNT")
+        if secret_value and secret_value.strip():
+            print("✅ Loaded FCM service account from Secret Manager: FCM_SERVICE_ACCOUNT.")
+            return secret_value
+    except Exception as e:
+        print(f"⚠️ Error loading FCM service account from Secret Manager: {e}")
+
+    # 3) Asset file - for packaged mobile app
     try:
         assets_dir = os.environ.get("FLET_ASSETS_DIR", "assets")
         candidates = [
