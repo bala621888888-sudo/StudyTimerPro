@@ -2052,6 +2052,44 @@ class GoogleSheetsManager:
             print(f"❌ Error fetching promoter stats: {e}")
             return None
 
+    def _ensure_promote_referral_structure(self, worksheet, existing_headers=None):
+        """Ensure promote referral sheet has Introducer ID and Approval columns."""
+        try:
+            headers = existing_headers or worksheet.row_values(1)
+            headers = headers if headers else []
+
+            approval_like_indices = [
+                idx for idx, h in enumerate(headers) if "approval" in h.strip().lower()
+            ]
+
+            # Ensure Introducer ID column exists
+            if not any("introducer" in h.strip().lower() for h in headers):
+                headers.append("Introducer ID")
+
+            # Ensure Approval column is present and at the end
+            if approval_like_indices:
+                # Normalize name of the first approval-like column
+                first_idx = approval_like_indices[0]
+                if headers[first_idx].strip() != "Approval":
+                    worksheet.update_cell(1, first_idx + 1, "Approval")
+
+                if first_idx != len(headers) - 1:
+                    headers.append("Approval")
+            else:
+                headers.append("Approval")
+
+            # Expand worksheet columns if necessary
+            if len(headers) > worksheet.col_count:
+                worksheet.add_cols(len(headers) - worksheet.col_count)
+
+            # Write normalized headers
+            worksheet.update('A1', [headers])
+
+            return headers
+        except Exception as e:
+            print(f"⚠️ Failed to normalize promote referral headers: {e}")
+            return existing_headers or []
+
     def submit_promoter_referral(self, referral_data):
         """Append promoter referral details to the 'promote referral' worksheet"""
         try:
@@ -2076,24 +2114,41 @@ class GoogleSheetsManager:
                     "Reason for Referral",
                     "Promotion Type",
                     "Additional Information",
+                    "Introducer ID",
+                    "Approval",
                 ]
                 worksheet.append_row(headers)
+
+            headers = worksheet.row_values(1)
+            headers = self._ensure_promote_referral_structure(worksheet, headers)
+            header_map = [h.strip().lower() for h in headers]
 
             ist_timezone = timezone(timedelta(hours=5, minutes=30))
             timestamp = datetime.now(ist_timezone).strftime("%Y-%m-%d %H:%M")
 
             row_data = [
-                timestamp,
-                referral_data.get("full_name", ""),
-                referral_data.get("primary_platform", ""),
-                referral_data.get("profile_link", ""),
-                referral_data.get("followers", ""),
-                referral_data.get("email", ""),
-                referral_data.get("phone", ""),
-                referral_data.get("referral_reason", ""),
-                referral_data.get("promotion_type", ""),
-                referral_data.get("additional_info", ""),
+                "" for _ in headers
             ]
+
+            def set_field(possible_names, value):
+                for name in possible_names:
+                    if name in header_map:
+                        row_data[header_map.index(name)] = value
+                        return
+
+            set_field(["timestamp"], timestamp)
+            set_field(["promoter full name", "full name"], referral_data.get("full_name", ""))
+            set_field(["primary platform"], referral_data.get("primary_platform", ""))
+            set_field(["platform profile link", "profile link"], referral_data.get("profile_link", ""))
+            set_field(["estimated followers / members", "estimated followers", "followers"], referral_data.get("followers", ""))
+            set_field(["contact email id", "email"], referral_data.get("email", ""))
+            set_field(["phone number", "phone"], referral_data.get("phone", ""))
+            set_field(["reason for referral", "referral reason"], referral_data.get("referral_reason", ""))
+            set_field(["promotion type"], referral_data.get("promotion_type", ""))
+            set_field(["additional information", "additional info"], referral_data.get("additional_info", ""))
+            set_field(["introducer id", "referrer id", "referral id"], referral_data.get("introducer_id", ""))
+
+            set_field(["approval"], "")
 
             worksheet.append_row(row_data)
             print(f"✅ Promoter referral saved: {row_data}")
@@ -2102,6 +2157,157 @@ class GoogleSheetsManager:
         except Exception as e:
             print(f"❌ Error submitting promoter referral: {e}")
             return False, "Failed to submit promoter referral. Please try again."
+
+    def get_downline_data(self, introducer_id):
+        """Fetch approved referred promoters and their subscription counts."""
+        try:
+            if not self.client or not self.sheet_id or not introducer_id:
+                return None
+
+            spreadsheet = self.client.open_by_key(self.sheet_id)
+
+            try:
+                referral_ws = spreadsheet.worksheet("promote referral")
+            except Exception as e:
+                print(f"❌ promote referral sheet missing: {e}")
+                return None
+
+            headers = referral_ws.row_values(1)
+            headers = self._ensure_promote_referral_structure(referral_ws, headers)
+            header_lower = [h.strip().lower() for h in headers]
+
+            def idx(possible_names):
+                for name in possible_names:
+                    if name in header_lower:
+                        return header_lower.index(name)
+                return None
+
+            intro_idx = idx(["introducer id", "introducer", "referrer id", "referral id"])
+            approval_idx = idx(["approval", "approved"])
+            name_idx = idx(["promoter full name", "full name", "name"])
+            platform_idx = idx(["primary platform", "platform"])
+            profile_idx = idx(["platform profile link", "profile link", "link"])
+            email_idx = idx(["contact email id", "email", "contact email"])
+
+            referral_rows = referral_ws.get_all_values()[1:]
+
+            filtered_referrals = []
+            for row in referral_rows:
+                intro_val = row[intro_idx].strip() if intro_idx is not None and len(row) > intro_idx else ""
+                approval_val = row[approval_idx].strip().lower() if approval_idx is not None and len(row) > approval_idx else ""
+
+                if intro_val and intro_val.strip().lower() == introducer_id.strip().lower() and approval_val == "true":
+                    filtered_referrals.append({
+                        "name": row[name_idx].strip() if name_idx is not None and len(row) > name_idx else "",
+                        "platform": row[platform_idx].strip() if platform_idx is not None and len(row) > platform_idx else "",
+                        "profile_link": row[profile_idx].strip() if profile_idx is not None and len(row) > profile_idx else "",
+                        "email": row[email_idx].strip() if email_idx is not None and len(row) > email_idx else "",
+                    })
+
+            if not filtered_referrals:
+                return {"entries": [], "total_bonus": 0, "total_subscriptions": 0}
+
+            try:
+                promoters_ws = spreadsheet.worksheet("promoters")
+                promoters_data = promoters_ws.get_all_values()
+                promoters_headers = [h.strip().lower() for h in (promoters_data[0] if promoters_data else [])]
+                prom_email_idx = None
+                prom_referral_idx = None
+                prom_subs_idx = None
+
+                def prom_idx(names):
+                    for n in names:
+                        if n in promoters_headers:
+                            return promoters_headers.index(n)
+                    return None
+
+                prom_email_idx = prom_idx(["email", "contact email", "contact email id"])
+                prom_referral_idx = prom_idx(["referral_id", "referral id"])
+                prom_subs_idx = prom_idx(["subscription_count", "subscription count", "subscriptions", "subscribers", "total subscriptions"])
+
+                promoters_rows = promoters_data[1:] if len(promoters_data) > 1 else []
+            except Exception as e:
+                print(f"⚠️ Failed to load promoters sheet for downline: {e}")
+                promoters_rows = []
+                prom_email_idx = prom_referral_idx = prom_subs_idx = None
+
+            referral_program_map = {}
+            try:
+                referral_program_ws = spreadsheet.worksheet("referral_program")
+                rp_values = referral_program_ws.get_all_values()
+                rp_headers = [h.strip().lower() for h in (rp_values[0] if rp_values else [])]
+
+                def rp_idx(names, fallback=None):
+                    for n in names:
+                        if n in rp_headers:
+                            return rp_headers.index(n)
+                    return fallback
+
+                rp_referral_idx = rp_idx(["referral_id", "referral id"], 4)
+                rp_subs_idx = rp_idx(["subscription_count", "subscription count", "subscriptions"], 14)
+
+                for rp_row in rp_values[1:]:
+                    if len(rp_row) > max(rp_referral_idx or 0, rp_subs_idx or 0):
+                        rid = rp_row[rp_referral_idx].strip() if rp_referral_idx is not None and len(rp_row) > rp_referral_idx else ""
+                        subs_val = rp_row[rp_subs_idx] if rp_subs_idx is not None and len(rp_row) > rp_subs_idx else "0"
+                        try:
+                            referral_program_map[rid] = int(float(subs_val)) if subs_val else 0
+                        except:
+                            referral_program_map[rid] = 0
+            except Exception as e:
+                print(f"⚠️ Failed to load referral_program sheet for downline: {e}")
+
+            def find_promoter_row_by_email(email):
+                if not email or prom_email_idx is None:
+                    return None
+                for prow in promoters_rows:
+                    if len(prow) > prom_email_idx and prow[prom_email_idx].strip().lower() == email.strip().lower():
+                        return prow
+                return None
+
+            entries = []
+            total_bonus = 0
+            total_subscriptions = 0
+
+            for ref in filtered_referrals:
+                promoter_row = find_promoter_row_by_email(ref.get("email"))
+                subscription_count = 0
+                referral_id = ""
+
+                if promoter_row:
+                    if prom_subs_idx is not None and len(promoter_row) > prom_subs_idx:
+                        try:
+                            subscription_count = int(float(promoter_row[prom_subs_idx])) if promoter_row[prom_subs_idx] else 0
+                        except:
+                            subscription_count = 0
+                    if prom_referral_idx is not None and len(promoter_row) > prom_referral_idx:
+                        referral_id = promoter_row[prom_referral_idx].strip()
+
+                if subscription_count == 0 and referral_id:
+                    subscription_count = referral_program_map.get(referral_id, 0)
+
+                bonus = math.floor(subscription_count / 10) * 100
+                total_bonus += bonus
+                total_subscriptions += subscription_count
+
+                entries.append({
+                    "name": ref.get("name", ""),
+                    "platform": ref.get("platform", ""),
+                    "profile_link": ref.get("profile_link", ""),
+                    "email": ref.get("email", ""),
+                    "subscription_count": subscription_count,
+                    "bonus": bonus,
+                })
+
+            return {
+                "entries": entries,
+                "total_bonus": total_bonus,
+                "total_subscriptions": total_subscriptions,
+            }
+
+        except Exception as e:
+            print(f"❌ Error loading downline data: {e}")
+            return None
 
 # Initialize Google Sheets Manager
 gsheet_manager = GoogleSheetsManager()
@@ -4592,6 +4798,7 @@ def main(page: ft.Page):
                 "referral_reason": referral_reason_field.value.strip(),
                 "promotion_type": ", ".join(selected_promotions),
                 "additional_info": (additional_info_field.value or "").strip(),
+                "introducer_id": promoter_referral_id,
             }
 
             success, message = gsheet_manager.submit_promoter_referral(referral_payload)
@@ -4709,6 +4916,113 @@ def main(page: ft.Page):
             dialog.open = True
             page.update()
             print(f"✅ Popup displayed with {len(subscriber_list)} subscriber entries")
+
+        # Downline dialog elements
+        downline_list_column = ft.Column(spacing=10, expand=True, scroll="auto")
+        downline_summary_text = ft.Text("", size=14, weight="bold")
+        downline_total_subs_text = ft.Text("", size=12, color="grey")
+        downline_status_text = ft.Text("", size=12, color="grey")
+
+        downline_dialog = ft.AlertDialog(
+            modal=True,
+            content=ft.Container(width=520, height=520),
+            actions=[ft.TextButton("Close", on_click=lambda e: (setattr(downline_dialog, "open", False), page.update()))],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+
+        def show_downline_view(e=None):
+            """Display downline details for the current promoter."""
+            if not promoter_referral_id:
+                show_snackbar("Register as a promoter to view downline.")
+                return
+
+            downline_list_column.controls.clear()
+            downline_status_text.value = "Loading downline..."
+            downline_summary_text.value = ""
+            downline_total_subs_text.value = ""
+
+            description_block = ft.Container(
+                content=ft.Column([
+                    ft.Text("Your Downline", size=20, weight="bold"),
+                    ft.Text(
+                        "You earn ₹100 bonus for every 10 new subscriptions from each approved referred promoter.",
+                        size=13,
+                        color="grey",
+                        text_align="left",
+                        width=480,
+                    ),
+                ], spacing=6),
+                padding=5,
+            )
+
+            def update_dialog_content():
+                downline_dialog.content = ft.Container(
+                    width=520,
+                    height=520,
+                    padding=10,
+                    content=ft.Column([
+                        description_block,
+                        ft.Divider(),
+                        downline_status_text,
+                        ft.Container(
+                            content=downline_list_column,
+                            expand=True,
+                        ),
+                        ft.Divider(),
+                        downline_summary_text,
+                        downline_total_subs_text,
+                    ], spacing=10, expand=True),
+                )
+                if downline_dialog not in page.overlay:
+                    page.overlay.append(downline_dialog)
+                downline_dialog.open = True
+                page.update()
+
+            update_dialog_content()
+
+            def load_downline_thread():
+                try:
+                    downline_data = gsheet_manager.get_downline_data(promoter_referral_id)
+                    downline_list_column.controls.clear()
+
+                    if not downline_data or not downline_data.get("entries"):
+                        downline_status_text.value = "No approved downline promoters yet. Refer promoters to start earning downline bonus."
+                        downline_summary_text.value = "Total Downline Bonus: ₹0"
+                        downline_total_subs_text.value = "Total Downline Subscriptions: 0"
+                        page.update()
+                        return
+
+                    downline_status_text.value = ""
+                    for entry in downline_data.get("entries", []):
+                        downline_list_column.controls.append(
+                            ft.Container(
+                                content=ft.Column([
+                                    ft.Text(entry.get("name", "Unnamed"), size=15, weight="bold"),
+                                    ft.Text(entry.get("platform", ""), size=12, color="grey"),
+                                    ft.Text(entry.get("profile_link", ""), size=12, color="blue", selectable=True),
+                                    ft.Text(f"Subscriptions: {entry.get('subscription_count', 0)}", size=13, weight="w600"),
+                                    ft.Text(f"Downline Bonus: ₹{entry.get('bonus', 0)}", size=13, weight="bold", color="purple"),
+                                ], spacing=4),
+                                padding=12,
+                                bgcolor="#F5F5F5",
+                                border_radius=10,
+                            )
+                        )
+
+                    total_bonus = downline_data.get("total_bonus", 0)
+                    total_subs = downline_data.get("total_subscriptions", 0)
+                    downline_summary_text.value = f"Total Downline Bonus: ₹{total_bonus}"
+                    downline_total_subs_text.value = f"Total Downline Subscriptions: {total_subs}"
+
+                except Exception as err:
+                    print(f"❌ Error loading downline dialog: {err}")
+                    downline_status_text.value = "Failed to load downline data. Please try again."
+                    show_snackbar("Failed to load downline data. Please try again.")
+                finally:
+                    update_dialog_content()
+                    page.update()
+
+            threading.Thread(target=load_downline_thread, daemon=True).start()
         
         def load_promoter_stats():
             """Load and display promoter statistics"""
@@ -4726,13 +5040,22 @@ def main(page: ft.Page):
                 )
             )
             page.update()
-            
+
             def fetch_stats_thread():
                 stats = gsheet_manager.get_promoter_stats(promoter_referral_id)
-                
+                downline_bonus = 0
+                try:
+                    downline_data = gsheet_manager.get_downline_data(promoter_referral_id)
+                    if downline_data:
+                        downline_bonus = downline_data.get("total_bonus", 0) or 0
+                except Exception as downline_error:
+                    print(f"⚠️ Failed to load downline bonus: {downline_error}")
+
                 stats_container.controls.clear()
-                
+
                 if stats:
+                    total_earnings = stats['earnings'] + downline_bonus
+
                     # Create stats cards
                     stats_container.controls.extend([
                         # Earnings Section
@@ -4761,7 +5084,16 @@ def main(page: ft.Page):
                                         ], horizontal_alignment="center", spacing=2),
                                         expand=True
                                     )
-                                ], spacing=10)
+                                ], spacing=10),
+                                ft.Container(height=6),
+                                ft.Row([
+                                    ft.Text("Downline Bonus", size=12, color="grey"),
+                                    ft.Text(f"₹{downline_bonus:.2f}", size=16, weight="w600", color="purple")
+                                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                                ft.Row([
+                                    ft.Text("Total Earnings", size=12, color="grey"),
+                                    ft.Text(f"₹{total_earnings:.2f}", size=16, weight="bold", color="green")
+                                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                             ], spacing=10),
                             padding=15,
                             bgcolor="#E8F5E9",
@@ -4809,6 +5141,21 @@ def main(page: ft.Page):
                                     show_subscribers_popup(stats['subscribers'])
                                 )[-1],
                                 bgcolor="#2196F3",
+                                color="white",
+                                width=300
+                            ),
+                            alignment=ft.alignment.center
+                        ),
+
+                        # Downline button
+                        ft.Container(
+                            content=ft.ElevatedButton(
+                                content=ft.Row([
+                                    ft.Icon(ft.Icons.GROUP_ADD, size=20),
+                                    ft.Text("Your Downline", size=14)
+                                ], spacing=10),
+                                on_click=show_downline_view,
+                                bgcolor="#673AB7",
                                 color="white",
                                 width=300
                             ),
