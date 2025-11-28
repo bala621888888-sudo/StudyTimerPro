@@ -65,6 +65,15 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# Flet icons fallback (older builds may not expose ft.icons)
+try:
+    ICONS = ft.icons
+except AttributeError:  # pragma: no cover - compatibility shim
+    class _Icons:
+        NOTIFICATIONS = "notifications"
+
+    ICONS = _Icons()
+
 # Message listener system
 active_listeners = {}  # Store active listeners
 message_queue = queue.Queue()  # Queue for UI updates
@@ -2053,39 +2062,44 @@ class GoogleSheetsManager:
             return None
 
     def _ensure_promote_referral_structure(self, worksheet, existing_headers=None):
-        """Ensure promote referral sheet has Introducer ID and Approval columns."""
+        """Ensure promote referral sheet has Introducer ID, Activation Key, and Approval columns at the end."""
         try:
             headers = existing_headers or worksheet.row_values(1)
             headers = headers if headers else []
 
-            approval_like_indices = [
-                idx for idx, h in enumerate(headers) if "approval" in h.strip().lower()
-            ]
+            normalized = []
+            introducer_label = None
+            activation_label = None
+            approval_label = None
 
-            # Ensure Introducer ID column exists
-            if not any("introducer" in h.strip().lower() for h in headers):
-                headers.append("Introducer ID")
+            for h in headers:
+                hl = h.strip().lower() if h else ""
+                if "introducer" in hl and not introducer_label:
+                    introducer_label = h.strip() or "Introducer ID"
+                    continue
+                if hl == "activation key" and not activation_label:
+                    activation_label = "Activation Key"
+                    continue
+                if "approval" in hl and not approval_label:
+                    approval_label = "Approval"
+                    continue
+                normalized.append(h)
 
-            # Ensure Approval column is present and at the end
-            if approval_like_indices:
-                # Normalize name of the first approval-like column
-                first_idx = approval_like_indices[0]
-                if headers[first_idx].strip() != "Approval":
-                    worksheet.update_cell(1, first_idx + 1, "Approval")
+            if not introducer_label:
+                introducer_label = "Introducer ID"
+            if not activation_label:
+                activation_label = "Activation Key"
+            if not approval_label:
+                approval_label = "Approval"
 
-                if first_idx != len(headers) - 1:
-                    headers.append("Approval")
-            else:
-                headers.append("Approval")
+            normalized.extend([introducer_label, activation_label, approval_label])
 
-            # Expand worksheet columns if necessary
-            if len(headers) > worksheet.col_count:
-                worksheet.add_cols(len(headers) - worksheet.col_count)
+            if len(normalized) > worksheet.col_count:
+                worksheet.add_cols(len(normalized) - worksheet.col_count)
 
-            # Write normalized headers
-            worksheet.update('A1', [headers])
+            worksheet.update('A1', [normalized])
 
-            return headers
+            return normalized
         except Exception as e:
             print(f"⚠️ Failed to normalize promote referral headers: {e}")
             return existing_headers or []
@@ -2115,6 +2129,7 @@ class GoogleSheetsManager:
                     "Promotion Type",
                     "Additional Information",
                     "Introducer ID",
+                    "Activation Key",
                     "Approval",
                 ]
                 worksheet.append_row(headers)
@@ -2148,6 +2163,7 @@ class GoogleSheetsManager:
             set_field(["additional information", "additional info"], referral_data.get("additional_info", ""))
             set_field(["introducer id", "referrer id", "referral id"], referral_data.get("introducer_id", ""))
 
+            set_field(["activation key"], "")
             set_field(["approval"], "")
 
             worksheet.append_row(row_data)
@@ -2308,6 +2324,87 @@ class GoogleSheetsManager:
         except Exception as e:
             print(f"❌ Error loading downline data: {e}")
             return None
+
+    def assign_activation_keys_for_approved_referrals(self, introducer_id):
+        """Assign activation keys to approved referrals lacking keys for a given introducer."""
+        assigned = []
+        try:
+            if not self.client or not self.sheet_id or not introducer_id:
+                return assigned
+
+            spreadsheet = self.client.open_by_key(self.sheet_id)
+
+            try:
+                referral_ws = spreadsheet.worksheet("promote referral")
+            except Exception as e:
+                print(f"❌ promote referral sheet missing: {e}")
+                return assigned
+
+            referral_headers = referral_ws.row_values(1)
+            referral_headers = self._ensure_promote_referral_structure(referral_ws, referral_headers)
+            referral_lower = [h.strip().lower() for h in referral_headers]
+
+            def idx(names):
+                for name in names:
+                    if name in referral_lower:
+                        return referral_lower.index(name)
+                return None
+
+            intro_idx = idx(["introducer id", "introducer", "referrer id", "referral id"])
+            approval_idx = idx(["approval", "approved"])
+            activation_idx = idx(["activation key"])
+            name_idx = idx(["promoter full name", "full name", "name"])
+
+            if intro_idx is None or approval_idx is None or activation_idx is None:
+                return assigned
+
+            referral_rows = referral_ws.get_all_values()[1:]
+
+            try:
+                promoters_ws = spreadsheet.worksheet("promoters")
+                promoters_rows = promoters_ws.get_all_values()
+            except Exception as e:
+                print(f"❌ promoters sheet missing: {e}")
+                return assigned
+
+            promoters_data_rows = promoters_rows[1:] if len(promoters_rows) > 1 else []
+
+            def find_fresh_activation_key():
+                for p_row_idx, prow in enumerate(promoters_data_rows, start=2):
+                    key_val = prow[0].strip() if len(prow) > 0 else ""
+                    status_val = prow[5].strip() if len(prow) > 5 else ""
+                    if key_val and not status_val:
+                        return key_val, p_row_idx
+                return None, None
+
+            for row_idx, row in enumerate(referral_rows, start=2):
+                intro_val = row[intro_idx].strip().lower() if len(row) > intro_idx else ""
+                approval_val = row[approval_idx].strip().lower() if len(row) > approval_idx else ""
+                activation_val = row[activation_idx].strip() if len(row) > activation_idx else ""
+
+                if intro_val == introducer_id.strip().lower() and approval_val == "true" and not activation_val:
+                    fresh_key, promoter_row_idx = find_fresh_activation_key()
+
+                    if not fresh_key:
+                        print("No fresh activation keys available")
+                        continue
+
+                    referral_ws.update_cell(row_idx, activation_idx + 1, fresh_key)
+                    promoters_ws.update_cell(promoter_row_idx, 6, "TRUE")
+                    try:
+                        promoters_data_rows[promoter_row_idx - 2][5] = "TRUE"
+                    except Exception:
+                        pass
+
+                    assigned.append({
+                        "name": row[name_idx].strip() if name_idx is not None and len(row) > name_idx else "Promoter",
+                        "activation_key": fresh_key
+                    })
+
+            return assigned
+        except Exception as e:
+            print(f"❌ Error assigning activation keys: {e}")
+            return assigned
 
 # Initialize Google Sheets Manager
 gsheet_manager = GoogleSheetsManager()
@@ -3502,10 +3599,110 @@ def main(page: ft.Page):
 
         # ---------------- TOP BAR (CRITICAL FIX - Ensure all numeric values are safe) ----------------
        
+        system_notifications = []
+        unread_system_notifications = {"count": 0}
+        unread_private_messages = {"count": 0}
+        activate_tab_ref = {"fn": None}
+
+        notification_badge_text = ft.Text(
+            "0", size=10, color="white", weight="bold"
+        )
+
+        notification_badge_container = ft.Container(
+            content=notification_badge_text,
+            bgcolor="red",
+            width=18,
+            height=18,
+            border_radius=9,
+            alignment=ft.alignment.center,
+            right=0,
+            top=0,
+            visible=False,
+        )
+
+        def update_notification_badge():
+            total_unread = unread_system_notifications["count"] + unread_private_messages["count"]
+            notification_badge_text.value = str(total_unread)
+            notification_badge_container.visible = total_unread > 0
+            if notification_badge_container.page:
+                notification_badge_container.update()
+
+        def open_notifications_dialog(e=None):
+            unread_system_notifications["count"] = 0
+            update_notification_badge()
+
+            notification_items = []
+
+            if system_notifications:
+                for item in reversed(system_notifications):
+                    notification_items.append(
+                        ft.ListTile(
+                            title=ft.Text(item.get("title", "Notification"), weight="bold"),
+                            subtitle=ft.Text(item.get("message", "")),
+                        )
+                    )
+            else:
+                notification_items.append(ft.Text("No system notifications yet.", size=12, color="grey"))
+
+            notification_items.append(ft.Divider())
+
+            notification_items.append(
+                ft.Row(
+                    [
+                        ft.Text(
+                            f"Unread private messages: {unread_private_messages['count']}",
+                            size=12,
+                        ),
+                        ft.TextButton(
+                            "Open Private Chats",
+                            on_click=lambda ev: activate_tab_ref["fn"](3) if activate_tab_ref.get("fn") else None,
+                        ),
+                    ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                )
+            )
+
+            dialog = ft.AlertDialog(
+                title=ft.Text("Notifications", size=18, weight="bold"),
+                content=ft.Container(
+                    content=ft.Column(notification_items, scroll="auto", width=360),
+                    width=380,
+                ),
+                actions=[ft.TextButton("Close", on_click=lambda ev: setattr(dialog, "open", False) or page.update())],
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+
+            if dialog not in page.overlay:
+                page.overlay.append(dialog)
+            page.dialog = dialog
+            dialog.open = True
+            page.update()
+
+        notification_icon_button = ft.IconButton(
+            icon=ICONS.NOTIFICATIONS,
+            tooltip="Notifications",
+            on_click=open_notifications_dialog,
+        )
+
+        # Allow clicks anywhere on the stack (including the badge) to open notifications
+        notification_badge_container.on_click = open_notifications_dialog
+
+        notification_icon_stack = ft.GestureDetector(
+            on_tap=open_notifications_dialog,
+            content=ft.Stack(
+                [
+                    notification_icon_button,
+                    notification_badge_container,
+                ],
+                width=36,
+                height=36,
+            ),
+        )
+
         try:
             safe_username = str(display_username) if display_username else "User"
             safe_email = str(auth.email) if auth.email else ""
-            
+
             top_bar = ft.Row(
                 [
                     ft.Column(
@@ -3516,7 +3713,11 @@ def main(page: ft.Page):
                         spacing=0,  # ✅ Plain integer
                         expand=True
                     ),
-                    profile_avatar_ref["widget"]
+                    ft.Row(
+                        [notification_icon_stack, profile_avatar_ref["widget"]],
+                        spacing=10,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
                 ],
                 spacing=10,  # ✅ Plain integer
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -5396,6 +5597,26 @@ def main(page: ft.Page):
 
             promoter_content.controls.clear()
 
+            update_notification_badge()
+
+            new_assignments = []
+            if is_registered_promoter and promoter_referral_id:
+                new_assignments = gsheet_manager.assign_activation_keys_for_approved_referrals(promoter_referral_id)
+                for assignment in new_assignments:
+                    system_notifications.append(
+                        {
+                            "title": "New downline activation key",
+                            "message": (
+                                f"Your referred promoter {assignment.get('name', 'Promoter')} has been approved. "
+                                f"Activation key: {assignment.get('activation_key', '')}. "
+                                "Ask them to use it in the 'Register as Promoter' screen."
+                            ),
+                        }
+                    )
+                    unread_system_notifications["count"] += 1
+                if new_assignments:
+                    update_notification_badge()
+
             promoter_content.controls.append(
                 ft.Container(
                     content=ft.Row(
@@ -5838,6 +6059,14 @@ def main(page: ft.Page):
                     private_chats_cache["data"] = accepted_chats
                     private_chats_cache["loaded"] = True
 
+                    try:
+                        unread_private_messages["count"] = sum(
+                            int(chat.get('unread', 0) or 0) for chat in accepted_chats
+                        )
+                    except Exception:
+                        unread_private_messages["count"] = 0
+                    update_notification_badge()
+
                     # Display
                     display_private_chats_from_cache(accepted_chats)
 
@@ -5855,6 +6084,14 @@ def main(page: ft.Page):
         def display_private_chats_from_cache(accepted_chats):
             """Display private chats from data (accepted + pending requests)"""
             private_chats_column.controls.clear()
+
+            try:
+                unread_private_messages["count"] = sum(
+                    int(chat.get('unread', 0) or 0) for chat in accepted_chats
+                )
+            except Exception:
+                unread_private_messages["count"] = 0
+            update_notification_badge()
 
             # Count pending requests (only those where this user is receiver)
             pending_count = sum(
@@ -6057,6 +6294,8 @@ def main(page: ft.Page):
                     bottom_nav.selected_index = selected_index
             except Exception as nav_ex:
                 print(f"[NAV SYNC] {nav_ex}")
+
+            activate_tab_ref["fn"] = activate_tab
 
             if not page_view_cls:
                 try:
