@@ -2,6 +2,19 @@
 import json
 import os
 import socket
+import sys
+
+# Ensure wsgiref is importable when bundled in the APK
+try:
+    import wsgiref.simple_server  # type: ignore
+except ModuleNotFoundError:
+    vendor_dir = os.path.join(os.path.dirname(__file__), "wsgiref")
+    if os.path.isdir(vendor_dir) and vendor_dir not in sys.path:
+        # Add the project root so "wsgiref" package can be resolved
+        sys.path.insert(0, os.path.dirname(vendor_dir))
+    # Retry import; if it still fails, let the exception surface for logging
+    import wsgiref.simple_server  # type: ignore
+
 import gspread
 from google.oauth2.service_account import Credentials
 from cryptography.fernet import Fernet
