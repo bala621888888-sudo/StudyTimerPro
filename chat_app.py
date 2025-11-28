@@ -62,7 +62,7 @@ import queue
 from secrets_util import get_secret, get_encrypted_gspread_client
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Message listener system
@@ -2051,6 +2051,57 @@ class GoogleSheetsManager:
         except Exception as e:
             print(f"❌ Error fetching promoter stats: {e}")
             return None
+
+    def submit_promoter_referral(self, referral_data):
+        """Append promoter referral details to the 'promote referral' worksheet"""
+        try:
+            if not self.client or not self.sheet_id:
+                return False, "Google Sheets not configured"
+
+            spreadsheet = self.client.open_by_key(self.sheet_id)
+
+            try:
+                worksheet = spreadsheet.worksheet("promote referral")
+            except Exception as e:
+                print(f"ℹ️ Worksheet 'promote referral' not found. Creating new worksheet: {e}")
+                worksheet = spreadsheet.add_worksheet(title="promote referral", rows=100, cols=20)
+                headers = [
+                    "Timestamp",
+                    "Promoter Full Name",
+                    "Primary Platform",
+                    "Platform Profile Link",
+                    "Estimated Followers / Members",
+                    "Contact Email ID",
+                    "Phone Number",
+                    "Reason for Referral",
+                    "Promotion Type",
+                    "Additional Information",
+                ]
+                worksheet.append_row(headers)
+
+            ist_timezone = timezone(timedelta(hours=5, minutes=30))
+            timestamp = datetime.now(ist_timezone).strftime("%Y-%m-%d %H:%M")
+
+            row_data = [
+                timestamp,
+                referral_data.get("full_name", ""),
+                referral_data.get("primary_platform", ""),
+                referral_data.get("profile_link", ""),
+                referral_data.get("followers", ""),
+                referral_data.get("email", ""),
+                referral_data.get("phone", ""),
+                referral_data.get("referral_reason", ""),
+                referral_data.get("promotion_type", ""),
+                referral_data.get("additional_info", ""),
+            ]
+
+            worksheet.append_row(row_data)
+            print(f"✅ Promoter referral saved: {row_data}")
+            return True, ""
+
+        except Exception as e:
+            print(f"❌ Error submitting promoter referral: {e}")
+            return False, "Failed to submit promoter referral. Please try again."
 
 # Initialize Google Sheets Manager
 gsheet_manager = GoogleSheetsManager()
@@ -4409,9 +4460,203 @@ def main(page: ft.Page):
         
         # State for showing registration form
         show_registration_form = {"visible": False}
-        
+
         # Stats container (will be updated when stats are loaded)
         stats_container = ft.Column([], spacing=10)
+
+        # Refer a Promoter form fields
+        promoter_full_name_field = ft.TextField(label="Promoter Full Name", width=420, autofocus=True)
+        primary_platform_dropdown = ft.Dropdown(
+            label="Primary Platform (where you have most followers)",
+            options=[
+                ft.dropdown.Option("YouTube"),
+                ft.dropdown.Option("Instagram"),
+                ft.dropdown.Option("Telegram"),
+                ft.dropdown.Option("WhatsApp"),
+                ft.dropdown.Option("Facebook"),
+                ft.dropdown.Option("TikTok"),
+                ft.dropdown.Option("Twitter (X)"),
+                ft.dropdown.Option("Other"),
+            ],
+            width=420,
+        )
+        platform_profile_link_field = ft.TextField(
+            label="Platform Profile Link",
+            hint_text="https://instagram.com/username",
+            width=420,
+        )
+        estimated_followers_field = ft.TextField(
+            label="Estimated Followers / Members",
+            keyboard_type=ft.KeyboardType.NUMBER,
+            width=420,
+        )
+        contact_email_field = ft.TextField(label="Contact Email ID", width=420)
+        phone_number_field = ft.TextField(label="Phone Number (Optional)", width=420)
+        referral_reason_field = ft.TextField(
+            label="Why are you referring this promoter?",
+            multiline=True,
+            min_lines=3,
+            width=420,
+        )
+        promotion_type_options = [
+            "YouTube Review",
+            "Short Video / Reel",
+            "Telegram Promotion",
+            "WhatsApp Group",
+            "Instagram Story",
+            "Paid Ads",
+            "Other",
+        ]
+        promotion_type_checkboxes = [
+            ft.Checkbox(label=option, value=False) for option in promotion_type_options
+        ]
+        additional_info_field = ft.TextField(
+            label="Additional Information (Optional)",
+            multiline=True,
+            min_lines=2,
+            width=420,
+        )
+
+        def reset_referral_errors():
+            promoter_full_name_field.error_text = None
+            primary_platform_dropdown.error_text = None
+            platform_profile_link_field.error_text = None
+            estimated_followers_field.error_text = None
+            contact_email_field.error_text = None
+            referral_reason_field.error_text = None
+
+        def clear_referral_form_fields():
+            promoter_full_name_field.value = ""
+            primary_platform_dropdown.value = None
+            platform_profile_link_field.value = ""
+            estimated_followers_field.value = ""
+            contact_email_field.value = ""
+            phone_number_field.value = ""
+            referral_reason_field.value = ""
+            additional_info_field.value = ""
+            for checkbox in promotion_type_checkboxes:
+                checkbox.value = False
+
+        def close_referral_dialog(e=None):
+            referral_dialog.open = False
+            page.update()
+
+        def submit_promoter_referral(e):
+            reset_referral_errors()
+            valid = True
+
+            if not promoter_full_name_field.value:
+                promoter_full_name_field.error_text = "Required"
+                valid = False
+
+            if not primary_platform_dropdown.value:
+                primary_platform_dropdown.error_text = "Required"
+                valid = False
+
+            profile_link = platform_profile_link_field.value or ""
+            if not profile_link.strip():
+                platform_profile_link_field.error_text = "Required"
+                valid = False
+
+            if not estimated_followers_field.value:
+                estimated_followers_field.error_text = "Required"
+                valid = False
+
+            email_value = (contact_email_field.value or "").strip()
+            if not email_value or "@" not in email_value or "." not in email_value:
+                contact_email_field.error_text = "Enter a valid email"
+                valid = False
+
+            if not referral_reason_field.value:
+                referral_reason_field.error_text = "Required"
+                valid = False
+
+            selected_promotions = [
+                checkbox.label for checkbox in promotion_type_checkboxes if checkbox.value
+            ]
+            if not selected_promotions:
+                show_snackbar("Please select at least one Promotion Type")
+                valid = False
+
+            if not valid:
+                page.update()
+                return
+
+            referral_payload = {
+                "full_name": promoter_full_name_field.value.strip(),
+                "primary_platform": primary_platform_dropdown.value,
+                "profile_link": profile_link.strip(),
+                "followers": estimated_followers_field.value.strip(),
+                "email": email_value,
+                "phone": (phone_number_field.value or "").strip(),
+                "referral_reason": referral_reason_field.value.strip(),
+                "promotion_type": ", ".join(selected_promotions),
+                "additional_info": (additional_info_field.value or "").strip(),
+            }
+
+            success, message = gsheet_manager.submit_promoter_referral(referral_payload)
+
+            if success:
+                show_snackbar("Promoter referral submitted successfully.")
+                clear_referral_form_fields()
+                referral_dialog.open = False
+            else:
+                show_snackbar(message or "Failed to submit promoter referral. Please try again.")
+
+            page.update()
+
+        referral_dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Refer a Promoter", size=20, weight="bold"),
+            content=ft.Container(
+                width=500,
+                content=ft.Column(
+                    [
+                        promoter_full_name_field,
+                        primary_platform_dropdown,
+                        platform_profile_link_field,
+                        estimated_followers_field,
+                        contact_email_field,
+                        phone_number_field,
+                        referral_reason_field,
+                        ft.Column(
+                            [
+                                ft.Text("Promotion Type", weight="bold"),
+                                ft.Row(
+                                    promotion_type_checkboxes,
+                                    wrap=True,
+                                    spacing=10,
+                                    run_spacing=10,
+                                ),
+                            ],
+                            spacing=6,
+                        ),
+                        additional_info_field,
+                    ],
+                    spacing=12,
+                    tight=True,
+                    scroll="auto",
+                ),
+            ),
+            actions=[
+                ft.TextButton("Cancel", on_click=close_referral_dialog),
+                ft.FilledButton("Submit", on_click=submit_promoter_referral),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+
+        def open_referral_dialog(e):
+            reset_referral_errors()
+            if referral_dialog not in page.overlay:
+                page.overlay.append(referral_dialog)
+            referral_dialog.open = True
+            page.update()
+
+        refer_promoter_button = ft.OutlinedButton(
+            "Refer a Promoter",
+            icon=ft.Icons.PERSON_ADD_ALT,
+            on_click=open_referral_dialog,
+        )
         
         def show_subscribers_popup(subscribers):
             """Show popup with list of subscribers"""
@@ -4801,9 +5046,19 @@ def main(page: ft.Page):
             """Refresh the promoter screen content"""
             # Always reload status from Firebase first
             reload_promoter_status()
-            
+
             promoter_content.controls.clear()
-            
+
+            promoter_content.controls.append(
+                ft.Container(
+                    content=ft.Row(
+                        [refer_promoter_button],
+                        alignment=ft.MainAxisAlignment.END,
+                    ),
+                    width=page.width,
+                )
+            )
+
             if is_registered_promoter:
                 # Show dashboard with stats
                 promoter_content.controls.extend([
