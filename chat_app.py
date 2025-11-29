@@ -2976,6 +2976,10 @@ def main(page: ft.Page):
     all_members_cache = []
     load_group_messages_callback = None  # Will be set when entering group chat
     upload_counter = {"count": 0}  # Counter for generating unique upload IDs
+    promoter_content = None
+    promoter_screen_initialized = False
+    promoter_needs_refresh = True
+    main_menu_initialized = False
     
     # ============================================
     # UI COMPONENT DEFINITIONS
@@ -3102,32 +3106,51 @@ def main(page: ft.Page):
     # Add near the top of main() after other global variables
     auto_refresh_timer = {"active": False, "thread": None}
 
+    def process_group_message_queue(group_id):
+        """Process queued message updates for group chat"""
+        try:
+            while not message_queue.empty():
+                update = message_queue.get_nowait()
+
+                if (
+                    update.get("type") == "update_messages"
+                    and update.get("chat_id") == group_id
+                    and active_screen["current"] == "group_chat"
+                ):
+                    print(f"[QUEUE] Processing update for group {update['chat_id']}")
+                    if load_group_messages_callback:
+                        load_group_messages_callback()
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print(f"[GROUP QUEUE ERROR] {e}")
+
     def start_auto_refresh_messages(interval=5):
         """Start auto-refresh for current chat/group"""
         stop_auto_refresh_messages()  # Stop any existing
-        
+
         auto_refresh_timer["active"] = True
-        
+
         def refresh_loop():
             while auto_refresh_timer["active"]:
                 try:
                     time.sleep(interval)
-                    
+
                     if not auto_refresh_timer["active"]:
                         break
-                    
+
                     # Check which screen is active
                     if active_screen.get("current") == "private_chat" and current_chat_id:
                         # Process private message queue
                         process_private_message_queue()
-                    
+
                     elif active_screen.get("current") == "group_chat" and current_group_id:
                         # Process group message queue
                         process_group_message_queue(current_group_id)
-                    
+
                 except Exception as e:
                     print(f"[AUTO-REFRESH ERROR] {e}")
-        
+
         auto_refresh_timer["thread"] = threading.Thread(target=refresh_loop, daemon=True)
         auto_refresh_timer["thread"].start()
         print(f"[AUTO-REFRESH] Started with {interval}s interval")
@@ -3708,7 +3731,7 @@ def main(page: ft.Page):
         active_screen["current"] = None 
     
     def show_main_menu():
-        nonlocal current_username  # Make sure we can modify it
+        nonlocal current_username, promoter_content, promoter_screen_initialized, promoter_needs_refresh, main_menu_initialized  # Make sure we can modify it
         
         # Safety check: Ensure current_username is a valid string, but don't override if it exists
         if current_username is None or (isinstance(current_username, str) and len(current_username) == 0):
@@ -5240,9 +5263,6 @@ def main(page: ft.Page):
         # State for showing registration form
         show_registration_form = {"visible": False}
 
-        # Track promoter screen initialization to avoid unnecessary reloads
-        promoter_screen_initialized = False
-
         # Stats container (will be updated when stats are loaded)
         stats_container = ft.Column([], spacing=10)
 
@@ -6019,15 +6039,22 @@ def main(page: ft.Page):
                 import traceback
                 traceback.print_exc()
         
-        def refresh_promoter_screen():
+        def refresh_promoter_screen(use_cached=False):
             """Refresh the promoter screen content"""
-            nonlocal promoter_screen_initialized
+            nonlocal promoter_screen_initialized, promoter_needs_refresh
+
+            if use_cached and promoter_screen_initialized and not promoter_needs_refresh:
+                update_notification_badge()
+                page.update()
+                return
+
             # Always reload status from Firebase first
             reload_promoter_status()
 
             promoter_content.controls.clear()
 
             update_notification_badge()
+            promoter_needs_refresh = False
 
             new_assignments = []
             if is_registered_promoter and promoter_referral_id:
@@ -6103,7 +6130,7 @@ def main(page: ft.Page):
                 promoter_content.controls.extend([
                     header_section,
                     ft.Container(height=10),
-                    
+
                     # Referral ID Card
                     ft.Container(
                         content=ft.Column([
@@ -6137,13 +6164,13 @@ def main(page: ft.Page):
                         border_radius=10,
                         width=350
                     ),
-                    
+
                     ft.Container(height=10),
-                    
+
                     # Stats container
                     stats_container,
                 ])
-                
+
                 # Load stats initially
                 load_promoter_stats()
             else:
@@ -6225,16 +6252,17 @@ def main(page: ft.Page):
             promoter_screen_initialized = True
             page.update()
         
-        # Main promoter content container
-        promoter_content = ft.Column(
-            [],
-            horizontal_alignment="center",
-            scroll="auto",
-            spacing=10
-        )
+        # Main promoter content container (reused across sessions)
+        if promoter_content is None:
+            promoter_content = ft.Column(
+                [],
+                horizontal_alignment="center",
+                scroll="auto",
+                spacing=10
+            )
         
         # Build initial screen
-        refresh_promoter_screen()
+        refresh_promoter_screen(use_cached=main_menu_initialized)
         
         # Screen promoter container
         screen_promoter = ft.Container(
@@ -6807,8 +6835,7 @@ def main(page: ft.Page):
                     print(f"[TAB FALLBACK] {tab_ex}")
 
             if selected_index == 0:
-                if not promoter_screen_initialized:
-                    refresh_promoter_screen()
+                refresh_promoter_screen(use_cached=True)
             elif selected_index == 1:
                 # Groups already loaded
                 pass
@@ -7069,6 +7096,9 @@ def main(page: ft.Page):
         )
         # Final page update
         page.update()
+
+        # Mark main menu as initialized to allow cached promoter tab reuse on return
+        main_menu_initialized = True
 
         # Load private chats data in background
         threading.Thread(target=load_private_chats, daemon=True).start()
