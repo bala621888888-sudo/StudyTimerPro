@@ -319,11 +319,12 @@ MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB in bytes
 # ============================================
 class MessageListener:
     """Firebase real-time message listener using polling"""
-    
-    def __init__(self, chat_id, callback, db_instance):
+
+    def __init__(self, chat_id, callback, db_instance, message_fetcher=None):
         self.chat_id = chat_id
         self.callback = callback
         self.db = db_instance
+        self.message_fetcher = message_fetcher or self.db.get_messages
         self.running = False
         self.thread = None
         self.last_message_count = 0
@@ -358,8 +359,8 @@ class MessageListener:
                 
                 self.last_check = current_time
                 
-                # Fetch latest messages
-                messages = self.db.get_messages(self.chat_id)
+                # Fetch latest messages (supports private and group chats)
+                messages = self.message_fetcher(self.chat_id)
                 
                 if messages:
                     message_count = len(messages)
@@ -886,11 +887,12 @@ class FirebaseStorage:
 
 class MessageListener:
     """Firebase real-time message listener using polling"""
-    
-    def __init__(self, chat_id, callback, db_instance):
+
+    def __init__(self, chat_id, callback, db_instance, message_fetcher=None):
         self.chat_id = chat_id
         self.callback = callback
         self.db = db_instance
+        self.message_fetcher = message_fetcher or self.db.get_messages
         self.running = False
         self.thread = None
         self.last_message_count = 0
@@ -925,8 +927,8 @@ class MessageListener:
                 
                 self.last_check = current_time
                 
-                # Fetch latest messages
-                messages = self.db.get_messages(self.chat_id)
+                # Fetch latest messages (supports private and group chats)
+                messages = self.message_fetcher(self.chat_id)
                 
                 if messages:
                     message_count = len(messages)
@@ -2025,15 +2027,22 @@ def format_file_size(size_bytes):
 # ============================================
 # LISTENER MANAGEMENT FUNCTIONS
 # ============================================
-def start_message_listener(chat_id, db_instance, page_ref):
-    """Start a real-time listener for a chat"""
+def start_message_listener(chat_id, db_instance, page_ref, chat_type="private"):
+    """Start a real-time listener for a chat or group."""
     global active_listeners
     
     with listener_lock:
         # Stop existing listener for this chat
         if chat_id in active_listeners:
             active_listeners[chat_id].stop()
-        
+
+        # Select appropriate fetcher
+        message_fetcher = (
+            db_instance.get_group_messages_by_id
+            if chat_type == "group"
+            else db_instance.get_messages
+        )
+
         # Create and start new listener
         def on_new_messages(messages):
             """Callback when new messages arrive"""
@@ -2047,8 +2056,8 @@ def start_message_listener(chat_id, db_instance, page_ref):
                 })
             except Exception as e:
                 print(f"[CALLBACK ERROR] {e}")
-        
-        listener = MessageListener(chat_id, on_new_messages, db_instance)
+
+        listener = MessageListener(chat_id, on_new_messages, db_instance, message_fetcher=message_fetcher)
         listener.start()
         active_listeners[chat_id] = listener
         
@@ -3972,6 +3981,7 @@ def main(page: ft.Page):
         system_notifications = []
         unread_system_notifications = {"count": 0}
         unread_private_messages = {"count": 0}
+        private_unread_counts = {}
         activate_tab_ref = {"fn": None}
 
         def load_notification_cache():
@@ -4658,7 +4668,7 @@ def main(page: ft.Page):
             load_specific_group_messages(group_id)
             
             # Start real-time listener for this group
-            start_message_listener(group_id, db, page)
+            start_message_listener(group_id, db, page, chat_type="group")
             print(f"[DEBUG] Started listener for group chat: {group_id}")
             
             # ✅ Start auto-refresh timer
@@ -5168,92 +5178,6 @@ def main(page: ft.Page):
             # Build initial members list
             build_members_ui()
 
-            # "Leave group" + "Delete group" (danger zone)
-            danger_controls = []
-
-            # Leave group button (any member)
-            def confirm_leave_group(e):
-                def do_leave(ev):
-                    dialog.open = False
-                    page.update()
-                    ok = db.remove_member_from_group(group_id, auth.user_id)
-                    if ok:
-                        show_snackbar("You left the group")
-                        # Go back to main menu; groups list will update on next open
-                        show_main_menu()
-                    else:
-                        show_snackbar("Failed to leave group")
-
-                def cancel(ev):
-                    dialog.open = False
-                    page.update()
-
-                dialog = ft.AlertDialog(
-                    title=ft.Text("Leave group?", size=18, weight="bold"),
-                    content=ft.Text("Are you sure you want to leave this group?", size=14),
-                    actions=[
-                        ft.TextButton("Cancel", on_click=cancel),
-                        ft.ElevatedButton("Leave", on_click=do_leave, bgcolor="red", color="white"),
-                    ],
-                    actions_alignment=ft.MainAxisAlignment.END,
-                )
-                page.dialog = dialog
-                dialog.open = True
-                page.update()
-
-            danger_controls.append(
-                ft.ElevatedButton(
-                    "🚪 Leave Group",
-                    on_click=confirm_leave_group,
-                    bgcolor="#FF7043",
-                    color="white",
-                    width=250,
-                )
-            )
-
-            # Delete group only for admins
-            if user_is_group_admin or is_admin:
-                def confirm_delete_group(e):
-                    def do_delete(ev):
-                        dialog.open = False
-                        page.update()
-                        ok = db.delete_group_by_id(group_id)
-                        if ok:
-                            show_snackbar("Group deleted")
-                            show_main_menu()
-                        else:
-                            show_snackbar("Failed to delete group")
-
-                    def cancel(ev):
-                        dialog.open = False
-                        page.update()
-
-                    dialog = ft.AlertDialog(
-                        title=ft.Text("Delete group?", size=18, weight="bold"),
-                        content=ft.Text(
-                            "This will remove all messages and cannot be undone.",
-                            size=14,
-                        ),
-                        actions=[
-                            ft.TextButton("Cancel", on_click=cancel),
-                            ft.ElevatedButton("Delete", on_click=do_delete, bgcolor="red", color="white"),
-                        ],
-                        actions_alignment=ft.MainAxisAlignment.END,
-                    )
-                    page.dialog = dialog
-                    dialog.open = True
-                    page.update()
-
-                danger_controls.append(
-                    ft.ElevatedButton(
-                        "🗑️ Delete Group",
-                        on_click=confirm_delete_group,
-                        bgcolor="red",
-                        color="white",
-                        width=250,
-                    )
-                )
-
             # Header with back button
             header = ft.Container(
                 content=ft.Row(
@@ -5267,29 +5191,11 @@ def main(page: ft.Page):
                 bgcolor="#E3F2FD",
             )
 
-            danger_section = ft.Container(
-                content=ft.Column(
-                    [
-                        ft.Text("Danger Zone", size=16, weight="bold", color="red"),
-                        ft.Text(
-                            "Leave the group or delete it completely.",
-                            size=12,
-                            color="grey"
-                        ),
-                        ft.Container(height=10),
-                        *danger_controls,
-                    ],
-                    spacing=6,
-                ),
-                padding=10,
-            )
-
             manage_screen = ft.Container(
                 content=ft.Column(
                     [
                         header,
                         ft.Container(content=members_column, expand=True, padding=10),
-                        danger_section,
                     ],
                     expand=True,
                 ),
@@ -5833,7 +5739,7 @@ def main(page: ft.Page):
                                 content=ft.Row([
                                     ft.Icon(ft.Icons.PEOPLE, size=18),
                                     ft.Text(f"Subscribers ({len(stats['subscribers'])})", size=13)
-                                ], spacing=5),
+                                ], spacing=5, alignment=ft.MainAxisAlignment.CENTER),
                                 on_click=lambda e: show_subscribers_popup(stats['subscribers']),
                                 bgcolor="#2196F3",
                                 color="white",
@@ -5843,7 +5749,7 @@ def main(page: ft.Page):
                                 content=ft.Row([
                                     ft.Icon(ft.Icons.GROUP_ADD, size=18),
                                     ft.Text("Downline", size=13)
-                                ], spacing=5),
+                                ], spacing=5, alignment=ft.MainAxisAlignment.CENTER),
                                 on_click=show_downline_view,
                                 bgcolor="#673AB7",
                                 color="white",
@@ -6138,43 +6044,35 @@ def main(page: ft.Page):
                     except Exception as err:
                         print(f"⚠️ Could not copy referral ID: {err}")
 
-                # ✅ Header: First row with refresh, verified icon, refer button; second row with title
-                header_icon_row = ft.Stack([
-                    ft.Row([
-                        # Left: Refresh Button
-                        ft.IconButton(
-                            icon=ft.Icons.REFRESH,
-                            icon_color="blue",
-                            tooltip="Refresh Stats",
-                            on_click=lambda e: load_promoter_stats(force_refresh=True)
-                        ),
-
-                        # Spacer to spread left/right actions
-                        ft.Container(expand=True),
-
-                        # Right: Refer Promoter Button
-                        ft.Container(
-                            content=refer_promoter_button,
-                            alignment=ft.alignment.center_right
-                        )
-                    ],
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        expand=True,
-                    ),
-                    ft.Container(
-                        content=ft.Icon(ft.Icons.VERIFIED, size=40, color="green"),
-                        alignment=ft.alignment.center
-                    )
-                ], expand=True)
-
                 header_section = ft.Column([
-                    header_icon_row,
+                    ft.Stack(
+                        controls=[
+                            ft.Row(
+                                [
+                                    ft.Icon(ft.Icons.VERIFIED, size=26, color="green"),
+                                    ft.Text("Promoter Dashboard", size=18, weight="bold"),
+                                ],
+                                spacing=6,
+                                alignment=ft.MainAxisAlignment.CENTER,
+                                expand=True,
+                            ),
+                            ft.Align(
+                                alignment=ft.alignment.center_right,
+                                child=ft.IconButton(
+                                    icon=ft.Icons.REFRESH,
+                                    icon_color="blue",
+                                    tooltip="Refresh Stats",
+                                    on_click=lambda e: load_promoter_stats(force_refresh=True)
+                                ),
+                            ),
+                        ],
+                        height=42,
+                    ),
                     ft.Row(
-                        [ft.Text("Promoter Dashboard", size=20, weight="bold")],
+                        [ft.Text("Track your promoter performance", size=12, color="grey")],
                         alignment=ft.MainAxisAlignment.CENTER,
                     ),
-                ], spacing=4)
+                ], spacing=6)
 
                 # Show dashboard with stats
                 promoter_content.controls.extend([
@@ -6213,6 +6111,11 @@ def main(page: ft.Page):
                         bgcolor="#E3F2FD",
                         border_radius=10,
                         width=350
+                    ),
+
+                    ft.Container(
+                        content=refer_promoter_button,
+                        alignment=ft.alignment.center,
                     ),
 
                     ft.Container(height=10),
@@ -6641,11 +6544,12 @@ def main(page: ft.Page):
                     private_chats_cache["loaded"] = True
 
                     try:
-                        unread_private_messages["count"] = sum(
-                            int(chat.get('unread', 0) or 0) for chat in accepted_chats
-                        )
+                        for chat in accepted_chats:
+                            private_unread_counts[chat.get('chat_id')] = int(chat.get('unread', 0) or 0)
+                        unread_private_messages["count"] = sum(private_unread_counts.values())
                     except Exception:
                         unread_private_messages["count"] = 0
+                        private_unread_counts.clear()
                     update_notification_badge()
 
                     # Display
@@ -6667,11 +6571,13 @@ def main(page: ft.Page):
             private_chats_column.controls.clear()
 
             try:
-                unread_private_messages["count"] = sum(
-                    int(chat.get('unread', 0) or 0) for chat in accepted_chats
-                )
+                private_unread_counts.clear()
+                for chat in accepted_chats:
+                    private_unread_counts[chat.get('chat_id')] = int(chat.get('unread', 0) or 0)
+                unread_private_messages["count"] = sum(private_unread_counts.values())
             except Exception:
                 unread_private_messages["count"] = 0
+                private_unread_counts.clear()
             update_notification_badge()
 
             # Count pending requests (only those where this user is receiver)
@@ -8355,10 +8261,13 @@ def main(page: ft.Page):
                         )
                 
                 page.update()
-                
+
                 # Mark as seen if accepted
                 if chat_status == "accepted":
                     db.mark_messages_as_seen(current_chat_id, auth.user_id)
+                    private_unread_counts[current_chat_id] = 0
+                    unread_private_messages["count"] = sum(private_unread_counts.values())
+                    update_notification_badge()
                     
         except Exception as ex:
             print(f"Error displaying messages: {ex}")
@@ -8393,13 +8302,28 @@ def main(page: ft.Page):
         try:
             while not message_queue.empty():
                 update = message_queue.get_nowait()
-                
+
                 if update['type'] == 'update_messages':
                     # Check if we're still on the same chat
                     if update['chat_id'] == current_chat_id and active_screen["current"] == "private_chat":
                         print(f"[QUEUE] Processing update for private chat {update['chat_id']}")
                         display_messages_ui(update['messages'])
+                        private_unread_counts[update['chat_id']] = 0
+                        unread_private_messages["count"] = sum(private_unread_counts.values())
+                        update_notification_badge()
                         page.update()
+                    else:
+                        # Update unread counts for other chats when new messages arrive
+                        try:
+                            unread_count = sum(
+                                1 for msg in update['messages']
+                                if msg.get('sender_id') != auth.user_id and not msg.get('seen', False)
+                            )
+                            private_unread_counts[update['chat_id']] = unread_count
+                            unread_private_messages["count"] = sum(private_unread_counts.values())
+                            update_notification_badge()
+                        except Exception as err:
+                            print(f"[QUEUE] Failed to update unread badge: {err}")
         except queue.Empty:
             pass
         except Exception as e:
