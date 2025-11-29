@@ -50,6 +50,12 @@ jobs:
           # Firebase google-services.json
           mkdir -p android/app
           echo "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+          
+          # ✅ Verify files were created
+          echo "=== Verifying config files ==="
+          ls -lh assets/
+          ls -lh android/app/google-services.json
+          echo "==========================="
 
       - name: Build APK with Flet
         env:
@@ -59,16 +65,55 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           ONESIGNAL_REST_API_KEY: ${{ secrets.ONESIGNAL_REST_API_KEY }}
         run: |
+          echo "🔨 Building Chat App with OneSignal support..."
           flet build apk --verbose
 
       - name: Collect APK
         run: |
           APK_PATH=$(find . -name "*.apk" | head -n 1)
           echo "Found APK at: $APK_PATH"
-          cp "$APK_PATH" ChatApp.apk
+          
+          if [ -f "$APK_PATH" ]; then
+            cp "$APK_PATH" ChatApp.apk
+            echo "✅ APK copied successfully"
+            ls -lh ChatApp.apk
+          else
+            echo "❌ ERROR: No APK found!"
+            exit 1
+          fi
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: ChatApp-APK
           path: ChatApp.apk
+          retention-days: 7
+
+      - name: Build Summary
+        run: |
+          echo "## ✅ Build Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 APK Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **File:** ChatApp.apk" >> $GITHUB_STEP_SUMMARY
+          echo "- **Package:** com.flet.chat_app" >> $GITHUB_STEP_SUMMARY
+          echo "- **OneSignal:** Enabled" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔔 OneSignal App ID" >> $GITHUB_STEP_SUMMARY
+          echo "- Check that your \`ONESIGNAL_APP_ID\` in \`chat_app.py\` matches dashboard" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 Testing Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Download APK from Artifacts above" >> $GITHUB_STEP_SUMMARY
+          echo "2. Install on Android device" >> $GITHUB_STEP_SUMMARY
+          echo "3. Login to app" >> $GITHUB_STEP_SUMMARY
+          echo "4. Wait 15 seconds" >> $GITHUB_STEP_SUMMARY
+          echo "5. Check \`adb logcat | findstr PUSH-DEBUG\`" >> $GITHUB_STEP_SUMMARY
+          echo "6. Verify OneSignal Dashboard shows new user" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🐛 Debug Commands" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "# View OneSignal logs" >> $GITHUB_STEP_SUMMARY
+          echo "adb logcat | findstr PUSH-DEBUG" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Check Firebase database for Player ID" >> $GITHUB_STEP_SUMMARY
+          echo "# Navigate to: /users/<user_id>/onesignal_player_id" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
