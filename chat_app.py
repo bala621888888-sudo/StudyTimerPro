@@ -61,118 +61,116 @@ def push_debug(msg: str):
 class PushNotificationManager:
     def __init__(self, page: ft.Page):
         self.page = page
-        self.enabled = page.platform in ("android", "ios")
+        self.enabled = page.platform in (ft.PagePlatform.ANDROID, ft.PagePlatform.IOS)
         self.onesignal = None
         self.player_id = None
-        self.db_instance = None  # Store DB reference
-        push_debug(f"PushNotificationManager init: platform={page.platform}, enabled={self.enabled}")
+        self.db_instance = None
+        self.current_user_id = None
+        
+        push_debug(f"PushNotificationManager.__init__() called")
+        push_debug(f"  page.platform = {page.platform}")
+        push_debug(f"  enabled = {self.enabled}")
 
     def init_onesignal(self):
-        push_debug("init_onesignal() called")
+        push_debug("=== init_onesignal() START ===")
+        push_debug(f"Platform: {self.page.platform}")
+        push_debug(f"Enabled: {self.enabled}")
+        
         if not self.enabled:
-            push_debug("OneSignal disabled on this platform; skipping init")
+            push_debug("OneSignal DISABLED (not mobile)")
             return
+            
         if self.onesignal:
+            push_debug("OneSignal already initialized")
             return
 
         try:
-            push_debug(f"Creating OneSignal control with APP_ID={ONESIGNAL_APP_ID}")
+            push_debug(f"Creating OneSignal with APP_ID: {ONESIGNAL_APP_ID[:8]}...")
+            
             self.onesignal = fos.OneSignal(
                 settings=fos.OneSignalSettings(app_id=ONESIGNAL_APP_ID),
                 on_notification_opened=self.handle_notification_opened,
                 on_notification_received=self.handle_notification_received,
             )
+            
+            push_debug("OneSignal control created")
             self.page.overlay.append(self.onesignal)
-            push_debug("OneSignal control created and added to page.overlay")
+            push_debug("OneSignal added to page.overlay")
             
-            # Request Android 13+ notification permission
-            self.request_notification_permission()
+            self.page.update()
+            push_debug("=== init_onesignal() SUCCESS ===")
             
         except Exception as exc:
-            push_debug(f"Error initializing OneSignal: {exc}")
+            push_debug(f"ERROR in init_onesignal: {exc}")
+            import traceback
+            push_debug(traceback.format_exc())
     
-    def request_notification_permission(self):
-        """Request notification permission for Android 13+"""
-        try:
-            import platform
-            if platform.system() != 'Android':
-                return
-            
-            # Use Flet's PermissionHandler
-            async def request_async():
-                try:
-                    ph = ft.PermissionHandler()
-                    self.page.overlay.append(ph)
-                    self.page.update()
-                    
-                    status = await ph.check_permission_async(ft.PermissionType.NOTIFICATION)
-                    push_debug(f"Notification permission status: {status}")
-                    
-                    if status != ft.PermissionStatus.GRANTED:
-                        result = await ph.request_permission_async(ft.PermissionType.NOTIFICATION)
-                        push_debug(f"Permission request result: {result}")
-                        return result == ft.PermissionStatus.GRANTED
-                    
-                    return True
-                except Exception as ex:
-                    push_debug(f"Permission request error: {ex}")
-                    return False
-            
-            # Run async in thread
-            import asyncio
-            try:
-                asyncio.run(request_async())
-            except:
-                # Already in event loop, schedule it
-                asyncio.create_task(request_async())
-                
-        except Exception as exc:
-            push_debug(f"Permission request error: {exc}")
-    
-    def get_player_id_delayed(self, delay=5):
-        """Retrieve OneSignal ID after delay (async registration takes time)"""
+    def get_player_id_delayed(self, delay=10):
+        """Retrieve OneSignal ID after delay - matches test app timing"""
+        push_debug(f"get_player_id_delayed() scheduled for {delay}s")
+        
         def delayed_retrieval():
+            push_debug(f"[After {delay}s] Attempting to get Player ID...")
             time.sleep(delay)
+            
             try:
-                if self.onesignal:
-                    # Try to get OneSignal ID
-                    self.player_id = self.onesignal.get_onesignal_id()
-                    
-                    if self.player_id:
-                        push_debug(f"✅ OneSignal Player ID retrieved: {self.player_id}")
-                        
-                        # Save to Firebase if we have db instance and user_id
-                        if self.db_instance and hasattr(self, 'current_user_id') and self.current_user_id:
-                            success = self.db_instance.save_user_onesignal_id(
-                                self.current_user_id, 
-                                self.player_id
-                            )
-                            if success:
-                                push_debug(f"✅ Saved Player ID to Firebase for user {self.current_user_id}")
-                            else:
-                                push_debug("⚠ Failed to save Player ID to Firebase")
-                    else:
-                        push_debug("⚠ OneSignal Player ID is still None - device may not be registered yet")
-                        # Retry once more after another delay
+                if not self.onesignal:
+                    push_debug("ERROR: onesignal is None!")
+                    return
+                
+                # Try to get OneSignal ID
+                self.player_id = self.onesignal.get_onesignal_id()
+                push_debug(f"get_onesignal_id() returned: {self.player_id}")
+                
+                # ✅ FIX: Check if it's the error string from test app
+                if self.player_id and isinstance(self.player_id, str):
+                    if "does not exist" in self.player_id.lower():
+                        push_debug("⚠️ Got error string, retrying in 5s...")
                         time.sleep(5)
                         self.player_id = self.onesignal.get_onesignal_id()
-                        if self.player_id:
-                            push_debug(f"✅ OneSignal Player ID retrieved on retry: {self.player_id}")
-                            if self.db_instance and hasattr(self, 'current_user_id') and self.current_user_id:
-                                self.db_instance.save_user_onesignal_id(self.current_user_id, self.player_id)
+                        push_debug(f"Retry result: {self.player_id}")
+                
+                if self.player_id and isinstance(self.player_id, str) and "does not exist" not in self.player_id.lower():
+                    push_debug(f"✅ SUCCESS! Player ID: {self.player_id}")
+                    
+                    # Save to Firebase
+                    if self.db_instance and self.current_user_id:
+                        push_debug(f"Saving to Firebase for user: {self.current_user_id}")
+                        success = self.db_instance.save_user_onesignal_id(
+                            self.current_user_id, 
+                            self.player_id
+                        )
+                        if success:
+                            push_debug("✅ Saved to Firebase successfully")
                         else:
-                            push_debug("❌ OneSignal Player ID still None after retry")
+                            push_debug("⚠️ Failed to save to Firebase")
+                else:
+                    push_debug(f"⚠️ Player ID invalid or None: {self.player_id}")
+                    
             except Exception as exc:
-                push_debug(f"Error retrieving OneSignal ID: {exc}")
+                push_debug(f"ERROR in get_player_id_delayed: {exc}")
+                import traceback
+                push_debug(traceback.format_exc())
         
         threading.Thread(target=delayed_retrieval, daemon=True).start()
 
     def login_user(self, user_id: str, db_instance=None):
-        """Login user to OneSignal and retrieve Player ID"""
-        push_debug(f"login_user() called with user_id={user_id}")
+        """Login user to OneSignal - matches test app pattern"""
+        push_debug(f"=== login_user() START ===")
+        push_debug(f"  user_id: {user_id}")
+        push_debug(f"  enabled: {self.enabled}")
+        push_debug(f"  onesignal exists: {self.onesignal is not None}")
         
-        if not self.enabled or not self.onesignal or not user_id:
-            push_debug("login_user skipped: not enabled or missing params")
+        if not self.enabled:
+            push_debug("Skipped: not enabled")
+            return
+            
+        if not self.onesignal:
+            push_debug("ERROR: onesignal is None!")
+            return
+            
+        if not user_id:
+            push_debug("ERROR: user_id is None!")
             return
         
         # Store references
@@ -180,15 +178,17 @@ class PushNotificationManager:
         self.current_user_id = user_id
         
         try:
-            push_debug("Calling OneSignal.login()")
+            push_debug("Calling onesignal.login()...")
             result = self.onesignal.login(user_id)
-            push_debug(f"OneSignal login result: {result}")
+            push_debug(f"login() returned: {result}")
             
-            # Get Player ID after delay (async registration takes time)
-            self.get_player_id_delayed(delay=5)
+            # ✅ Use same timing as test app: 10 seconds
+            self.get_player_id_delayed(delay=10)
             
         except Exception as exc:
-            push_debug(f"OneSignal login error: {exc}")
+            push_debug(f"ERROR in login_user: {exc}")
+            import traceback
+            push_debug(traceback.format_exc())
 
     def logout_user(self):
         push_debug("logout_user() called")
@@ -198,17 +198,19 @@ class PushNotificationManager:
             self.onesignal.logout()
             self.player_id = None
             self.current_user_id = None
-            push_debug("OneSignal logout succeeded")
+            push_debug("Logout successful")
         except Exception as exc:
-            push_debug(f"OneSignal logout error: {exc}")
+            push_debug(f"Logout error: {exc}")
 
     def handle_notification_opened(self, e):
         try:
             notification_opened = getattr(e, "notification_opened", None) or {}
             push_debug(f"Notification OPENED: {notification_opened}")
-            # Handle navigation based on notification data
+            
+            # TODO: Navigate to appropriate chat based on notification data
+            
         except Exception as exc:
-            push_debug(f"Notification opened handler error: {exc}")
+            push_debug(f"Notification opened error: {exc}")
 
     def handle_notification_received(self, e):
         try:
@@ -224,6 +226,7 @@ class PushNotificationManager:
             else:
                 body = str(notification)
 
+            # Show in-app notification banner
             snack = ft.SnackBar(
                 content=ft.Column([
                     ft.Text(title, weight="bold", color="white"),
@@ -237,7 +240,7 @@ class PushNotificationManager:
             self.page.update()
             
         except Exception as exc:
-            push_debug(f"Notification received handler error: {exc}")
+            push_debug(f"Notification received error: {exc}")
 
 # Message listener system
 active_listeners = {}  # Store active listeners
@@ -1891,7 +1894,7 @@ class FirebaseDatabase:
             return None
         except:
             return None
-            
+   
     def save_user_onesignal_id(self, user_id, onesignal_player_id):
         """Save OneSignal player ID for a user"""
         url = f"{self.database_url}/users/{user_id}/onesignal_player_id.json?auth={self.auth_token}"
@@ -1902,7 +1905,7 @@ class FirebaseDatabase:
                 print(f"✅ Saved OneSignal ID to Firebase: {onesignal_player_id}")
                 return True
             else:
-                print(f"⚠ Failed to save OneSignal ID: {response.status_code}")
+                print(f"⚠️ Failed to save OneSignal ID: {response.status_code}")
                 return False
         except Exception as e:
             print(f"❌ Error saving OneSignal ID: {e}")
@@ -1915,7 +1918,10 @@ class FirebaseDatabase:
         try:
             response = requests.get(url)
             if response.status_code == 200:
-                return response.json()
+                player_id = response.json()
+                # ✅ Validate it's a real UUID, not an error string
+                if player_id and isinstance(player_id, str) and "does not exist" not in player_id.lower():
+                    return player_id
             return None
         except Exception as e:
             print(f"❌ Error getting OneSignal ID: {e}")
@@ -1928,20 +1934,19 @@ class FirebaseDatabase:
             onesignal_player_id = self.get_user_onesignal_id(receiver_user_id)
             
             if not onesignal_player_id:
-                print(f"⚠ No OneSignal player ID for user {receiver_user_id}")
+                print(f"⚠️ No OneSignal player ID for user {receiver_user_id}")
                 return False
             
-            # Get OneSignal REST API key from environment
+            # Get OneSignal REST API key
             onesignal_api_key = os.environ.get("ONESIGNAL_REST_API_KEY")
             if not onesignal_api_key:
-                # Try to get from secrets_util
                 try:
                     onesignal_api_key = get_secret("ONESIGNAL_REST_API_KEY")
                 except:
                     pass
             
             if not onesignal_api_key:
-                print("⚠ ONESIGNAL_REST_API_KEY not configured")
+                print("⚠️ ONESIGNAL_REST_API_KEY not configured")
                 return False
             
             url = "https://onesignal.com/api/v1/notifications"
@@ -2773,6 +2778,14 @@ def main(page: ft.Page):
     
     page.update = safe_update
 
+    # ✅ Debug info at startup
+    print(f"=== APP STARTUP DEBUG ===")
+    print(f"page.platform: {page.platform}")
+    print(f"Platform type: {type(page.platform)}")
+    print(f"Is Android: {page.platform == ft.PagePlatform.ANDROID}")
+    print(f"ONESIGNAL_APP_ID: {ONESIGNAL_APP_ID[:8]}...")
+    print(f"========================")
+
     push_manager = PushNotificationManager(page)
     push_manager.init_onesignal()
     push_debug("PushNotificationManager created and initialized in main()")
@@ -3225,7 +3238,7 @@ def main(page: ft.Page):
 
                     group_info = {}
                     print("✓ Auto-login successful")
-                    push_debug(f"Login success: calling login_user() with uid={auth.user_id}")
+                    push_debug(f"Auto-login success: calling login_user() with uid={auth.user_id}")
                     push_manager.login_user(auth.user_id, db_instance=db)
                     show_main_menu()
                     
@@ -7959,33 +7972,24 @@ def main(page: ft.Page):
                 )
             
                 if success:
-                    # ✅ Send push notification to receiver
+                    # ✅ Send push notification
                     try:
                         receiver_id = current_chat_user.get('id') if current_chat_user else None
                         if receiver_id:
-                            # Determine notification title based on admin status
-                            if is_admin or user_is_group_admin:
-                                notification_title = f"👑 Admin {current_username}"
-                            else:
-                                notification_title = f"💬 {current_username}"
-                            
                             threading.Thread(
                                 target=db.send_onesignal_notification,
                                 args=(
                                     receiver_id,
-                                    notification_title,
-                                    message_text[:100],  # First 100 chars
+                                    f"💬 {current_username}",
+                                    message_text[:100],
                                     {
                                         "chat_id": current_chat_id,
                                         "sender_id": auth.user_id,
-                                        "sender_name": current_username,
-                                        "type": "new_message",
-                                        "is_admin": is_admin or user_is_group_admin
+                                        "type": "new_message"
                                     }
                                 ),
                                 daemon=True
                             ).start()
-                            print(f"[NOTIFICATION] Queued push notification to {receiver_id}")
                     except Exception as notif_error:
                         print(f"[NOTIFICATION ERROR] {notif_error}")
                 else:
