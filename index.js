@@ -2,6 +2,7 @@ const {onSchedule} = require("firebase-functions/v2/scheduler");
 const admin = require("firebase-admin");
 const functions = require("firebase-functions");
 const axios = require("axios");
+const FormData = require("form-data");
 
 // ✅ Get bot token from environment variable (Cloud Functions v2)
 function getTelegramToken() {
@@ -63,6 +64,16 @@ function getTargetOnlinePercentage(hour) {
   if (hour >= 5 && hour < 8) return { min: 0.15, max: 0.35 };  // 5 AM - 8 AM: 15-35%
   if (hour >= 17 && hour < 22) return { min: 0.30, max: 0.60 }; // 5 PM - 10 PM: 30-60%
   return { min: 0.10, max: 0.40 }; // Rest of time: 10-40%
+}
+
+function isWithinReportWindow(istTime) {
+  const hour = istTime.getUTCHours();
+  const minute = istTime.getUTCMinutes();
+
+  return (
+    (hour === 23 && minute >= 55) || // 11:55 PM - 11:59 PM IST
+    (hour === 0 && minute <= 5)      // 12:00 AM - 12:05 AM IST
+  );
 }
 
 // Initialize user performance profile (ONLY for fake active users)
@@ -538,10 +549,99 @@ async function runLeaderboardUpdate() {
   }
 }
 
+async function sendTelegramReport(chatId, pdfBase64, filename) {
+  const TELEGRAM_BOT_TOKEN = getTelegramToken();
+
+  if (!TELEGRAM_BOT_TOKEN) {
+    console.error('Telegram bot token not configured');
+    return false;
+  }
+
+  if (!chatId || !pdfBase64) {
+    return false;
+  }
+
+  try {
+    const formData = new FormData();
+    formData.append('chat_id', chatId);
+    formData.append('document', Buffer.from(pdfBase64, 'base64'), {
+      filename: filename || 'Study_Report.pdf',
+    });
+
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`;
+    const response = await axios.post(url, formData, {
+      headers: formData.getHeaders(),
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+    });
+
+    return response.data.ok === true;
+  } catch (error) {
+    console.error(`Failed to send report to ${chatId}:`, error.message);
+    return false;
+  }
+}
+
+async function processStudyReports(istTime) {
+  const todayKey = istTime.toISOString().slice(0, 10);
+  const snapshot = await db.ref('studyReports').once('value');
+
+  if (!snapshot.exists()) {
+    console.log('ℹ️ No study reports queued for dispatch');
+    return { sent: 0, cleaned: 0 };
+  }
+
+  const reports = snapshot.val();
+  const updates = {};
+  let sentCount = 0;
+  let cleanedCount = 0;
+
+  for (const [uid, userReports] of Object.entries(reports)) {
+    if (!userReports || typeof userReports !== 'object') continue;
+
+    for (const [reportDateKey, reportData] of Object.entries(userReports)) {
+      if (!reportData) {
+        updates[`studyReports/${uid}/${reportDateKey}`] = null;
+        cleanedCount++;
+        continue;
+      }
+
+      const reportDate = reportData.reportDate || reportDateKey;
+      if (reportDate !== todayKey) continue;
+
+      const pdfBase64 = reportData.pdfBase64 || reportData.pdf;
+      const chatId = reportData.telegramChatId || reportData.chatId;
+
+      if (!pdfBase64 || !chatId) {
+        updates[`studyReports/${uid}/${reportDateKey}`] = null;
+        cleanedCount++;
+        continue;
+      }
+
+      const sent = await sendTelegramReport(chatId, pdfBase64, `Study_Report_${reportDate}.pdf`);
+      if (sent) {
+        sentCount++;
+        updates[`studyReports/${uid}/${reportDateKey}`] = null;
+        updates[`_reportLogs/${uid}/${reportDate}`] = {
+          sentAt: istTime.toISOString(),
+          via: 'auto_scheduler',
+        };
+      }
+    }
+  }
+
+  if (Object.keys(updates).length > 0) {
+    await db.ref().update(updates);
+  }
+
+  console.log(`📤 Auto study reports sent: ${sentCount}, cleaned: ${cleanedCount}`);
+  return { sent: sentCount, cleaned: cleanedCount };
+}
+
 async function runNotificationCheck() {
   try {
     console.log('\n🔔 NOTIFICATION CHECK STARTED');
-    
+
     const now = new Date();
     const istOffset = 5.5 * 60 * 60 * 1000;
     const istTime = new Date(now.getTime() + istOffset);
@@ -550,16 +650,16 @@ async function runNotificationCheck() {
     console.log(`⏰ Current IST time: ${currentTime}`);
     
     const groupsSnapshot = await db.ref('studyGroups').once('value');
-    
+
     if (!groupsSnapshot.exists()) {
       console.log('❌ No groups found');
-      return null;
     }
-    
-    const groups = groupsSnapshot.val();
+
+    const groups = groupsSnapshot.val() || {};
     let notificationsSent = 0;
     let plansChecked = 0;
     let sessionsChecked = 0;
+    let reportSummary = { sent: 0, cleaned: 0 };
     
     for (const [groupId, groupData] of Object.entries(groups)) {
       const groupName = groupData.metadata?.name || 'Study Group';
@@ -645,10 +745,20 @@ async function runNotificationCheck() {
         }
       }
     }
-    
-    console.log(`📊 Plans: ${plansChecked}, Sessions: ${sessionsChecked}, Sent: ${notificationsSent}`);
+
+    if (isWithinReportWindow(istTime)) {
+      try {
+        reportSummary = await processStudyReports(istTime);
+      } catch (error) {
+        console.error('Auto report dispatch error:', error.message);
+      }
+    } else {
+      console.log('📭 Outside auto-report window, skipping dispatch check');
+    }
+
+    console.log(`📊 Plans: ${plansChecked}, Sessions: ${sessionsChecked}, Sent: ${notificationsSent}, Reports: ${reportSummary.sent}`);
     return null;
-    
+
   } catch (error) {
     console.error('Notification check error:', error);
     return null;
