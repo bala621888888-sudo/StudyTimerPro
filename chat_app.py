@@ -49,6 +49,7 @@ except AttributeError:  # pragma: no cover - compatibility shim
     ICONS = _Icons()
 
 ONESIGNAL_APP_ID = "6bb7df1b-6014-498a-ac2e-67abb63e4751"
+ONESIGNAL_REST_API_KEY = "os_v2_app_no356g3acreyvlbom6v3mpshkgsqs54zgyeuoxv6jkcmhcemp5x64wi3ulleqo4ykcl4b3vxomf5gs2mcs6p6y5eeai6quwkg7pxooa" 
 
 PUSH_DEBUG = True
 
@@ -1930,25 +1931,32 @@ class FirebaseDatabase:
     def send_onesignal_notification(self, receiver_user_id, title, message, data=None):
         """Send notification via OneSignal REST API"""
         try:
-            # Get receiver's OneSignal Player ID from Firebase
+            print(f"[NOTIFICATION] ===== NOTIFICATION REQUEST START =====")
+            print(f"[NOTIFICATION] Receiver User ID: {receiver_user_id}")
+            print(f"[NOTIFICATION] Title: {title}")
+            print(f"[NOTIFICATION] Message: {message[:100]}")
+            
+            # Step 1: Get receiver's OneSignal Player ID from Firebase
             onesignal_player_id = self.get_user_onesignal_id(receiver_user_id)
+            print(f"[NOTIFICATION] Player ID from Firebase: {onesignal_player_id}")
             
             if not onesignal_player_id:
-                print(f"⚠️ No OneSignal player ID for user {receiver_user_id}")
+                print(f"[NOTIFICATION] ❌ FAILED: No Player ID in Firebase for user {receiver_user_id}")
+                print(f"[NOTIFICATION] → User needs to login to register device")
+                print(f"[NOTIFICATION] ===== END =====")
                 return False
             
-            # Get OneSignal REST API key
-            onesignal_api_key = os.environ.get("ONESIGNAL_REST_API_KEY")
-            if not onesignal_api_key:
-                try:
-                    onesignal_api_key = get_secret("ONESIGNAL_REST_API_KEY")
-                except:
-                    pass
+            # Step 2: Get REST API Key (hardcoded)
+            onesignal_api_key = ONESIGNAL_REST_API_KEY
+            print(f"[NOTIFICATION] REST API Key: {onesignal_api_key[:10]}... (length: {len(onesignal_api_key)})")
             
-            if not onesignal_api_key:
-                print("⚠️ ONESIGNAL_REST_API_KEY not configured")
+            if not onesignal_api_key or len(onesignal_api_key) < 20:
+                print(f"[NOTIFICATION] ❌ FAILED: REST API Key not configured or invalid")
+                print(f"[NOTIFICATION] → Add your REST API Key at top of chat_app.py")
+                print(f"[NOTIFICATION] ===== END =====")
                 return False
             
+            # Step 3: Prepare OneSignal API request
             url = "https://onesignal.com/api/v1/notifications"
             
             headers = {
@@ -1961,20 +1969,49 @@ class FirebaseDatabase:
                 "include_player_ids": [onesignal_player_id],
                 "headings": {"en": title},
                 "contents": {"en": message},
-                "data": data or {}
+                "data": data or {},
+                "android_channel_id": "default",  # Use default notification channel
             }
             
+            print(f"[NOTIFICATION] API URL: {url}")
+            print(f"[NOTIFICATION] App ID: {ONESIGNAL_APP_ID}")
+            print(f"[NOTIFICATION] Target Player ID: {onesignal_player_id}")
+            print(f"[NOTIFICATION] Sending request...")
+            
+            # Step 4: Send notification
             response = requests.post(url, json=payload, headers=headers, timeout=10)
             
+            print(f"[NOTIFICATION] Response Status: {response.status_code}")
+            print(f"[NOTIFICATION] Response Body: {response.text}")
+            
+            # Step 5: Check result
             if response.status_code == 200:
-                print(f"✅ Notification sent to {receiver_user_id}")
+                response_data = response.json()
+                recipients = response_data.get('recipients', 0)
+                print(f"[NOTIFICATION] ✅ SUCCESS: Sent to {recipients} device(s)")
+                
+                if recipients == 0:
+                    print(f"[NOTIFICATION] ⚠️ WARNING: 0 recipients - Player ID may be invalid or device unsubscribed")
+                
+                print(f"[NOTIFICATION] ===== END =====")
                 return True
             else:
-                print(f"❌ Notification failed: {response.status_code} - {response.text}")
+                print(f"[NOTIFICATION] ❌ FAILED: HTTP {response.status_code}")
+                
+                try:
+                    error_data = response.json()
+                    print(f"[NOTIFICATION] Error details: {error_data}")
+                except:
+                    print(f"[NOTIFICATION] Error body: {response.text}")
+                
+                print(f"[NOTIFICATION] ===== END =====")
                 return False
                 
         except Exception as e:
-            print(f"❌ Notification error: {e}")
+            print(f"[NOTIFICATION] ❌ EXCEPTION: {e}")
+            import traceback
+            print(traceback.format_exc())
+            print(f"[NOTIFICATION] ===== END =====")
             return False
 
 def format_file_size(size_bytes):
@@ -7972,26 +8009,35 @@ def main(page: ft.Page):
                 )
             
                 if success:
-                    # ✅ Send push notification
+                    # ✅ Send push notification - DON'T use threading here, we're already in a thread
                     try:
                         receiver_id = current_chat_user.get('id') if current_chat_user else None
-                        if receiver_id:
-                            threading.Thread(
-                                target=db.send_onesignal_notification,
-                                args=(
-                                    receiver_id,
-                                    f"💬 {current_username}",
-                                    message_text[:100],
-                                    {
-                                        "chat_id": current_chat_id,
-                                        "sender_id": auth.user_id,
-                                        "type": "new_message"
-                                    }
-                                ),
-                                daemon=True
-                            ).start()
+                        if receiver_id and receiver_id != auth.user_id:
+                            print(f"[MESSAGE] Sent successfully, now sending notification to {receiver_id}")
+                            
+                            # Determine notification title
+                            if is_admin or user_is_group_admin:
+                                notification_title = f"👑 Admin {current_username}"
+                            else:
+                                notification_title = f"💬 {current_username}"
+                            
+                            # Send notification (synchronously - we're already in background thread)
+                            db.send_onesignal_notification(
+                                receiver_id,
+                                notification_title,
+                                message_text[:100],
+                                {
+                                    "chat_id": current_chat_id,
+                                    "sender_id": auth.user_id,
+                                    "sender_name": current_username,
+                                    "type": "new_message",
+                                    "is_admin": is_admin or user_is_group_admin
+                                }
+                            )
                     except Exception as notif_error:
                         print(f"[NOTIFICATION ERROR] {notif_error}")
+                        import traceback
+                        traceback.print_exc()
                 else:
                     show_snackbar("Failed to send message")
                     
@@ -8572,14 +8618,14 @@ def main(page: ft.Page):
                 if success:
                     # ✅ Send push notifications to all group members
                     try:
-                        # Get current group info for group name
+                        # Get current group info
                         group_info_data = db.get_group_info_by_id(current_group_id)
                         group_name = group_info_data.get('name', 'Group') if group_info_data else 'Group'
                         
                         # Get all group members
                         members = db.get_group_members_by_id(current_group_id)
                         
-                        # Determine notification title based on admin status
+                        # Determine notification content
                         if is_admin or user_is_group_admin:
                             notification_title = f"👑 {group_name}"
                             sender_prefix = f"👑 {current_username}"
@@ -8589,33 +8635,38 @@ def main(page: ft.Page):
                         
                         notification_body = f"{sender_prefix}: {message_text[:80]}"
                         
+                        print(f"[GROUP-NOTIFICATION] Sending to {len(members)} members")
+                        
                         # Send notification to each member (except sender)
+                        notification_count = 0
                         for member in members:
                             member_id = member.get('id')
-                            if member_id and member_id != auth.user_id:  # Don't send to self
-                                threading.Thread(
-                                    target=db.send_onesignal_notification,
-                                    args=(
-                                        member_id,
-                                        notification_title,
-                                        notification_body,
-                                        {
-                                            "group_id": current_group_id,
-                                            "group_name": group_name,
-                                            "sender_id": auth.user_id,
-                                            "sender_name": current_username,
-                                            "type": "group_message",
-                                            "is_admin": is_admin or user_is_group_admin
-                                        }
-                                    ),
-                                    daemon=True
-                                ).start()
+                            if member_id and member_id != auth.user_id:
+                                print(f"[GROUP-NOTIFICATION] Sending to member: {member_id}")
+                                
+                                result = db.send_onesignal_notification(
+                                    member_id,
+                                    notification_title,
+                                    notification_body,
+                                    {
+                                        "group_id": current_group_id,
+                                        "group_name": group_name,
+                                        "sender_id": auth.user_id,
+                                        "sender_name": current_username,
+                                        "type": "group_message",
+                                        "is_admin": is_admin or user_is_group_admin
+                                    }
+                                )
+                                
+                                if result:
+                                    notification_count += 1
                         
-                        if members:
-                            print(f"[NOTIFICATION] Queued push notifications to {len(members)-1} group members")
+                        print(f"[GROUP-NOTIFICATION] Sent to {notification_count}/{len(members)-1} members")
                             
                     except Exception as notif_error:
-                        print(f"[NOTIFICATION ERROR] {notif_error}")
+                        print(f"[GROUP-NOTIFICATION ERROR] {notif_error}")
+                        import traceback
+                        traceback.print_exc()
                 else:
                     show_snackbar("Failed to send message")
         
