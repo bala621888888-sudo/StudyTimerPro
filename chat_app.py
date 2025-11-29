@@ -2789,7 +2789,6 @@ def main(page: ft.Page):
     loading_container = ft.Container(
         content=ft.Column([
             ft.ProgressRing(width=50, height=50),
-            ft.Text("Initializing storage...", size=16)
         ], horizontal_alignment="center", spacing=20),
         expand=True,
         alignment=ft.alignment.center
@@ -5237,9 +5236,12 @@ def main(page: ft.Page):
         promoter_status = profile.get("promoter_status", {}) if profile else {}
         is_registered_promoter = promoter_status.get("registered", False)
         promoter_referral_id = promoter_status.get("referral_id", "")
-        
+
         # State for showing registration form
         show_registration_form = {"visible": False}
+
+        # Track promoter screen initialization to avoid unnecessary reloads
+        promoter_screen_initialized = False
 
         # Stats container (will be updated when stats are loaded)
         stats_container = ft.Column([], spacing=10)
@@ -6019,6 +6021,7 @@ def main(page: ft.Page):
         
         def refresh_promoter_screen():
             """Refresh the promoter screen content"""
+            nonlocal promoter_screen_initialized
             # Always reload status from Firebase first
             reload_promoter_status()
 
@@ -6218,7 +6221,8 @@ def main(page: ft.Page):
                             height=50
                         )
                     ])
-            
+
+            promoter_screen_initialized = True
             page.update()
         
         # Main promoter content container
@@ -6803,7 +6807,8 @@ def main(page: ft.Page):
                     print(f"[TAB FALLBACK] {tab_ex}")
 
             if selected_index == 0:
-                refresh_promoter_screen()
+                if not promoter_screen_initialized:
+                    refresh_promoter_screen()
             elif selected_index == 1:
                 # Groups already loaded
                 pass
