@@ -1465,7 +1465,7 @@ class FirebaseDatabase:
                     for group_id, group_data in groups_data.items():
                         info = group_data.get('info', {})
                         members = group_data.get('members', {})
-                        
+
                         groups_list.append({
                             'id': group_id,
                             'name': info.get('name', 'Unnamed Group'),
@@ -1475,7 +1475,8 @@ class FirebaseDatabase:
                             'created_by': info.get('created_by'),
                             'created_at': info.get('created_at', 0),
                             'member_count': len(members),
-                            'members': members
+                            'members': members,
+                            'category': info.get('category', 'None')
                         })
                     
                     groups_list.sort(key=lambda x: x.get('created_at', 0), reverse=True)
@@ -4273,12 +4274,25 @@ def main(page: ft.Page):
                     group_icon_url = group.get('icon_url')
                     group_icon_emoji = group.get('icon', '👥')
                     member_count = group.get('member_count', 0)
-                    
+                    category = group.get('category', 'None')
+                    members = group.get('members', {}) or {}
+                    is_member = auth.user_id in members
+
+                    category_styles = {
+                        "Gold": {"border": "#FFD700", "icon_color": "#DAA520"},
+                        "Platinum": {"border": "#E5E4E2", "icon_color": "#9C27B0"},
+                        "Bronze": {"border": "#CD7F32", "icon_color": "#CD7F32"},
+                    }
+
+                    border_color = category_styles.get(category, {}).get("border", "#E0E0E0")
+                    category_icon_color = category_styles.get(category, {}).get("icon_color", "#757575")
+                    show_category_badge = category in category_styles
+
                     if group_icon_url:
                         cached_icon = ImageCache.get_cached_image(group_icon_url, "group")
                         if cached_icon:
                             group_icon_widget = ft.Image(
-                                src=cached_icon, width=50, height=50, 
+                                src=cached_icon, width=50, height=50,
                                 fit=ft.ImageFit.COVER, border_radius=25
                             )
                         else:
@@ -4286,24 +4300,52 @@ def main(page: ft.Page):
                             ImageCache.download_image(group_icon_url, None, "group")
                     else:
                         group_icon_widget = ft.Text(group_icon_emoji, size=32)
-                    
+
+                    category_badge = ft.Container(
+                        content=ft.Row([
+                            ft.Text("👑", size=14, color=category_icon_color),
+                            ft.Text(category, size=12, color=category_icon_color)
+                        ], spacing=4),
+                        padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                        border_radius=20,
+                        bgcolor="#FFF8E1",
+                        visible=show_category_badge
+                    )
+
+                    lock_icon = ft.Icon(
+                        ft.Icons.LOCK,
+                        color="#757575",
+                        size=18,
+                        visible=not is_member
+                    )
+
+                    title_row = ft.Row(
+                        [
+                            ft.Text(group_name, size=16, weight="bold", expand=True),
+                            category_badge,
+                            lock_icon,
+                        ],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    )
+
                     group_card = ft.Container(
                         content=ft.Row([
                             group_icon_widget,
                             ft.Column([
-                                ft.Text(group_name, size=16, weight="bold"),
+                                title_row,
                                 ft.Text(f"{member_count} members", size=12, color="grey"),
-                                ft.Text((group_desc[:50] + "...") if len(group_desc) > 50 else group_desc, 
+                                ft.Text((group_desc[:50] + "...") if len(group_desc) > 50 else group_desc,
                                        size=11, color="grey")
-                            ], spacing=2, expand=True),
+                            ], spacing=4, expand=True),
                             ft.Icon(ft.Icons.CHEVRON_RIGHT, color="grey")
                         ], spacing=15),
                         padding=15,
-                        border=ft.border.all(1, "#E0E0E0"),
+                        border=ft.border.all(1, border_color),
                         border_radius=10,
                         on_click=lambda e, gid=group_id: open_specific_group_chat(gid)
                     )
-                    
+
                     groups_list_column.controls.append(group_card)
                 
                 page.update()
