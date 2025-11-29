@@ -319,11 +319,12 @@ MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB in bytes
 # ============================================
 class MessageListener:
     """Firebase real-time message listener using polling"""
-    
-    def __init__(self, chat_id, callback, db_instance):
+
+    def __init__(self, chat_id, callback, db_instance, is_group=False):
         self.chat_id = chat_id
         self.callback = callback
         self.db = db_instance
+        self.is_group = is_group
         self.running = False
         self.thread = None
         self.last_message_count = 0
@@ -359,7 +360,10 @@ class MessageListener:
                 self.last_check = current_time
                 
                 # Fetch latest messages
-                messages = self.db.get_messages(self.chat_id)
+                if self.is_group:
+                    messages = self.db.get_group_messages_by_id(self.chat_id)
+                else:
+                    messages = self.db.get_messages(self.chat_id)
                 
                 if messages:
                     message_count = len(messages)
@@ -886,11 +890,12 @@ class FirebaseStorage:
 
 class MessageListener:
     """Firebase real-time message listener using polling"""
-    
-    def __init__(self, chat_id, callback, db_instance):
+
+    def __init__(self, chat_id, callback, db_instance, is_group=False):
         self.chat_id = chat_id
         self.callback = callback
         self.db = db_instance
+        self.is_group = is_group
         self.running = False
         self.thread = None
         self.last_message_count = 0
@@ -926,7 +931,10 @@ class MessageListener:
                 self.last_check = current_time
                 
                 # Fetch latest messages
-                messages = self.db.get_messages(self.chat_id)
+                if self.is_group:
+                    messages = self.db.get_group_messages_by_id(self.chat_id)
+                else:
+                    messages = self.db.get_messages(self.chat_id)
                 
                 if messages:
                     message_count = len(messages)
@@ -2025,7 +2033,7 @@ def format_file_size(size_bytes):
 # ============================================
 # LISTENER MANAGEMENT FUNCTIONS
 # ============================================
-def start_message_listener(chat_id, db_instance, page_ref):
+def start_message_listener(chat_id, db_instance, page_ref, is_group=False):
     """Start a real-time listener for a chat"""
     global active_listeners
     
@@ -2048,7 +2056,7 @@ def start_message_listener(chat_id, db_instance, page_ref):
             except Exception as e:
                 print(f"[CALLBACK ERROR] {e}")
         
-        listener = MessageListener(chat_id, on_new_messages, db_instance)
+        listener = MessageListener(chat_id, on_new_messages, db_instance, is_group=is_group)
         listener.start()
         active_listeners[chat_id] = listener
         
@@ -4659,7 +4667,7 @@ def main(page: ft.Page):
             load_specific_group_messages(group_id)
             
             # Start real-time listener for this group
-            start_message_listener(group_id, db, page)
+            start_message_listener(group_id, db, page, is_group=True)
             print(f"[DEBUG] Started listener for group chat: {group_id}")
             
             # ✅ Start auto-refresh timer
@@ -6038,12 +6046,8 @@ def main(page: ft.Page):
                 header_section = ft.Column([
                     ft.Row(
                         [
-                            ft.IconButton(
-                                icon=ft.Icons.REFRESH,
-                                icon_color="blue",
-                                tooltip="Refresh Stats",
-                                on_click=lambda e: load_promoter_stats(force_refresh=True)
-                            ),
+                            # Placeholder keeps the title perfectly centered even with refresh button
+                            ft.Container(width=48),
                             ft.Container(
                                 content=ft.Row(
                                     [
@@ -6056,8 +6060,14 @@ def main(page: ft.Page):
                                 expand=True,
                                 alignment=ft.alignment.center,
                             ),
+                            ft.IconButton(
+                                icon=ft.Icons.REFRESH,
+                                icon_color="blue",
+                                tooltip="Refresh Stats",
+                                on_click=lambda e: load_promoter_stats(force_refresh=True)
+                            ),
                         ],
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        alignment=ft.MainAxisAlignment.CENTER,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                     ft.Row(
@@ -8413,7 +8423,7 @@ def main(page: ft.Page):
         load_messages()
         
         # Start real-time listener for this chat
-        start_message_listener(current_chat_id, db, page)
+        start_message_listener(current_chat_id, db, page, is_group=False)
         print(f"[DEBUG] Started listener for private chat: {current_chat_id}")
         # ✅ Start auto-refresh timer
         start_auto_refresh_messages(interval=5)
