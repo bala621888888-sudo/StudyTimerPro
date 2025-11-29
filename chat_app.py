@@ -7586,11 +7586,16 @@ def main(page: ft.Page):
         return f"{ids[0]}_{ids[1]}"
     
     def open_chat(user_data):
-        nonlocal current_chat_id, current_chat_user
-        current_chat_user = user_data
-        # CRITICAL: Create unique chat ID for this specific conversation
+        nonlocal current_chat_id, current_chat_user  # ← Make sure this is here!
+        
+        print(f'[DEBUG] open_chat() called with user_data: {user_data}')
+        
+        current_chat_user = user_data  # ← This MUST be set
         current_chat_id = create_chat_id(auth.user_id, user_data['id'])
-        print(f"Opening chat with {user_data.get('username')} - Chat ID: {current_chat_id}")  # Debug
+        
+        print(f'[DEBUG] Set current_chat_user: {current_chat_user}')
+        print(f'[DEBUG] Set current_chat_id: {current_chat_id}')
+        
         show_chat_screen()
     
     def load_users():
@@ -7858,32 +7863,34 @@ def main(page: ft.Page):
 
     
     def send_message(e=None):
-        print('[DEBUG] send_message clicked')
+        print('[DEBUG] ========== send_message() START ==========')
         try:
             if not message_input.value or not message_input.value.strip():
+                print('[DEBUG] No message text, returning')
                 return
             
-            # ADD OFFLINE CHECK:
             if not NetworkChecker.is_online():
+                print('[DEBUG] Offline, showing snackbar')
                 show_snackbar("❌ Cannot send - you're offline")
                 return
         
             message_text = message_input.value.strip()
+            print(f'[DEBUG] Message text: {message_text[:50]}...')
             message_input.value = ""
             page.update()
         
-            # Immediately show the message optimistically
+            # Optimistic UI update (existing code)
             timestamp = datetime.now()
             time_str = timestamp.strftime("%I:%M %p")
-        
+            
             message_content = [
                 ft.Text(message_text, size=14),
                 ft.Row([ft.Text(time_str, size=10)], spacing=2)
             ]
-        
+            
             if is_admin or user_is_group_admin:
                 message_content.insert(0, ft.Text("👑 ADMIN", size=10, weight="bold", color="#FF6F00"))
-        
+            
             message_bubble = ft.Container(
                 content=ft.Column(message_content, spacing=2),
                 bgcolor="#FFD54F" if (is_admin or user_is_group_admin) else "#BBDEFB",
@@ -7891,69 +7898,129 @@ def main(page: ft.Page):
                 padding=10,
                 margin=ft.margin.only(left=50, right=0)
             )
-        
+            
             messages_list.controls.append(
                 ft.Row([message_bubble], alignment="end")
             )
             page.update()
-        
+            
+            print(f'[DEBUG] UI updated, starting background send')
+            print(f'[DEBUG] current_chat_id: {current_chat_id}')
+            print(f'[DEBUG] current_chat_user: {current_chat_user}')
+            print(f'[DEBUG] auth.user_id: {auth.user_id}')
+            
             # Send to Firebase in background
             def send_in_background():
-                # Check if this is the first message (chat request)
-                messages = db.get_messages(current_chat_id)
-                is_first_message = len(messages) == 0
-            
-                if is_first_message:
-                    db.set_chat_requester(current_chat_id, auth.user_id)
-                    db.update_chat_status(current_chat_id, "pending")
-            
-                success = db.send_message(
-                    current_chat_id, 
-                    auth.user_id, 
-                    current_username, 
-                    message_text,
-                    is_admin=(is_admin or user_is_group_admin),
-                    seen=False
-                )
-            
-                if success:
-                    # ✅ Send push notification - DON'T use threading here, we're already in a thread
-                    try:
-                        receiver_id = current_chat_user.get('id') if current_chat_user else None
-                        if receiver_id and receiver_id != auth.user_id:
-                            print(f"[MESSAGE] Sent successfully, now sending notification to {receiver_id}")
-                            
-                            # Determine notification title
-                            if is_admin or user_is_group_admin:
-                                notification_title = f"👑 Admin {current_username}"
-                            else:
-                                notification_title = f"💬 {current_username}"
-                            
-                            # Send notification (synchronously - we're already in background thread)
-                            db.send_onesignal_notification(
-                                receiver_id,
-                                notification_title,
-                                message_text[:100],
-                                {
-                                    "chat_id": current_chat_id,
-                                    "sender_id": auth.user_id,
-                                    "sender_name": current_username,
-                                    "type": "new_message",
-                                    "is_admin": is_admin or user_is_group_admin
-                                }
-                            )
-                    except Exception as notif_error:
-                        print(f"[NOTIFICATION ERROR] {notif_error}")
-                        import traceback
-                        traceback.print_exc()
-                else:
-                    show_snackbar("Failed to send message")
+                print('[DEBUG-THREAD] ========== send_in_background() START ==========')
+                
+                try:
+                    # Check if this is the first message (chat request)
+                    print('[DEBUG-THREAD] Getting existing messages...')
+                    messages = db.get_messages(current_chat_id)
+                    is_first_message = len(messages) == 0
+                    print(f'[DEBUG-THREAD] is_first_message: {is_first_message}')
+                
+                    if is_first_message:
+                        print('[DEBUG-THREAD] First message, setting requester and status')
+                        db.set_chat_requester(current_chat_id, auth.user_id)
+                        db.update_chat_status(current_chat_id, "pending")
+                
+                    print('[DEBUG-THREAD] Sending message to Firebase...')
+                    success = db.send_message(
+                        current_chat_id, 
+                        auth.user_id, 
+                        current_username, 
+                        message_text,
+                        is_admin=(is_admin or user_is_group_admin),
+                        seen=False
+                    )
                     
+                    print(f'[DEBUG-THREAD] Firebase send result: {success}')
+                
+                    if success:
+                        print('[DEBUG-THREAD] ✅ Message sent to Firebase successfully')
+                        
+                        # ========== NOTIFICATION SECTION START ==========
+                        print('[DEBUG-THREAD] ========== NOTIFICATION SECTION START ==========')
+                        
+                        try:
+                            print(f'[DEBUG-THREAD] current_chat_user type: {type(current_chat_user)}')
+                            print(f'[DEBUG-THREAD] current_chat_user value: {current_chat_user}')
+                            
+                            receiver_id = current_chat_user.get('id') if current_chat_user else None
+                            print(f'[DEBUG-THREAD] receiver_id: {receiver_id}')
+                            print(f'[DEBUG-THREAD] auth.user_id: {auth.user_id}')
+                            
+                            if receiver_id:
+                                print(f'[DEBUG-THREAD] Receiver ID exists: {receiver_id}')
+                                
+                                if receiver_id != auth.user_id:
+                                    print('[DEBUG-THREAD] Receiver is not sender (good)')
+                                    
+                                    print('[DEBUG-THREAD] Preparing notification...')
+                                    
+                                    # Determine notification title
+                                    if is_admin or user_is_group_admin:
+                                        notification_title = f"👑 Admin {current_username}"
+                                    else:
+                                        notification_title = f"💬 {current_username}"
+                                    
+                                    print(f'[DEBUG-THREAD] Notification title: {notification_title}')
+                                    print(f'[DEBUG-THREAD] Notification message: {message_text[:100]}')
+                                    
+                                    print('[DEBUG-THREAD] ⚡ CALLING db.send_onesignal_notification() NOW...')
+                                    
+                                    # Call the notification function
+                                    notification_result = db.send_onesignal_notification(
+                                        receiver_id,
+                                        notification_title,
+                                        message_text[:100],
+                                        {
+                                            "chat_id": current_chat_id,
+                                            "sender_id": auth.user_id,
+                                            "sender_name": current_username,
+                                            "type": "new_message",
+                                            "is_admin": is_admin or user_is_group_admin
+                                        }
+                                    )
+                                    
+                                    print(f'[DEBUG-THREAD] ⚡ send_onesignal_notification() returned: {notification_result}')
+                                else:
+                                    print('[DEBUG-THREAD] ⚠️ Receiver is same as sender, skipping notification')
+                            else:
+                                print('[DEBUG-THREAD] ❌ receiver_id is None!')
+                                
+                        except Exception as notif_error:
+                            print(f'[DEBUG-THREAD] ❌❌❌ NOTIFICATION EXCEPTION: {notif_error}')
+                            import traceback
+                            print('[DEBUG-THREAD] Traceback:')
+                            traceback.print_exc()
+                        
+                        print('[DEBUG-THREAD] ========== NOTIFICATION SECTION END ==========')
+                        # ========== NOTIFICATION SECTION END ==========
+                    else:
+                        print('[DEBUG-THREAD] ❌ Firebase send failed')
+                        show_snackbar("Failed to send message")
+                    
+                except Exception as bg_error:
+                    print(f'[DEBUG-THREAD] ❌❌❌ BACKGROUND THREAD EXCEPTION: {bg_error}')
+                    import traceback
+                    print('[DEBUG-THREAD] Traceback:')
+                    traceback.print_exc()
+                
+                print('[DEBUG-THREAD] ========== send_in_background() END ==========')
+            
+            print('[DEBUG] Starting background thread...')
             threading.Thread(target=send_in_background, daemon=True).start()
+            print('[DEBUG] Background thread started')
 
         except Exception as ex:
-            print(f'[ERROR] send_message: {ex}')
+            print(f'[ERROR] ❌❌❌ send_message() EXCEPTION: {ex}')
+            import traceback
+            traceback.print_exc()
             show_snackbar(f'Message send error: {ex}')
+        
+        print('[DEBUG] ========== send_message() END ==========')
 
     def on_file_selected_private(e: ft.FilePickerResultEvent):
         if e.files and len(e.files) > 0:
@@ -8352,7 +8419,7 @@ def main(page: ft.Page):
             show_snackbar(f'Back error: {ex}')
 
     def show_chat_screen():
-        nonlocal displayed_message_ids
+        nonlocal displayed_message_ids, current_chat_user 
         
         active_screen["current"] = "private_chat"  # ADD THIS LINE
         
