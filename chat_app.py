@@ -2136,7 +2136,8 @@ def _load_gsheet_sheet_id():
 
     Priority:
     1) GOOGLE_SHEET_ID env var (PC / dev)
-    2) assets/gsheet_config.json inside packaged app (APK)
+    2) Secret Manager
+    3) assets/gsheet_config.json inside packaged app (APK)
     """
     try:
         env_val = os.environ.get("GOOGLE_SHEET_ID")
@@ -2144,10 +2145,15 @@ def _load_gsheet_sheet_id():
             print("✅ Loaded Google Sheet ID from env")
             return env_val.strip()
 
-        secret_val = get_secret("GOOGLE_SHEET_ID")
-        if secret_val and secret_val.strip():
-            print("✅ Loaded Google Sheet ID from Secret Manager")
-            return secret_val.strip()
+        # Try Secret Manager (might fail due to internet)
+        try:
+            secret_val = get_secret("GOOGLE_SHEET_ID")
+            if secret_val and secret_val.strip():
+                print("✅ Loaded Google Sheet ID from Secret Manager")
+                return secret_val.strip()
+        except Exception as secret_error:
+            print(f"⚠️ Could not fetch Google Sheet ID from Secret Manager (internet issue?): {secret_error}")
+            # Continue to try local files
 
         assets_dir = os.environ.get("FLET_ASSETS_DIR") or "assets"
         candidates = [
@@ -2173,7 +2179,7 @@ def _load_gsheet_sheet_id():
     except Exception as e:
         print(f"⚠️ Error loading Google Sheet ID: {e}")
 
-    print("⚠️ No Google Sheet ID found. Promoter stats disabled.")
+    print("⚠️ No Google Sheet ID found in any location. Promoter stats disabled.")
     return ""
 
 
@@ -5630,13 +5636,26 @@ def main(page: ft.Page):
                     display_cached_promoter_stats(combined_stats)
                     
                 except Exception as e:
+                    error_str = str(e).lower()
                     print(f"Error loading promoter stats: {e}")
+                    
+                    # Detect if it's an internet error
+                    is_internet_error = any(keyword in error_str for keyword in [
+                        'connection', 'network', 'timeout', 'unreachable', 
+                        'getaddrinfo', 'refused', 'ssl', 'certificate'
+                    ])
+                    
+                    error_icon = ft.Icons.WIFI_OFF if is_internet_error else ft.Icons.ERROR
+                    error_text = "No internet connection" if is_internet_error else "Failed to load stats"
+                    error_color = "orange" if is_internet_error else "red"
+                    
                     stats_container.controls.clear()
                     stats_container.controls.append(
                         ft.Container(
                             content=ft.Column([
-                                ft.Icon(ft.Icons.ERROR, size=40, color="red"),
-                                ft.Text("Failed to load stats", size=14, color="red"),
+                                ft.Icon(error_icon, size=40, color=error_color),
+                                ft.Text(error_text, size=14, color=error_color),
+                                ft.Text("Check your connection and try again", size=11, color="grey") if is_internet_error else None,
                                 ft.TextButton("Retry", on_click=lambda e: load_promoter_stats(force_refresh=True))
                             ], horizontal_alignment="center", spacing=10),
                             padding=20
@@ -5766,12 +5785,82 @@ def main(page: ft.Page):
                     )
                 ])
             else:
-                stats_container.controls.append(
+                # ✅ Show structure with zeros instead of "No stats yet"
+                # This motivates users and helps them understand the structure
+                stats_container.controls.extend([
+                    # Earnings Section
                     ft.Container(
-                        content=ft.Text("No stats available yet", size=14, color="grey"),
+                        content=ft.Column([
+                            ft.Text("💰 Earnings", size=16, weight="bold"),
+                            ft.Row([
+                                ft.Container(
+                                    content=ft.Column([
+                                        ft.Text("Total", size=12, color="grey"),
+                                        ft.Text("₹0.00", size=18, weight="bold", color="green")
+                                    ], horizontal_alignment="center", spacing=2),
+                                    expand=True
+                                ),
+                                ft.Container(
+                                    content=ft.Column([
+                                        ft.Text("Paid", size=12, color="grey"),
+                                        ft.Text("₹0.00", size=18, weight="bold", color="blue")
+                                    ], horizontal_alignment="center", spacing=2),
+                                    expand=True
+                                ),
+                                ft.Container(
+                                    content=ft.Column([
+                                        ft.Text("Pending", size=12, color="grey"),
+                                        ft.Text("₹0.00", size=18, weight="bold", color="orange")
+                                    ], horizontal_alignment="center", spacing=2),
+                                    expand=True
+                                ),
+                            ], spacing=5)
+                        ], spacing=8),
+                        padding=15,
+                        bgcolor="#E8F5E9",
+                        border_radius=10
+                    ),
+                    
+                    # Performance Section
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("📊 Performance", size=16, weight="bold"),
+                            ft.Row([
+                                ft.Container(
+                                    content=ft.Column([
+                                        ft.Text("Subscribers", size=12, color="grey"),
+                                        ft.Text("0", size=18, weight="bold")
+                                    ], horizontal_alignment="center", spacing=2),
+                                    expand=True
+                                ),
+                                ft.Container(
+                                    content=ft.Column([
+                                        ft.Text("Active", size=12, color="grey"),
+                                        ft.Text("0", size=18, weight="bold")
+                                    ], horizontal_alignment="center", spacing=2),
+                                    expand=True
+                                ),
+                            ], spacing=5)
+                        ], spacing=8),
+                        padding=15,
+                        bgcolor="#FFF3E0",
+                        border_radius=10
+                    ),
+                    
+                    # Info message
+                    ft.Container(
+                        content=ft.Row([
+                            ft.Icon(ft.Icons.INFO_OUTLINE, size=16, color="blue"),
+                            ft.Text(
+                                "Start referring to see your stats grow!",
+                                size=12,
+                                color="grey",
+                                italic=True
+                            )
+                        ], spacing=8, alignment=ft.MainAxisAlignment.CENTER),
                         padding=10
                     )
-                )
+                ])
             
             page.update()
         
@@ -5991,7 +6080,7 @@ def main(page: ft.Page):
                 traceback.print_exc()
         
         def refresh_promoter_screen(use_cached=False):
-            """Refresh the promoter screen content"""
+            """Refresh the promoter screen content - OPTIMIZED for instant display"""
             nonlocal promoter_screen_initialized, promoter_needs_refresh
 
             if use_cached and promoter_screen_initialized and not promoter_needs_refresh:
@@ -5999,35 +6088,13 @@ def main(page: ft.Page):
                 page.update()
                 return
 
-            # Always reload status from Firebase first
-            reload_promoter_status()
-
+            # ⚡ OPTIMIZATION: Clear and show UI immediately with cached data
             promoter_content.controls.clear()
-
             update_notification_badge()
             promoter_needs_refresh = False
 
-            new_assignments = []
+            # ⚡ Show UI immediately if we have cached promoter_referral_id
             if is_registered_promoter and promoter_referral_id:
-                new_assignments = get_gsheet_manager().assign_activation_keys_for_approved_referrals(promoter_referral_id)
-                for assignment in new_assignments:
-                    system_notifications.append(
-                        {
-                    "title": "New downline activation key",
-                    "message": (
-                        f"Your referred promoter {assignment.get('name', 'Promoter')} has been approved. "
-                        f"Activation key: {assignment.get('activation_key', '')}. "
-                        "Ask them to use it in the 'Register as Promoter' screen."
-                    ),
-                }
-                    )
-                    unread_system_notifications["count"] += 1
-                if new_assignments:
-                    save_notification_cache()
-                if new_assignments:
-                    update_notification_badge()
-
-            if is_registered_promoter:
                 def copy_referral_to_clipboard(e=None):
                     """Copy the promoter referral ID to clipboard."""
                     try:
@@ -6042,7 +6109,6 @@ def main(page: ft.Page):
                 header_section = ft.Column([
                     ft.Row(
                         [
-                            # Placeholder keeps the title perfectly centered even with refresh button
                             ft.Container(width=48),
                             ft.Container(
                                 content=ft.Row(
@@ -6072,12 +6138,12 @@ def main(page: ft.Page):
                     ),
                 ], spacing=6)
 
-                # Show dashboard with stats
+                # ⚡ Show referral ID and loading indicator immediately
                 promoter_content.controls.extend([
                     header_section,
                     ft.Container(height=10),
 
-                    # Referral ID Card
+                    # Referral ID Card - SHOW IMMEDIATELY
                     ft.Container(
                         content=ft.Column([
                             ft.Text("Your Referral ID", size=14, weight="bold", color="grey"),
@@ -6118,11 +6184,47 @@ def main(page: ft.Page):
 
                     ft.Container(height=10),
 
-                    # Stats container
+                    # Stats container - Will show loading initially
                     stats_container,
                 ])
 
-                # Load stats initially
+                # ⚡ Update UI immediately to show referral ID
+                page.update()
+
+                # ⚡ Now load heavy data in background
+                def background_load():
+                    try:
+                        # Reload status from Firebase
+                        reload_promoter_status()
+
+                        # Check for new assignments
+                        new_assignments = []
+                        try:
+                            new_assignments = get_gsheet_manager().assign_activation_keys_for_approved_referrals(promoter_referral_id)
+                            for assignment in new_assignments:
+                                system_notifications.append({
+                                    "title": "New downline activation key",
+                                    "message": (
+                                        f"Your referred promoter {assignment.get('name', 'Promoter')} has been approved. "
+                                        f"Activation key: {assignment.get('activation_key', '')}. "
+                                        "Ask them to use it in the 'Register as Promoter' screen."
+                                    ),
+                                })
+                                unread_system_notifications["count"] += 1
+                            if new_assignments:
+                                save_notification_cache()
+                                update_notification_badge()
+                                page.update()
+                        except Exception as assign_error:
+                            print(f"⚠️ Error checking assignments: {assign_error}")
+
+                    except Exception as bg_error:
+                        print(f"⚠️ Background load error: {bg_error}")
+
+                # Start background loading
+                threading.Thread(target=background_load, daemon=True).start()
+
+                # Load stats (already async)
                 load_promoter_stats()
             else:
                 # Show register button or registration form
@@ -6202,53 +6304,6 @@ def main(page: ft.Page):
 
             promoter_screen_initialized = True
             page.update()
-        
-        # Main promoter content container (reused across sessions)
-        if promoter_content is None:
-            promoter_content = ft.Column(
-                [],
-                horizontal_alignment="center",
-                scroll="auto",
-                spacing=10
-            )
-        
-        # Build initial screen
-        refresh_promoter_screen(use_cached=main_menu_initialized)
-        
-        # Screen promoter container
-        screen_promoter = ft.Container(
-            content=promoter_content,
-            padding=20,
-            expand=True
-        )
-
-        groups_column = ft.Column(
-            [
-                ft.Container(
-                    content=ft.Row([
-                        ft.Text("Groups", size=20, weight="bold", expand=True)
-                    ]),
-                    padding=15
-                ),
-                ft.Container(
-                    content=groups_list_column,
-                    padding=10,
-                    expand=True
-                )
-            ],
-            spacing=0,
-            expand=True,
-            scroll="auto",
-        )
-
-        screen_groups = ft.Container(
-            content=groups_column,
-            expand=True
-        )
-
-        # Load immediately when creating main menu
-        # This should be called AFTER screen_groups is defined
-        load_groups_list()
 
         # TAB 2 → ALL MEMBERS (OPTIMIZED - faster loading)
         all_members_column = ft.Column(scroll="auto", expand=True, spacing=5)
@@ -6354,6 +6409,55 @@ def main(page: ft.Page):
             
             threading.Thread(target=refresh_members, daemon=True).start()
             
+        # SCREEN CONTAINERS FOR TABS
+        
+        # Initialize promoter_content if not already created
+        if promoter_content is None:
+            promoter_content = ft.Column(
+                [],
+                horizontal_alignment="center",
+                scroll="auto",
+                spacing=10
+            )
+        
+        # Build initial promoter screen
+        refresh_promoter_screen(use_cached=main_menu_initialized)
+        
+        # TAB 0 → PROMOTER SCREEN
+        screen_promoter = ft.Container(
+            content=promoter_content,
+            padding=20,
+            expand=True
+        )
+        
+        # TAB 1 → GROUPS SCREEN (wraps groups_list_column)
+        groups_column = ft.Column(
+            [
+                ft.Container(
+                    content=ft.Row([
+                        ft.Text("Groups", size=20, weight="bold", expand=True)
+                    ]),
+                    padding=15
+                ),
+                ft.Container(
+                    content=groups_list_column,
+                    padding=10,
+                    expand=True
+                )
+            ],
+            spacing=0,
+            expand=True,
+            scroll="auto",
+        )
+
+        screen_groups = ft.Container(
+            content=groups_column,
+            expand=True
+        )
+        
+        # Load groups immediately when creating main menu
+        load_groups_list()
+        
         # ADD THIS - Create the screen_members container:
         members_column = ft.Column(
             [
