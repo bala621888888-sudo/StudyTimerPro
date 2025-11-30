@@ -248,14 +248,35 @@ class PushNotificationManager:
             push_debug(f"Logout error: {exc}")
 
     def handle_notification_opened(self, e):
+        """Handle when user taps notification - Navigate to chat"""
         try:
-            notification_opened = getattr(e, "notification_opened", None) or {}
-            push_debug(f"Notification OPENED: {notification_opened}")
+            push_debug(f"Notification tapped!")
             
-            # TODO: Navigate to appropriate chat based on notification data
+            # Get notification data
+            notification_data = {}
+            if hasattr(e, 'data') and e.data:
+                if isinstance(e.data, str):
+                    try:
+                        notification_data = json.loads(e.data)
+                    except:
+                        pass
+                elif isinstance(e.data, dict):
+                    notification_data = e.data
+            
+            # Extract chat info (from data field we sent)
+            chat_id = notification_data.get('chat_id', '')
+            sender_id = notification_data.get('sender_id', '')
+            message_type = notification_data.get('type', '')
+            
+            push_debug(f"Opening chat: {chat_id}, sender: {sender_id}, type: {message_type}")
+            
+            # TODO: Navigate to the appropriate chat
+            # You'll need to add logic here to open the specific chat
             
         except Exception as exc:
-            push_debug(f"Notification opened error: {exc}")
+            push_debug(f"Error handling notification tap: {exc}")
+            import traceback
+            traceback.print_exc()
 
     def handle_notification_received(self, e):
         try:
@@ -1968,11 +1989,13 @@ class FirebaseDatabase:
             
             payload = {
                 "app_id": ONESIGNAL_APP_ID,
-                "include_external_user_ids": [receiver_user_id],  # ✅ Use Firebase User ID directly
+                "include_external_user_ids": [receiver_user_id],
                 "headings": {"en": title},
-                "contents": {"en": message},
-                "data": data or {},
-                "priority": 10
+                "contents": {"en": message},  # This is what user sees
+                "data": data or {},  # This is hidden from notification, used by app
+                "priority": 10,
+                "android_visibility": 1,  # Show notification but hide sensitive data
+                "collapse_id": "chat_message"  # Group similar notifications
             }
             
             print(f"[NOTIFICATION] Sending to External User ID: {receiver_user_id}")
@@ -2836,6 +2859,8 @@ def main(page: ft.Page):
     push_manager.init_onesignal()
     push_debug("PushNotificationManager created and initialized in main()")
 
+
+
     # ============================================
     # CRITICAL: Set page properties FIRST
     # ============================================
@@ -3183,6 +3208,63 @@ def main(page: ft.Page):
             pass
         except Exception as e:
             print(f"[GROUP QUEUE ERROR] {e}")
+            
+    # Add after push_manager initialization
+    def request_notification_permission_dialog():
+        """Show dialog to request notification permission after first login"""
+        if not push_manager.enabled or page.platform != ft.PagePlatform.ANDROID:
+            return
+        
+        def open_settings(e):
+            try:
+                # Open app notification settings
+                page.launch_url("app-settings:")
+            except Exception as ex:
+                print(f"Could not open settings: {ex}")
+                try:
+                    # Fallback: open general settings
+                    page.launch_url("content://settings/notification_listener_settings")
+                except:
+                    pass
+            if hasattr(dialog, 'open'):
+                dialog.open = False
+                page.update()
+        
+        def dismiss_dialog(e):
+            dialog.open = False
+            page.update()
+        
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Row([
+                ft.Icon(ft.Icons.NOTIFICATIONS_ACTIVE, color="blue", size=30),
+                ft.Text("Enable Notifications?", size=18, weight="bold")
+            ], spacing=10),
+            content=ft.Container(
+                content=ft.Column([
+                    ft.Text("Get notified about:", size=14),
+                    ft.Row([ft.Icon(ft.Icons.MESSAGE, size=20, color="blue"), ft.Text("New messages", size=14)], spacing=10),
+                    ft.Row([ft.Icon(ft.Icons.GROUP, size=20, color="green"), ft.Text("Group updates", size=14)], spacing=10),
+                    ft.Row([ft.Icon(ft.Icons.WALLET, size=20, color="orange"), ft.Text("Earnings & bonuses", size=14)], spacing=10),
+                ], spacing=8, tight=True),
+                padding=10
+            ),
+            actions=[
+                ft.TextButton("Later", on_click=dismiss_dialog),
+                ft.ElevatedButton(
+                    "Enable Now", 
+                    on_click=open_settings, 
+                    bgcolor="blue", 
+                    color="white",
+                    icon=ft.Icons.SETTINGS
+                ),
+            ],
+            actions_alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        )
+        
+        page.overlay.append(dialog)
+        dialog.open = True
+        page.update()
 
     def start_auto_refresh_messages(interval=5):
         """Start auto-refresh for current chat/group"""
@@ -3286,6 +3368,7 @@ def main(page: ft.Page):
                     print("✓ Auto-login successful")
                     push_debug(f"Auto-login success: calling login_user() with uid={auth.user_id}")
                     push_manager.login_user(auth.user_id, db_instance=db)
+                    request_notification_permission_dialog() 
                     show_main_menu()
                     
                     # Restore timeout
@@ -3462,6 +3545,7 @@ def main(page: ft.Page):
                             show_snackbar("Account created successfully!")
                             push_debug(f"Login success: calling login_user() with uid={auth.user_id}")
                             push_manager.login_user(auth.user_id, db_instance=db)
+                            request_notification_permission_dialog() 
                             show_main_menu()
                             return
                         else:
@@ -3498,6 +3582,7 @@ def main(page: ft.Page):
                                     show_snackbar("Account recovered successfully!")
                                     push_debug(f"Login success: calling login_user() with uid={auth.user_id}")
                                     push_manager.login_user(auth.user_id, db_instance=db)
+                                    request_notification_permission_dialog() 
                                     show_main_menu()
                                     return
                                 else:
@@ -3540,6 +3625,7 @@ def main(page: ft.Page):
                         show_snackbar("Login successful!")
                         push_debug(f"Login success: calling login_user() with uid={auth.user_id}")
                         push_manager.login_user(auth.user_id, db_instance=db)
+                        request_notification_permission_dialog() 
                         show_main_menu()
                         return
                 
@@ -3583,6 +3669,7 @@ def main(page: ft.Page):
                             show_snackbar("Login successful!")
                             push_debug(f"Login success: calling login_user() with uid={auth.user_id}")
                             push_manager.login_user(auth.user_id, db_instance=db)
+                            request_notification_permission_dialog() 
                             show_main_menu()
                             return
                         else:
@@ -7278,6 +7365,14 @@ def main(page: ft.Page):
             group_info = {}
     def handle_logout():
         push_debug("Logout triggered: calling logout_user()")
+        
+        # ✅ FIX #2: Clear promoter stats cache to prevent showing wrong stats on account switch
+        print("[LOGOUT] Clearing promoter stats cache...")
+        promoter_stats_cache["loaded"] = False
+        promoter_stats_cache["data"] = None
+        promoter_stats_cache["timestamp"] = 0
+        print("[LOGOUT] Promoter cache cleared ✅")
+        
         push_manager.logout_user()
         CredentialsManager.clear_credentials()
         show_snackbar("Logged out successfully")
