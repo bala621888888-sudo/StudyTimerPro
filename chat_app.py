@@ -249,7 +249,7 @@ class PushNotificationManager:
             push_debug(f"Logout error: {exc}")
 
     def handle_notification_opened(self, e):
-        """Handle when user taps notification - Navigate to chat"""
+        """Handle when user taps notification - Navigate to chat (NO RAW JSON DISPLAY)"""
         try:
             push_debug(f"Notification tapped!")
             push_debug(f"Raw notification data: {e.data if hasattr(e, 'data') else 'No data'}")
@@ -262,19 +262,38 @@ class PushNotificationManager:
                         notification_data = json.loads(e.data)
                     except Exception as parse_ex:
                         push_debug(f"Failed to parse notification data as JSON: {parse_ex}")
-                        pass
+                        # ✅ FIX 2: Don't show error to user, just log it
+                        return
                 elif isinstance(e.data, dict):
                     notification_data = e.data
             
             push_debug(f"Parsed notification_data: {notification_data}")
             
-            # ✅ FIX: Extract from nested structure (custom.a)
+            # ✅ FIX 2: Extract from nested structure (custom.a)
             # Android/FCM wraps our data in: custom -> a -> {our_data}
+            # NOTE: custom can be a STRING containing JSON, not a dict!
             actual_data = notification_data
             if 'custom' in notification_data:
                 custom = notification_data['custom']
+                
+                # ✅ FIX 2: Handle custom being a JSON string
+                if isinstance(custom, str):
+                    try:
+                        custom = json.loads(custom)
+                        push_debug(f"Parsed custom from string: {custom}")
+                    except:
+                        push_debug(f"Could not parse custom string")
+                        custom = {}
+                
                 if isinstance(custom, dict) and 'a' in custom:
-                    actual_data = custom['a']
+                    additional_data = custom['a']
+                    # ✅ FIX 2: additional_data might also be a JSON string
+                    if isinstance(additional_data, str):
+                        try:
+                            additional_data = json.loads(additional_data)
+                        except:
+                            additional_data = {}
+                    actual_data = additional_data
                     push_debug(f"Extracted data from custom.a: {actual_data}")
             
             # Extract chat info (from our data field)
@@ -284,9 +303,13 @@ class PushNotificationManager:
             message_type = actual_data.get('type', '')
             is_admin = actual_data.get('is_admin', False)
             
+            # ✅ FIX 2: Also check for group message type
+            group_id = actual_data.get('group_id', '')
+            group_name = actual_data.get('group_name', '')
+            
             push_debug(f"Chat info - ID: {chat_id}, Sender: {sender_name}, Type: {message_type}")
             
-            # ✅ FIX: Actually navigate to the chat!
+            # ✅ FIX 2: Navigate to the appropriate chat
             if message_type == 'new_message' and chat_id:
                 push_debug(f"Opening private chat: {chat_id}")
                 
@@ -304,18 +327,39 @@ class PushNotificationManager:
                 # Try to navigate immediately if page is available
                 if self.page and hasattr(self.page, 'route'):
                     try:
-                        # Trigger a page update to process the navigation
                         self.page.update()
                         push_debug("✅ Page updated to trigger navigation")
                     except Exception as nav_ex:
                         push_debug(f"Could not navigate immediately: {nav_ex}")
+                        
+            elif message_type == 'group_message' and group_id:
+                push_debug(f"Opening group chat: {group_id}")
+                
+                self.pending_navigation = {
+                    'type': 'group_chat',
+                    'group_id': group_id,
+                    'group_name': group_name,
+                    'sender_id': sender_id,
+                    'sender_name': sender_name,
+                    'is_admin': is_admin
+                }
+                
+                push_debug(f"✅ Stored pending group navigation: {self.pending_navigation}")
+                
+                if self.page and hasattr(self.page, 'route'):
+                    try:
+                        self.page.update()
+                    except Exception as nav_ex:
+                        push_debug(f"Could not navigate immediately: {nav_ex}")
             else:
                 push_debug(f"⚠️ Unknown message type or missing chat_id: type={message_type}, chat_id={chat_id}")
+                # ✅ FIX 2: Don't show any dialog with raw data - just silently log
             
         except Exception as exc:
             push_debug(f"Error handling notification tap: {exc}")
             import traceback
             push_debug(traceback.format_exc())
+            # ✅ FIX 2: Don't show error to user
 
     def handle_notification_received(self, e):
         try:
@@ -3249,9 +3293,44 @@ def main(page: ft.Page):
             print(f"[GROUP QUEUE ERROR] {e}")
             
     # Add after push_manager initialization
+    # ✅ FIX 1: Track if notification permission dialog has been shown
+    NOTIFICATION_PERMISSION_FLAG_FILE = None
+    
+    def get_notification_permission_flag_file():
+        """Get the file path for notification permission flag"""
+        nonlocal NOTIFICATION_PERMISSION_FLAG_FILE
+        if NOTIFICATION_PERMISSION_FLAG_FILE is None:
+            try:
+                NOTIFICATION_PERMISSION_FLAG_FILE = CACHE_DIR.parent / "notification_permission_shown.flag"
+            except:
+                NOTIFICATION_PERMISSION_FLAG_FILE = Path.home() / ".chat_app_notification_flag"
+        return NOTIFICATION_PERMISSION_FLAG_FILE
+    
+    def has_shown_notification_permission():
+        """Check if notification permission dialog has been shown before"""
+        try:
+            flag_file = get_notification_permission_flag_file()
+            return flag_file.exists()
+        except:
+            return False
+    
+    def mark_notification_permission_shown():
+        """Mark that notification permission dialog has been shown"""
+        try:
+            flag_file = get_notification_permission_flag_file()
+            flag_file.parent.mkdir(parents=True, exist_ok=True)
+            flag_file.touch()
+        except Exception as e:
+            print(f"Could not save notification permission flag: {e}")
+    
     def request_notification_permission_dialog():
-        """Show dialog to request notification permission after first login"""
+        """Show dialog to request notification permission - ONLY FIRST TIME"""
         if not push_manager.enabled or page.platform != ft.PagePlatform.ANDROID:
+            return
+        
+        # ✅ FIX 1: Only show first time, not every login
+        if has_shown_notification_permission():
+            print("[NOTIFICATION] Permission dialog already shown before, skipping")
             return
         
         def open_settings(e):
@@ -3259,39 +3338,48 @@ def main(page: ft.Page):
             dialog.open = False
             page.update()
             
-            # Show instructions dialog
-            instructions_dialog = ft.AlertDialog(
-                modal=True,
-                title=ft.Text("Enable Notifications", size=18, weight="bold"),
-                content=ft.Container(
-                    content=ft.Column([
-                        ft.Text("Follow these steps:", size=14, weight="bold"),
-                        ft.Text("1. Open Settings app", size=13),
-                        ft.Text("2. Go to 'Apps' or 'Applications'", size=13),
-                        ft.Text("3. Find and tap 'Chat App'", size=13),
-                        ft.Text("4. Tap 'Notifications'", size=13),
-                        ft.Text("5. Enable 'All notifications'", size=13),
-                        ft.Divider(),
-                        ft.Text("Or swipe down and long-press this notification to access settings quickly!", 
-                               size=12, italic=True, color="blue"),
-                    ], spacing=8, tight=True),
-                    padding=15
-                ),
-                actions=[
-                    ft.TextButton("Got it!", on_click=lambda e: close_instructions(e))
-                ],
-            )
+            # ✅ FIX 1: Directly launch Android notification settings
+            try:
+                # Get package name - try multiple methods
+                package_name = "com.example.chat_app"  # Default
+                
+                try:
+                    # Try to get from Flet page
+                    if hasattr(page, 'package_name') and page.package_name:
+                        package_name = page.package_name
+                except:
+                    pass
+                
+                # Try environment variable
+                env_package = os.environ.get("ANDROID_PACKAGE_NAME")
+                if env_package:
+                    package_name = env_package
+                
+                # Launch Android notification settings directly using Intent
+                intent_cmd = f"am start -a android.settings.APP_NOTIFICATION_SETTINGS --es android.provider.extra.APP_PACKAGE {package_name}"
+                
+                print(f"[NOTIFICATION] Launching settings with command: {intent_cmd}")
+                result = os.system(intent_cmd)
+                
+                if result != 0:
+                    # Fallback: Try alternative intent format
+                    alt_cmd = f"am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d package:{package_name}"
+                    os.system(alt_cmd)
+                
+                print(f"[NOTIFICATION] Launched settings for package: {package_name}")
+                show_snackbar("Opening notification settings...")
+                
+            except Exception as settings_ex:
+                print(f"[NOTIFICATION] Could not open settings directly: {settings_ex}")
+                show_snackbar("Go to Settings > Apps > Chat App > Notifications to enable")
             
-            def close_instructions(e):
-                instructions_dialog.open = False
-                page.update()
-            
-            page.overlay.append(instructions_dialog)
-            instructions_dialog.open = True
-            page.update()
+            # Mark as shown
+            mark_notification_permission_shown()
         
         def dismiss_dialog(e):
             dialog.open = False
+            # Mark as shown even if dismissed
+            mark_notification_permission_shown()
             page.update()
         
         dialog = ft.AlertDialog(
@@ -3312,7 +3400,7 @@ def main(page: ft.Page):
             actions=[
                 ft.TextButton("Later", on_click=dismiss_dialog),
                 ft.ElevatedButton(
-                    "Enable Now", 
+                    "Open Settings", 
                     on_click=open_settings, 
                     bgcolor="blue", 
                     color="white",
@@ -4237,6 +4325,77 @@ def main(page: ft.Page):
             notification_badge_container.visible = total_unread > 0
             if notification_badge_container.page:
                 notification_badge_container.update()
+
+        # ✅ FIX 4: Load unread private messages count at startup
+        def load_unread_private_messages_count():
+            """Load unread private message count from Firebase/cache for notification badge"""
+            try:
+                # First try to get from cache
+                cached_chats = CacheManager.load_from_cache('private_chats')
+                if cached_chats:
+                    total_unread = 0
+                    for chat in cached_chats:
+                        unread = chat.get('unread', 0)
+                        try:
+                            unread_val = int(unread) if unread else 0
+                        except:
+                            unread_val = 0
+                        total_unread += unread_val
+                    unread_private_messages["count"] = total_unread
+                    print(f"[NOTIFICATION] Loaded unread count from cache: {total_unread}")
+                    update_notification_badge()
+                
+                # Then fetch fresh data in background
+                def fetch_fresh_unread():
+                    try:
+                        if not NetworkChecker.is_online():
+                            return
+                        
+                        # Get all private chats for current user
+                        chats_url = f"{db.database_url}/private_chats.json?auth={db.auth_token}"
+                        response = requests.get(chats_url, timeout=10)
+                        
+                        if response.status_code == 200:
+                            all_chats = response.json() or {}
+                            total_unread = 0
+                            
+                            for chat_id, chat_data in all_chats.items():
+                                if not chat_data or not isinstance(chat_data, dict):
+                                    continue
+                                
+                                # Check if current user is part of this chat
+                                participants = chat_data.get('participants', {})
+                                if auth.user_id not in participants:
+                                    continue
+                                
+                                # Check if chat is accepted
+                                status = chat_data.get('status', '')
+                                if status != 'accepted':
+                                    continue
+                                
+                                # Get unread count for current user
+                                unread_counts = chat_data.get('unread_counts', {})
+                                unread = unread_counts.get(auth.user_id, 0)
+                                try:
+                                    unread_val = int(unread) if unread else 0
+                                except:
+                                    unread_val = 0
+                                total_unread += unread_val
+                            
+                            unread_private_messages["count"] = total_unread
+                            print(f"[NOTIFICATION] Fresh unread count: {total_unread}")
+                            update_notification_badge()
+                            
+                    except Exception as fetch_ex:
+                        print(f"[NOTIFICATION] Error fetching unread count: {fetch_ex}")
+                
+                threading.Thread(target=fetch_fresh_unread, daemon=True).start()
+                
+            except Exception as e:
+                print(f"[NOTIFICATION] Error loading unread count: {e}")
+
+        # ✅ FIX 4: Load unread count immediately
+        load_unread_private_messages_count()
 
         update_notification_badge()
 
@@ -7039,6 +7198,7 @@ def main(page: ft.Page):
         )
 
         # TAB 4 → SETTINGS (with Create Group button for admin)
+        # ✅ FIX 5: Only create settings content for admin
         settings_buttons = []
         
         if is_admin:
@@ -7080,6 +7240,11 @@ def main(page: ft.Page):
         page_controller_cls = getattr(ft, "PageController", None)
         page_controller = page_controller_cls(initial_page=selected_index) if page_controller_cls else None
 
+        # ✅ FIX 5: Determine number of tabs based on admin status
+        # Admin: 5 tabs (Promoter, Groups, Members, Private, Settings)
+        # Non-admin: 4 tabs (Promoter, Groups, Members, Private) - no Settings
+        num_tabs = 5 if is_admin else 4
+
         # SELECT WHICH SCREEN TO SHOW (with optimized lazy loading)
 
         def activate_tab(new_index):
@@ -7115,13 +7280,15 @@ def main(page: ft.Page):
                         load_users()
                     except Exception as ex:
                         print(f"[PRIVATE TAB AUTO-LOAD ERROR] {ex}")
+            # ✅ FIX 5: Tab 4 (Settings) only exists for admin
             page.update()
 
         def switch_tab(e):
             try:
                 # Ensure index is a valid integer
                 new_index = int(e.control.selected_index)
-                if 0 <= new_index <= 4:  # Valid range (5 tabs now)
+                # ✅ FIX 5: Use dynamic tab count
+                if 0 <= new_index < num_tabs:
                     if page_controller:
                         page_controller.animate_to_page(
                             new_index,
@@ -7135,36 +7302,44 @@ def main(page: ft.Page):
             except Exception as ex:
                 print(f"Tab switch error: {ex}")
 
+        # ✅ FIX 5: Create bottom navigation with conditional Settings tab
         try:
-            bottom_nav = ft.NavigationBar(
-                selected_index=0,
-                destinations=[
-                    ft.NavigationBarDestination(
-                        icon=ft.Icons.WALLET_OUTLINED,
-                        selected_icon=ft.Icons.WALLET,
-                        label="Promoter"
-                    ),
-                    ft.NavigationBarDestination(
-                        icon=ft.Icons.CHAT_OUTLINED,
-                        selected_icon=ft.Icons.CHAT,
-                        label="Groups"
-                    ),
-                    ft.NavigationBarDestination(
-                        icon=ft.Icons.PEOPLE_OUTLINED,
-                        selected_icon=ft.Icons.PEOPLE,
-                        label="Members"
-                    ),
-                    ft.NavigationBarDestination(
-                        icon=ft.Icons.PERSON_OUTLINED,
-                        selected_icon=ft.Icons.PERSON,
-                        label="Private"
-                    ),
+            nav_destinations = [
+                ft.NavigationBarDestination(
+                    icon=ft.Icons.WALLET_OUTLINED,
+                    selected_icon=ft.Icons.WALLET,
+                    label="Promoter"
+                ),
+                ft.NavigationBarDestination(
+                    icon=ft.Icons.CHAT_OUTLINED,
+                    selected_icon=ft.Icons.CHAT,
+                    label="Groups"
+                ),
+                ft.NavigationBarDestination(
+                    icon=ft.Icons.PEOPLE_OUTLINED,
+                    selected_icon=ft.Icons.PEOPLE,
+                    label="Members"
+                ),
+                ft.NavigationBarDestination(
+                    icon=ft.Icons.PERSON_OUTLINED,
+                    selected_icon=ft.Icons.PERSON,
+                    label="Private"
+                ),
+            ]
+            
+            # ✅ FIX 5: Only add Settings tab for admin
+            if is_admin:
+                nav_destinations.append(
                     ft.NavigationBarDestination(
                         icon=ft.Icons.SETTINGS_OUTLINED,
                         selected_icon=ft.Icons.SETTINGS,
                         label="Settings"
-                    ),
-                ],
+                    )
+                )
+            
+            bottom_nav = ft.NavigationBar(
+                selected_index=0,
+                destinations=nav_destinations,
                 on_change=switch_tab
             )
         except Exception as e:
@@ -7196,7 +7371,8 @@ def main(page: ft.Page):
                             load_private_chats(force_refresh=True)
                     except Exception as ex:
                         print(f"[PULL REFRESH PRIVATE] {ex}")
-                elif selected_index == 4:
+                # ✅ FIX 5: Only handle Settings tab refresh if admin
+                elif selected_index == 4 and is_admin:
                     # Settings tab - nothing to refresh yet
                     pass
             except Exception as ex:
@@ -7207,8 +7383,10 @@ def main(page: ft.Page):
             try:
                 vx = getattr(e, "velocity_x", 0) or 0
                 threshold = 300  # Adjust sensitivity if needed
+                # ✅ FIX 5: Use num_tabs instead of hardcoded 4
+                max_tab_index = num_tabs - 1
                 # Swipe left -> next tab
-                if vx < -threshold and selected_index < 4:
+                if vx < -threshold and selected_index < max_tab_index:
                     if page_controller:
                         page_controller.animate_to_page(
                             selected_index + 1,
@@ -7272,14 +7450,17 @@ def main(page: ft.Page):
         screen_members.content = members_refreshable
         chat_list_view.content = chat_list_refreshable
 
-        # Build horizontal pager for WhatsApp-like slide transitions
+        # ✅ FIX 5: Build horizontal pager with conditional Settings tab
         tab_pages = [
             ft.Container(content=screen_promoter, expand=True),
             ft.Container(content=screen_groups, expand=True),
             ft.Container(content=screen_members, expand=True),
             ft.Container(content=chat_list_view, expand=True),
-            ft.Container(content=screen_settings, expand=True),
         ]
+        
+        # ✅ FIX 5: Only add Settings tab for admin
+        if is_admin:
+            tab_pages.append(ft.Container(content=screen_settings, expand=True))
 
         page_view_cls = getattr(ft, "PageView", None)
         tab_placeholder = ft.Container(expand=True)
@@ -7491,7 +7672,7 @@ def main(page: ft.Page):
     def handle_logout():
         push_debug("Logout triggered: calling logout_user()")
         
-        # ✅ Clear ALL promoter-related data
+        # ✅ FIX 3: Clear ALL cached data to prevent data leakage between accounts
         print("[LOGOUT] ===== CLEARING ALL DATA =====")
         print(f"[LOGOUT] Current auth.user_id before logout: {auth.user_id if auth else 'None'}")
         
@@ -7501,12 +7682,86 @@ def main(page: ft.Page):
         promoter_stats_cache["timestamp"] = 0
         print("[LOGOUT] ✅ Stats cache cleared")
         
+        # ✅ FIX 3: Clear ALL file-based caches
+        try:
+            import shutil
+            
+            # Clear main cache directory (users_cache.pkl, groups_cache.pkl, etc.)
+            if CACHE_DIR and CACHE_DIR.exists():
+                shutil.rmtree(CACHE_DIR)
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                print(f"[LOGOUT] ✅ Cache directory cleared: {CACHE_DIR}")
+            
+            # Clear group icon cache directory
+            if GROUP_ICON_CACHE_DIR and GROUP_ICON_CACHE_DIR.exists():
+                shutil.rmtree(GROUP_ICON_CACHE_DIR)
+                GROUP_ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                print(f"[LOGOUT] ✅ Group icon cache cleared: {GROUP_ICON_CACHE_DIR}")
+            
+            # Clear user list cache file
+            if USER_LIST_CACHE_FILE and USER_LIST_CACHE_FILE.exists():
+                USER_LIST_CACHE_FILE.unlink()
+                print(f"[LOGOUT] ✅ User list cache cleared: {USER_LIST_CACHE_FILE}")
+            
+            # Clear notifications cache file
+            if NOTIFICATIONS_CACHE_FILE and NOTIFICATIONS_CACHE_FILE.exists():
+                NOTIFICATIONS_CACHE_FILE.unlink()
+                print(f"[LOGOUT] ✅ Notifications cache cleared: {NOTIFICATIONS_CACHE_FILE}")
+            
+            # ✅ FIX 3: Clear any other pickle caches in cache parent directory
+            try:
+                cache_parent = CACHE_DIR.parent if CACHE_DIR else None
+                if cache_parent and cache_parent.exists():
+                    for cache_file in cache_parent.glob("*.pkl"):
+                        cache_file.unlink()
+                        print(f"[LOGOUT] ✅ Removed cache file: {cache_file}")
+                    for cache_file in cache_parent.glob("*.json"):
+                        # Don't delete credentials.json as we handle that separately
+                        if "credential" not in cache_file.name.lower():
+                            cache_file.unlink()
+                            print(f"[LOGOUT] ✅ Removed cache file: {cache_file}")
+            except Exception as glob_ex:
+                print(f"[LOGOUT] ⚠️ Could not clear additional cache files: {glob_ex}")
+            
+            print("[LOGOUT] ✅ All file caches cleared")
+        except Exception as cache_ex:
+            print(f"[LOGOUT] ⚠️ Error clearing caches: {cache_ex}")
+        
+        # ✅ FIX 3: Clear in-memory caches
+        try:
+            # Clear private chats cache
+            if 'private_chats_cache' in dir():
+                private_chats_cache["loaded"] = False
+                private_chats_cache["data"] = []
+            
+            # Clear members cache
+            if 'members_cache' in dir():
+                members_cache["loaded"] = False
+            
+            # Clear private unread counts
+            if 'private_unread_counts' in dir():
+                private_unread_counts.clear()
+            
+            # Clear system notifications list
+            if 'system_notifications' in dir():
+                system_notifications.clear()
+            
+            # Reset unread counts
+            if 'unread_system_notifications' in dir():
+                unread_system_notifications["count"] = 0
+            if 'unread_private_messages' in dir():
+                unread_private_messages["count"] = 0
+            
+            print("[LOGOUT] ✅ In-memory caches cleared")
+        except Exception as mem_ex:
+            print(f"[LOGOUT] ⚠️ Error clearing in-memory caches: {mem_ex}")
+        
         # Clear Firebase profile cache (force fresh load on next login)
         try:
             # Force garbage collection to clear any cached data
             import gc
             gc.collect()
-            print("[LOGOUT] ✅ Memory cleared")
+            print("[LOGOUT] ✅ Memory cleared via GC")
         except:
             pass
         
@@ -7514,9 +7769,16 @@ def main(page: ft.Page):
         push_manager.logout_user()
         print("[LOGOUT] ✅ Push manager logged out")
         
-        # Clear credentials
+        # Clear credentials (this will force new login)
         CredentialsManager.clear_credentials()
         print("[LOGOUT] ✅ Credentials cleared")
+        
+        # ✅ FIX 3: Clear image cache as well
+        try:
+            ImageCache.clear_cache()
+            print("[LOGOUT] ✅ Image cache cleared")
+        except Exception as img_ex:
+            print(f"[LOGOUT] ⚠️ Could not clear image cache: {img_ex}")
         
         print("[LOGOUT] ===== LOGOUT COMPLETE =====\n")
         
@@ -7638,6 +7900,38 @@ def main(page: ft.Page):
             edit_profile_image_preview.visible = False
             selected_profile_image_data["url"] = None
         
+        # ✅ FIX 5: Build profile content list - add Logout for non-admin users
+        profile_content = [
+            ft.Container(height=20),
+            ft.Text("Profile Settings", size=24, weight="bold"),
+            ft.Container(height=30),
+            ft.Container(content=edit_profile_image_preview, alignment=ft.alignment.center),
+            ft.Container(height=15),
+            ft.ElevatedButton("Choose Profile Image", on_click=pick_profile_image, bgcolor="#2196F3", color="white"),
+            ft.Container(height=30),
+            edit_username_field,
+            ft.Container(height=30),
+            ft.ElevatedButton("Save Changes", expand=True, bgcolor="green", color="white", on_click=save_profile),
+        ]
+        
+        # ✅ FIX 5: Add Logout button for non-admin users (since they don't have Settings tab)
+        if not is_admin:
+            profile_content.extend([
+                ft.Container(height=40),
+                ft.Divider(),
+                ft.Container(height=20),
+                ft.Text("Account", size=18, weight="bold", color="grey"),
+                ft.Container(height=15),
+                ft.ElevatedButton(
+                    "Logout",
+                    icon=ft.Icons.LOGOUT,
+                    on_click=lambda e: handle_logout(),
+                    bgcolor="#FF5252",
+                    color="white",
+                    width=200
+                ),
+            ])
+        
         edit_profile_view = ft.Container(
             content=ft.Column([
                 ft.Container(
@@ -7649,18 +7943,7 @@ def main(page: ft.Page):
                     bgcolor="#E3F2FD"
                 ),
                 ft.Container(
-                    content=ft.Column([
-                        ft.Container(height=20),
-                        ft.Text("Profile Settings", size=24, weight="bold"),
-                        ft.Container(height=30),
-                        ft.Container(content=edit_profile_image_preview, alignment=ft.alignment.center),
-                        ft.Container(height=15),
-                        ft.ElevatedButton("Choose Profile Image", on_click=pick_profile_image, bgcolor="#2196F3", color="white"),
-                        ft.Container(height=30),
-                        edit_username_field,
-                        ft.Container(height=30),
-                        ft.ElevatedButton("Save Changes", expand=True, bgcolor="green", color="white", on_click=save_profile)
-                    ], horizontal_alignment="center", scroll="auto"),
+                    content=ft.Column(profile_content, horizontal_alignment="center", scroll="auto"),
                     padding=20,
                     expand=True
                 )
