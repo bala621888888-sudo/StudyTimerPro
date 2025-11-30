@@ -88,15 +88,8 @@ class PushNotificationManager:
         try:
             push_debug(f"Creating OneSignal with APP_ID: {ONESIGNAL_APP_ID[:8]}...")
             
-            # ✅ CRITICAL FIX: Create settings with notification permission request
-            settings = fos.OneSignalSettings(
-                app_id=ONESIGNAL_APP_ID,
-                # ✅ Request notification permission on Android
-                auto_prompt=True,  # Automatically prompt for permission
-            )
-            
             self.onesignal = fos.OneSignal(
-                settings=settings,
+                settings=fos.OneSignalSettings(app_id=ONESIGNAL_APP_ID),
                 on_notification_opened=self.handle_notification_opened,
                 on_notification_received=self.handle_notification_received,
             )
@@ -106,15 +99,6 @@ class PushNotificationManager:
             push_debug("OneSignal added to page.overlay")
             
             self.page.update()
-            
-            # ✅ CRITICAL: Explicitly request notification permission
-            try:
-                push_debug("🔔 Requesting notification permission...")
-                permission_result = self.onesignal.prompt_for_push_notifications()
-                push_debug(f"🔔 Permission result: {permission_result}")
-            except Exception as perm_error:
-                push_debug(f"⚠️ Permission request error (this is OK on some devices): {perm_error}")
-            
             push_debug("=== init_onesignal() SUCCESS ===")
             
         except Exception as exc:
@@ -225,14 +209,6 @@ class PushNotificationManager:
             push_debug("Calling onesignal.login()...")
             result = self.onesignal.login(user_id)
             push_debug(f"login() returned: {result}")
-            
-            # ✅ NEW: Request notification permission after login
-            try:
-                push_debug("🔔 Requesting notification permission after login...")
-                permission = self.onesignal.prompt_for_push_notifications()
-                push_debug(f"🔔 Permission granted: {permission}")
-            except Exception as perm_error:
-                push_debug(f"⚠️ Permission error: {perm_error}")
             
             # ✅ Use same timing as test app: 10 seconds
             self.get_player_id_delayed(delay=10)
@@ -1955,122 +1931,94 @@ class FirebaseDatabase:
         except:
             return None
    
-    def save_user_onesignal_id(self, user_id, onesignal_player_id):
-        """Save OneSignal player ID for a user"""
-        url = f"{self.database_url}/users/{user_id}/onesignal_player_id.json?auth={self.auth_token}"
-        
-        try:
-            response = requests.put(url, json=onesignal_player_id)
-            if response.status_code == 200:
-                print(f"✅ Saved OneSignal ID to Firebase: {onesignal_player_id}")
-                return True
-            else:
-                print(f"⚠️ Failed to save OneSignal ID: {response.status_code}")
-                return False
-        except Exception as e:
-            print(f"❌ Error saving OneSignal ID: {e}")
-            return False
     
-    def get_user_onesignal_id(self, user_id):
-        """Get OneSignal player ID for a user"""
-        url = f"{self.database_url}/users/{user_id}/onesignal_player_id.json?auth={self.auth_token}"
-        
-        try:
-            response = requests.get(url)
-            if response.status_code == 200:
-                player_id = response.json()
-                # ✅ Validate it's a real UUID, not an error string
-                if player_id and isinstance(player_id, str) and "does not exist" not in player_id.lower():
-                    return player_id
-            return None
-        except Exception as e:
-            print(f"❌ Error getting OneSignal ID: {e}")
-            return None
     
     def send_onesignal_notification(self, receiver_user_id, title, message, data=None):
-        """Send notification via OneSignal REST API"""
+        """Send notification via OneSignal REST API using Subscription ID"""
+        
+        print(f"\n[NOTIFICATION] ===== START =====")
+        print(f"[NOTIFICATION] Receiver User ID: {receiver_user_id}")
+        print(f"[NOTIFICATION] Title: {title}")
+        print(f"[NOTIFICATION] Message: {message[:100]}")
+        
         try:
-            print(f"[NOTIFICATION] ===== NOTIFICATION REQUEST START =====")
-            print(f"[NOTIFICATION] Receiver User ID: {receiver_user_id}")
-            print(f"[NOTIFICATION] Title: {title}")
-            print(f"[NOTIFICATION] Message: {message[:100]}")
+            # Step 1: Get Subscription ID from OneSignal using External User ID
+            print(f"[NOTIFICATION] Getting Subscription ID from OneSignal...")
             
-            # Step 1: Get receiver's OneSignal Player ID from Firebase
-            onesignal_player_id = self.get_user_onesignal_id(receiver_user_id)
-            print(f"[NOTIFICATION] Player ID from Firebase: {onesignal_player_id}")
+            # Query OneSignal for this user's subscription
+            query_url = f"https://onesignal.com/api/v1/players?app_id={ONESIGNAL_APP_ID}&limit=10"
+            query_headers = {"Authorization": f"Basic {ONESIGNAL_REST_API_KEY}"}
             
-            if not onesignal_player_id:
-                print(f"[NOTIFICATION] ❌ FAILED: No Player ID in Firebase for user {receiver_user_id}")
-                print(f"[NOTIFICATION] → User needs to login to register device")
-                print(f"[NOTIFICATION] ===== END =====")
+            response = requests.get(query_url, headers=query_headers, timeout=10)
+            
+            if response.status_code != 200:
+                print(f"[NOTIFICATION] ❌ Failed to query players: {response.status_code}")
                 return False
             
-            # Step 2: Get REST API Key (hardcoded)
-            onesignal_api_key = ONESIGNAL_REST_API_KEY
-            print(f"[NOTIFICATION] REST API Key: {onesignal_api_key[:10]}... (length: {len(onesignal_api_key)})")
+            players = response.json().get('players', [])
+            print(f"[NOTIFICATION] Found {len(players)} total players")
             
-            if not onesignal_api_key or len(onesignal_api_key) < 20:
-                print(f"[NOTIFICATION] ❌ FAILED: REST API Key not configured or invalid")
-                print(f"[NOTIFICATION] → Add your REST API Key at top of chat_app.py")
-                print(f"[NOTIFICATION] ===== END =====")
+            # Find player with matching external_user_id
+            subscription_id = None
+            for player in players:
+                if player.get('external_user_id') == receiver_user_id:
+                    # Check if subscribed
+                    if player.get('notification_types', 0) > 0:
+                        subscription_id = player.get('identifier')  # This is Subscription ID
+                        print(f"[NOTIFICATION] ✅ Found subscribed player!")
+                        print(f"[NOTIFICATION] Subscription ID: {subscription_id}")
+                        break
+            
+            if not subscription_id:
+                print(f"[NOTIFICATION] ❌ No subscribed device found for user {receiver_user_id}")
                 return False
             
-            # Step 3: Prepare OneSignal API request
-            url = "https://onesignal.com/api/v1/notifications"
+            # Step 2: Send notification using Subscription ID
+            print(f"[NOTIFICATION] Sending via OneSignal API...")
             
-            headers = {
+            notification_url = "https://onesignal.com/api/v1/notifications"
+            notification_headers = {
                 "Content-Type": "application/json; charset=utf-8",
-                "Authorization": f"Basic {onesignal_api_key}"
+                "Authorization": f"Basic {ONESIGNAL_REST_API_KEY}"
             }
             
             payload = {
                 "app_id": ONESIGNAL_APP_ID,
-                "include_player_ids": [onesignal_player_id],
+                "include_subscription_ids": [subscription_id],  # ✅ Use Subscription ID!
                 "headings": {"en": title},
                 "contents": {"en": message},
-                "data": data or {},
-                "android_channel_id": "default",  # Use default notification channel
+                "data": data or {}
             }
             
-            print(f"[NOTIFICATION] API URL: {url}")
-            print(f"[NOTIFICATION] App ID: {ONESIGNAL_APP_ID}")
-            print(f"[NOTIFICATION] Target Player ID: {onesignal_player_id}")
-            print(f"[NOTIFICATION] Sending request...")
+            print(f"[NOTIFICATION] Payload: {json.dumps(payload, indent=2)}")
             
-            # Step 4: Send notification
-            response = requests.post(url, json=payload, headers=headers, timeout=10)
+            response = requests.post(notification_url, json=payload, headers=notification_headers, timeout=10)
             
             print(f"[NOTIFICATION] Response Status: {response.status_code}")
             print(f"[NOTIFICATION] Response Body: {response.text}")
             
-            # Step 5: Check result
             if response.status_code == 200:
-                response_data = response.json()
-                recipients = response_data.get('recipients', 0)
-                print(f"[NOTIFICATION] ✅ SUCCESS: Sent to {recipients} device(s)")
+                result = response.json()
+                recipients = result.get('recipients', 0)
                 
-                if recipients == 0:
-                    print(f"[NOTIFICATION] ⚠️ WARNING: 0 recipients - Player ID may be invalid or device unsubscribed")
-                
-                print(f"[NOTIFICATION] ===== END =====")
-                return True
+                if recipients > 0:
+                    print(f"[NOTIFICATION] ✅ SUCCESS! Sent to {recipients} recipient(s)")
+                    print(f"[NOTIFICATION] ===== END =====\n")
+                    return True
+                else:
+                    print(f"[NOTIFICATION] ⚠️ Sent but 0 recipients: {result}")
+                    print(f"[NOTIFICATION] ===== END =====\n")
+                    return False
             else:
-                print(f"[NOTIFICATION] ❌ FAILED: HTTP {response.status_code}")
-                
-                try:
-                    error_data = response.json()
-                    print(f"[NOTIFICATION] Error details: {error_data}")
-                except:
-                    print(f"[NOTIFICATION] Error body: {response.text}")
-                
-                print(f"[NOTIFICATION] ===== END =====")
+                print(f"[NOTIFICATION] ❌ Failed: {response.text}")
+                print(f"[NOTIFICATION] ===== END =====\n")
                 return False
                 
         except Exception as e:
-            print(f"[NOTIFICATION] ❌ EXCEPTION: {e}")
+            print(f"[NOTIFICATION] ❌ Exception: {e}")
             import traceback
-            print(traceback.format_exc())
-            print(f"[NOTIFICATION] ===== END =====")
+            traceback.print_exc()
+            print(f"[NOTIFICATION] ===== END =====\n")
             return False
 
 def format_file_size(size_bytes):
