@@ -33,7 +33,24 @@ import random
 import smtplib
 import traceback
 import queue
-from secrets_util_chatapp import get_secret, get_encrypted_gspread_client
+# ⚡ LAZY IMPORT - Only load when needed, not at startup!
+_secrets_util = None
+
+def _get_secrets_util():
+    """Lazy load secrets_util - only when actually needed"""
+    global _secrets_util
+    if _secrets_util is None:
+        import secrets_util_chatapp
+        _secrets_util = secrets_util_chatapp
+    return _secrets_util
+
+def get_secret(secret_id):
+    """Wrapper for lazy-loaded get_secret"""
+    return _get_secrets_util().get_secret(secret_id)
+
+def get_encrypted_gspread_client():
+    """Wrapper for lazy-loaded get_encrypted_gspread_client"""
+    return _get_secrets_util().get_encrypted_gspread_client()
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
@@ -2715,8 +2732,15 @@ class GoogleSheetsManager:
             print(f"❌ Error assigning activation keys: {e}")
             return assigned
 
-# Initialize Google Sheets Manager
-gsheet_manager = GoogleSheetsManager()
+# ⚡ LAZY INIT - Initialize Google Sheets Manager only when needed
+gsheet_manager = None
+
+def get_gsheet_manager():
+    """Get or create GoogleSheetsManager instance (lazy initialization)"""
+    global gsheet_manager
+    if gsheet_manager is None:
+        gsheet_manager = GoogleSheetsManager()
+    return gsheet_manager
 
 def main(page: ft.Page):
     global CREDENTIALS_FILE, CACHE_DIR, GROUP_ICON_CACHE_DIR, USER_LIST_CACHE_FILE
@@ -5324,7 +5348,7 @@ def main(page: ft.Page):
                 "introducer_id": promoter_referral_id,
             }
 
-            success, message = gsheet_manager.submit_promoter_referral(referral_payload)
+            success, message = get_gsheet_manager().submit_promoter_referral(referral_payload)
 
             if success:
                 show_snackbar("Promoter referral submitted successfully.")
@@ -5505,7 +5529,7 @@ def main(page: ft.Page):
 
             def load_downline_thread():
                 try:
-                    downline_data = gsheet_manager.get_downline_data(promoter_referral_id)
+                    downline_data = get_gsheet_manager().get_downline_data(promoter_referral_id)
                     downline_list_column.controls.clear()
 
                     if not downline_data or not downline_data.get("entries"):
@@ -5578,11 +5602,11 @@ def main(page: ft.Page):
             def fetch_stats_thread():
                 try:
                     # Fetch fresh stats
-                    stats = gsheet_manager.get_promoter_stats(promoter_referral_id)
+                    stats = get_gsheet_manager().get_promoter_stats(promoter_referral_id)
                     downline_bonus = 0
                     
                     try:
-                        downline_data = gsheet_manager.get_downline_data(promoter_referral_id)
+                        downline_data = get_gsheet_manager().get_downline_data(promoter_referral_id)
                         if downline_data:
                             downline_bonus = downline_data.get("total_bonus", 0) or 0
                     except Exception as downline_error:
@@ -5816,7 +5840,7 @@ def main(page: ft.Page):
             
             # Verify and register in background thread
             def register_thread():
-                success, message, referral_id = gsheet_manager.verify_and_register_promoter(
+                success, message, referral_id = get_gsheet_manager().verify_and_register_promoter(
                     activation_key.strip(),
                     email_promo.strip(),
                     upi_id.strip()
@@ -5985,7 +6009,7 @@ def main(page: ft.Page):
 
             new_assignments = []
             if is_registered_promoter and promoter_referral_id:
-                new_assignments = gsheet_manager.assign_activation_keys_for_approved_referrals(promoter_referral_id)
+                new_assignments = get_gsheet_manager().assign_activation_keys_for_approved_referrals(promoter_referral_id)
                 for assignment in new_assignments:
                     system_notifications.append(
                         {
