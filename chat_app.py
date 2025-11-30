@@ -84,6 +84,7 @@ class PushNotificationManager:
         self.player_id = None
         self.db_instance = None
         self.current_user_id = None
+        self.pending_navigation = None  # Store navigation info from tapped notifications
         
         push_debug(f"PushNotificationManager.__init__() called")
         push_debug(f"  page.platform = {page.platform}")
@@ -251,6 +252,7 @@ class PushNotificationManager:
         """Handle when user taps notification - Navigate to chat"""
         try:
             push_debug(f"Notification tapped!")
+            push_debug(f"Raw notification data: {e.data if hasattr(e, 'data') else 'No data'}")
             
             # Get notification data
             notification_data = {}
@@ -258,25 +260,62 @@ class PushNotificationManager:
                 if isinstance(e.data, str):
                     try:
                         notification_data = json.loads(e.data)
-                    except:
+                    except Exception as parse_ex:
+                        push_debug(f"Failed to parse notification data as JSON: {parse_ex}")
                         pass
                 elif isinstance(e.data, dict):
                     notification_data = e.data
             
-            # Extract chat info (from data field we sent)
-            chat_id = notification_data.get('chat_id', '')
-            sender_id = notification_data.get('sender_id', '')
-            message_type = notification_data.get('type', '')
+            push_debug(f"Parsed notification_data: {notification_data}")
             
-            push_debug(f"Opening chat: {chat_id}, sender: {sender_id}, type: {message_type}")
+            # ✅ FIX: Extract from nested structure (custom.a)
+            # Android/FCM wraps our data in: custom -> a -> {our_data}
+            actual_data = notification_data
+            if 'custom' in notification_data:
+                custom = notification_data['custom']
+                if isinstance(custom, dict) and 'a' in custom:
+                    actual_data = custom['a']
+                    push_debug(f"Extracted data from custom.a: {actual_data}")
             
-            # TODO: Navigate to the appropriate chat
-            # You'll need to add logic here to open the specific chat
+            # Extract chat info (from our data field)
+            chat_id = actual_data.get('chat_id', '')
+            sender_id = actual_data.get('sender_id', '')
+            sender_name = actual_data.get('sender_name', 'Someone')
+            message_type = actual_data.get('type', '')
+            is_admin = actual_data.get('is_admin', False)
+            
+            push_debug(f"Chat info - ID: {chat_id}, Sender: {sender_name}, Type: {message_type}")
+            
+            # ✅ FIX: Actually navigate to the chat!
+            if message_type == 'new_message' and chat_id:
+                push_debug(f"Opening private chat: {chat_id}")
+                
+                # Store the chat info so we can open it when app becomes active
+                self.pending_navigation = {
+                    'type': 'private_chat',
+                    'chat_id': chat_id,
+                    'sender_id': sender_id,
+                    'sender_name': sender_name,
+                    'is_admin': is_admin
+                }
+                
+                push_debug(f"✅ Stored pending navigation: {self.pending_navigation}")
+                
+                # Try to navigate immediately if page is available
+                if self.page and hasattr(self.page, 'route'):
+                    try:
+                        # Trigger a page update to process the navigation
+                        self.page.update()
+                        push_debug("✅ Page updated to trigger navigation")
+                    except Exception as nav_ex:
+                        push_debug(f"Could not navigate immediately: {nav_ex}")
+            else:
+                push_debug(f"⚠️ Unknown message type or missing chat_id: type={message_type}, chat_id={chat_id}")
             
         except Exception as exc:
             push_debug(f"Error handling notification tap: {exc}")
             import traceback
-            traceback.print_exc()
+            push_debug(traceback.format_exc())
 
     def handle_notification_received(self, e):
         try:
@@ -3216,19 +3255,40 @@ def main(page: ft.Page):
             return
         
         def open_settings(e):
-            try:
-                # Open app notification settings
-                page.launch_url("app-settings:")
-            except Exception as ex:
-                print(f"Could not open settings: {ex}")
-                try:
-                    # Fallback: open general settings
-                    page.launch_url("content://settings/notification_listener_settings")
-                except:
-                    pass
-            if hasattr(dialog, 'open'):
-                dialog.open = False
+            # Close the dialog first
+            dialog.open = False
+            page.update()
+            
+            # Show instructions dialog
+            instructions_dialog = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Enable Notifications", size=18, weight="bold"),
+                content=ft.Container(
+                    content=ft.Column([
+                        ft.Text("Follow these steps:", size=14, weight="bold"),
+                        ft.Text("1. Open Settings app", size=13),
+                        ft.Text("2. Go to 'Apps' or 'Applications'", size=13),
+                        ft.Text("3. Find and tap 'Chat App'", size=13),
+                        ft.Text("4. Tap 'Notifications'", size=13),
+                        ft.Text("5. Enable 'All notifications'", size=13),
+                        ft.Divider(),
+                        ft.Text("Or swipe down and long-press this notification to access settings quickly!", 
+                               size=12, italic=True, color="blue"),
+                    ], spacing=8, tight=True),
+                    padding=15
+                ),
+                actions=[
+                    ft.TextButton("Got it!", on_click=lambda e: close_instructions(e))
+                ],
+            )
+            
+            def close_instructions(e):
+                instructions_dialog.open = False
                 page.update()
+            
+            page.overlay.append(instructions_dialog)
+            instructions_dialog.open = True
+            page.update()
         
         def dismiss_dialog(e):
             dialog.open = False
@@ -3876,6 +3936,49 @@ def main(page: ft.Page):
         refresh_control["active"] = False
         active_screen["current"] = None 
     
+    def process_pending_notification_navigation():
+        """Check and process any pending navigation from notification tap"""
+        try:
+            if not hasattr(push_manager, 'pending_navigation') or not push_manager.pending_navigation:
+                return
+            
+            nav_info = push_manager.pending_navigation
+            push_debug(f"[NOTIFICATION NAV] Processing pending navigation: {nav_info}")
+            
+            if nav_info.get('type') == 'private_chat':
+                chat_id = nav_info.get('chat_id', '')
+                sender_id = nav_info.get('sender_id', '')
+                sender_name = nav_info.get('sender_name', 'User')
+                
+                if chat_id and sender_id:
+                    # Create user_data object to pass to open_chat
+                    user_data = {
+                        'id': sender_id,
+                        'username': sender_name,
+                        'email': f"{sender_name}@user.com"  # Placeholder
+                    }
+                    
+                    push_debug(f"[NOTIFICATION NAV] Opening chat with user: {user_data}")
+                    
+                    # Use a delayed call to ensure UI is ready
+                    def delayed_open():
+                        time.sleep(0.5)  # Small delay to ensure UI is loaded
+                        try:
+                            open_chat(user_data)
+                            push_debug("[NOTIFICATION NAV] ✅ Chat opened successfully")
+                        except Exception as chat_ex:
+                            push_debug(f"[NOTIFICATION NAV] ❌ Error opening chat: {chat_ex}")
+                    
+                    threading.Thread(target=delayed_open, daemon=True).start()
+            
+            # Clear pending navigation
+            push_manager.pending_navigation = None
+            
+        except Exception as ex:
+            push_debug(f"[NOTIFICATION NAV] Error processing navigation: {ex}")
+            import traceback
+            push_debug(traceback.format_exc())
+    
     def show_main_menu():
         nonlocal current_username, promoter_content, promoter_screen_initialized, promoter_needs_refresh, main_menu_initialized  # Make sure we can modify it
         
@@ -3966,8 +4069,19 @@ def main(page: ft.Page):
         threading.Thread(target=monitor_connection, daemon=True).start()
         update_offline_status()  # Check immediately
         
-        # Load current user profile
+        # Load current user profile - WITH DEBUGGING
+        print(f"\n[PROFILE LOAD] ===== LOADING PROFILE =====")
+        print(f"[PROFILE LOAD] User ID: {auth.user_id}")
         profile = db.get_user_profile(auth.user_id)
+        print(f"[PROFILE LOAD] Profile loaded: {profile is not None}")
+        
+        if profile:
+            print(f"[PROFILE LOAD] Has promoter_status: {'promoter_status' in profile}")
+            if 'promoter_status' in profile:
+                print(f"[PROFILE LOAD] Promoter Status: {profile['promoter_status']}")
+                print(f"[PROFILE LOAD] Referral ID: {profile['promoter_status'].get('referral_id', 'NONE')}")
+        print(f"[PROFILE LOAD] ===== END =====\n")
+        
         profile_image_url = profile.get("profile_image_url") if profile else None
         
         # Ensure display_username is always a string
@@ -5299,10 +5413,17 @@ def main(page: ft.Page):
         # TAB 0: PROMOTER REGISTRATION & DASHBOARD
         # =============================================
         
-        # Check if user is already registered as promoter
+        # Check if user is already registered as promoter - WITH DEBUGGING
+        print(f"\n[PROMOTER CHECK] ===== LOADING PROMOTER DATA =====")
+        print(f"[PROMOTER CHECK] User ID: {auth.user_id}")
         promoter_status = profile.get("promoter_status", {}) if profile else {}
         is_registered_promoter = promoter_status.get("registered", False)
         promoter_referral_id = promoter_status.get("referral_id", "")
+        
+        print(f"[PROMOTER CHECK] Registered: {is_registered_promoter}")
+        print(f"[PROMOTER CHECK] Referral ID: {promoter_referral_id}")
+        print(f"[PROMOTER CHECK] Full Status: {promoter_status}")
+        print(f"[PROMOTER CHECK] ===== END =====\n")
 
         # State for showing registration form
         show_registration_form = {"visible": False}
@@ -7247,6 +7368,10 @@ def main(page: ft.Page):
 
         # Load private chats data in background
         threading.Thread(target=load_private_chats, daemon=True).start()
+        
+        # ✅ Check for pending notification navigation (if user tapped notification)
+        process_pending_notification_navigation()
+        
         # Load private chats data
         
         
@@ -7366,15 +7491,35 @@ def main(page: ft.Page):
     def handle_logout():
         push_debug("Logout triggered: calling logout_user()")
         
-        # ✅ FIX #2: Clear promoter stats cache to prevent showing wrong stats on account switch
-        print("[LOGOUT] Clearing promoter stats cache...")
+        # ✅ Clear ALL promoter-related data
+        print("[LOGOUT] ===== CLEARING ALL DATA =====")
+        print(f"[LOGOUT] Current auth.user_id before logout: {auth.user_id if auth else 'None'}")
+        
+        # Clear stats cache
         promoter_stats_cache["loaded"] = False
         promoter_stats_cache["data"] = None
         promoter_stats_cache["timestamp"] = 0
-        print("[LOGOUT] Promoter cache cleared ✅")
+        print("[LOGOUT] ✅ Stats cache cleared")
         
+        # Clear Firebase profile cache (force fresh load on next login)
+        try:
+            # Force garbage collection to clear any cached data
+            import gc
+            gc.collect()
+            print("[LOGOUT] ✅ Memory cleared")
+        except:
+            pass
+        
+        # Logout from push notifications
         push_manager.logout_user()
+        print("[LOGOUT] ✅ Push manager logged out")
+        
+        # Clear credentials
         CredentialsManager.clear_credentials()
+        print("[LOGOUT] ✅ Credentials cleared")
+        
+        print("[LOGOUT] ===== LOGOUT COMPLETE =====\n")
+        
         show_snackbar("Logged out successfully")
         show_login_view()
     
