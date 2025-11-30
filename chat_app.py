@@ -88,8 +88,15 @@ class PushNotificationManager:
         try:
             push_debug(f"Creating OneSignal with APP_ID: {ONESIGNAL_APP_ID[:8]}...")
             
+            # ✅ CRITICAL FIX: Create settings with notification permission request
+            settings = fos.OneSignalSettings(
+                app_id=ONESIGNAL_APP_ID,
+                # ✅ Request notification permission on Android
+                auto_prompt=True,  # Automatically prompt for permission
+            )
+            
             self.onesignal = fos.OneSignal(
-                settings=fos.OneSignalSettings(app_id=ONESIGNAL_APP_ID),
+                settings=settings,
                 on_notification_opened=self.handle_notification_opened,
                 on_notification_received=self.handle_notification_received,
             )
@@ -99,6 +106,15 @@ class PushNotificationManager:
             push_debug("OneSignal added to page.overlay")
             
             self.page.update()
+            
+            # ✅ CRITICAL: Explicitly request notification permission
+            try:
+                push_debug("🔔 Requesting notification permission...")
+                permission_result = self.onesignal.prompt_for_push_notifications()
+                push_debug(f"🔔 Permission result: {permission_result}")
+            except Exception as perm_error:
+                push_debug(f"⚠️ Permission request error (this is OK on some devices): {perm_error}")
+            
             push_debug("=== init_onesignal() SUCCESS ===")
             
         except Exception as exc:
@@ -107,7 +123,7 @@ class PushNotificationManager:
             push_debug(traceback.format_exc())
     
     def get_player_id_delayed(self, delay=10):
-        """Retrieve OneSignal ID after delay - matches test app timing"""
+        """Retrieve OneSignal ID after delay - IMPROVED VERSION"""
         push_debug(f"get_player_id_delayed() scheduled for {delay}s")
         
         def delayed_retrieval():
@@ -119,35 +135,62 @@ class PushNotificationManager:
                     push_debug("ERROR: onesignal is None!")
                     return
                 
-                # Try to get OneSignal ID
-                self.player_id = self.onesignal.get_onesignal_id()
-                push_debug(f"get_onesignal_id() returned: {self.player_id}")
+                # ✅ TRY MULTIPLE TIMES with increasing delays
+                max_attempts = 5
+                retry_delays = [0, 3, 5, 10, 15]  # Try immediately, then with delays
                 
-                # ✅ FIX: Check if it's the error string from test app
-                if self.player_id and isinstance(self.player_id, str):
-                    if "does not exist" in self.player_id.lower():
-                        push_debug("⚠️ Got error string, retrying in 5s...")
-                        time.sleep(5)
-                        self.player_id = self.onesignal.get_onesignal_id()
-                        push_debug(f"Retry result: {self.player_id}")
-                
-                if self.player_id and isinstance(self.player_id, str) and "does not exist" not in self.player_id.lower():
-                    push_debug(f"✅ SUCCESS! Player ID: {self.player_id}")
+                for attempt in range(max_attempts):
+                    if attempt > 0:
+                        push_debug(f"⏳ Retry attempt {attempt + 1}/{max_attempts} after {retry_delays[attempt]}s...")
+                        time.sleep(retry_delays[attempt])
                     
-                    # Save to Firebase
-                    if self.db_instance and self.current_user_id:
-                        push_debug(f"Saving to Firebase for user: {self.current_user_id}")
-                        success = self.db_instance.save_user_onesignal_id(
-                            self.current_user_id, 
-                            self.player_id
-                        )
-                        if success:
-                            push_debug("✅ Saved to Firebase successfully")
+                    # Try to get OneSignal ID
+                    self.player_id = self.onesignal.get_onesignal_id()
+                    push_debug(f"Attempt {attempt + 1}: get_onesignal_id() returned: {self.player_id}")
+                    
+                    # Check if valid
+                    if self.player_id and isinstance(self.player_id, str):
+                        if "does not exist" not in self.player_id.lower() and len(self.player_id) > 10:
+                            push_debug(f"✅ SUCCESS! Valid Player ID: {self.player_id}")
+                            
+                            # Save to Firebase
+                            if self.db_instance and self.current_user_id:
+                                push_debug(f"Saving to Firebase for user: {self.current_user_id}")
+                                success = self.db_instance.save_user_onesignal_id(
+                                    self.current_user_id, 
+                                    self.player_id
+                                )
+                                if success:
+                                    push_debug("✅ Saved to Firebase successfully")
+                                    
+                                    # ✅ VERIFY IT WAS SAVED
+                                    time.sleep(1)  # Wait a bit
+                                    saved_id = self.db_instance.get_user_onesignal_id(self.current_user_id)
+                                    push_debug(f"✅ Verification - ID in Firebase: {saved_id}")
+                                    
+                                    if saved_id == self.player_id:
+                                        push_debug("🎉 PERFECT! Player ID verified in Firebase")
+                                        return  # Success!
+                                    else:
+                                        push_debug(f"⚠️ WARNING: Saved ID doesn't match. Trying again...")
+                                else:
+                                    push_debug("⚠️ Failed to save to Firebase, retrying...")
+                            else:
+                                push_debug("⚠️ db_instance or current_user_id is None")
+                                return
                         else:
-                            push_debug("⚠️ Failed to save to Firebase")
-                else:
-                    push_debug(f"⚠️ Player ID invalid or None: {self.player_id}")
-                    
+                            push_debug(f"⚠️ Player ID invalid (attempt {attempt + 1}): {self.player_id}")
+                    else:
+                        push_debug(f"⚠️ Player ID is None or wrong type (attempt {attempt + 1})")
+                
+                # If we get here, all attempts failed
+                push_debug(f"❌ FAILED after {max_attempts} attempts")
+                push_debug("❌ User will NOT receive push notifications")
+                push_debug("❌ Possible solutions:")
+                push_debug("   1. Uninstall app completely and reinstall")
+                push_debug("   2. Clear app data in Settings")
+                push_debug("   3. Check OneSignal dashboard for device registration")
+                        
             except Exception as exc:
                 push_debug(f"ERROR in get_player_id_delayed: {exc}")
                 import traceback
@@ -182,6 +225,14 @@ class PushNotificationManager:
             push_debug("Calling onesignal.login()...")
             result = self.onesignal.login(user_id)
             push_debug(f"login() returned: {result}")
+            
+            # ✅ NEW: Request notification permission after login
+            try:
+                push_debug("🔔 Requesting notification permission after login...")
+                permission = self.onesignal.prompt_for_push_notifications()
+                push_debug(f"🔔 Permission granted: {permission}")
+            except Exception as perm_error:
+                push_debug(f"⚠️ Permission error: {perm_error}")
             
             # ✅ Use same timing as test app: 10 seconds
             self.get_player_id_delayed(delay=10)
