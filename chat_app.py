@@ -33,7 +33,7 @@ import random
 import smtplib
 import traceback
 import queue
-from secrets_util import get_secret, get_encrypted_gspread_client
+from secrets_util_chatapp import get_secret, get_encrypted_gspread_client
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
