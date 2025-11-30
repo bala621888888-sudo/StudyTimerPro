@@ -1934,7 +1934,7 @@ class FirebaseDatabase:
     
     
     def send_onesignal_notification(self, receiver_user_id, title, message, data=None):
-        """Send notification via OneSignal REST API using Subscription ID"""
+        """Send notification via OneSignal using External User ID"""
         
         print(f"\n[NOTIFICATION] ===== START =====")
         print(f"[NOTIFICATION] Receiver User ID: {receiver_user_id}")
@@ -1942,40 +1942,7 @@ class FirebaseDatabase:
         print(f"[NOTIFICATION] Message: {message[:100]}")
         
         try:
-            # Step 1: Get Subscription ID from OneSignal using External User ID
-            print(f"[NOTIFICATION] Getting Subscription ID from OneSignal...")
-            
-            # Query OneSignal for this user's subscription
-            query_url = f"https://onesignal.com/api/v1/players?app_id={ONESIGNAL_APP_ID}&limit=10"
-            query_headers = {"Authorization": f"Basic {ONESIGNAL_REST_API_KEY}"}
-            
-            response = requests.get(query_url, headers=query_headers, timeout=10)
-            
-            if response.status_code != 200:
-                print(f"[NOTIFICATION] ❌ Failed to query players: {response.status_code}")
-                return False
-            
-            players = response.json().get('players', [])
-            print(f"[NOTIFICATION] Found {len(players)} total players")
-            
-            # Find player with matching external_user_id
-            subscription_id = None
-            for player in players:
-                if player.get('external_user_id') == receiver_user_id:
-                    # Check if subscribed
-                    if player.get('notification_types', 0) > 0:
-                        subscription_id = player.get('identifier')  # This is Subscription ID
-                        print(f"[NOTIFICATION] ✅ Found subscribed player!")
-                        print(f"[NOTIFICATION] Subscription ID: {subscription_id}")
-                        break
-            
-            if not subscription_id:
-                print(f"[NOTIFICATION] ❌ No subscribed device found for user {receiver_user_id}")
-                return False
-            
-            # Step 2: Send notification using Subscription ID
-            print(f"[NOTIFICATION] Sending via OneSignal API...")
-            
+            # ✅ Send directly using External User ID - No need to query!
             notification_url = "https://onesignal.com/api/v1/notifications"
             notification_headers = {
                 "Content-Type": "application/json; charset=utf-8",
@@ -1984,12 +1951,14 @@ class FirebaseDatabase:
             
             payload = {
                 "app_id": ONESIGNAL_APP_ID,
-                "include_subscription_ids": [subscription_id],  # ✅ Use Subscription ID!
+                "include_external_user_ids": [receiver_user_id],  # ✅ Use Firebase User ID directly
                 "headings": {"en": title},
                 "contents": {"en": message},
-                "data": data or {}
+                "data": data or {},
+                "priority": 10
             }
             
+            print(f"[NOTIFICATION] Sending to External User ID: {receiver_user_id}")
             print(f"[NOTIFICATION] Payload: {json.dumps(payload, indent=2)}")
             
             response = requests.post(notification_url, json=payload, headers=notification_headers, timeout=10)
@@ -2000,17 +1969,21 @@ class FirebaseDatabase:
             if response.status_code == 200:
                 result = response.json()
                 recipients = result.get('recipients', 0)
+                errors = result.get('errors')
                 
                 if recipients > 0:
                     print(f"[NOTIFICATION] ✅ SUCCESS! Sent to {recipients} recipient(s)")
                     print(f"[NOTIFICATION] ===== END =====\n")
                     return True
                 else:
-                    print(f"[NOTIFICATION] ⚠️ Sent but 0 recipients: {result}")
+                    print(f"[NOTIFICATION] ⚠️ Sent but 0 recipients")
+                    if errors:
+                        print(f"[NOTIFICATION] Errors: {errors}")
+                    print(f"[NOTIFICATION] Full result: {result}")
                     print(f"[NOTIFICATION] ===== END =====\n")
                     return False
             else:
-                print(f"[NOTIFICATION] ❌ Failed: {response.text}")
+                print(f"[NOTIFICATION] ❌ Failed: {response.status_code} - {response.text}")
                 print(f"[NOTIFICATION] ===== END =====\n")
                 return False
                 
@@ -2020,7 +1993,6 @@ class FirebaseDatabase:
             traceback.print_exc()
             print(f"[NOTIFICATION] ===== END =====\n")
             return False
-
 def format_file_size(size_bytes):
     """Convert bytes to human readable format"""
     for unit in ['B', 'KB', 'MB', 'GB']:
@@ -4671,6 +4643,7 @@ def main(page: ft.Page):
             
             # ✅ Start auto-refresh timer
             start_auto_refresh_messages(interval=5)
+            refresh_control["active"] = True  # ✅ Enable refresh just like private chat
 
         def load_specific_group_messages(group_id):
             """Load messages for a specific group (always rebuild UI)"""
