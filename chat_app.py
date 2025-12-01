@@ -3247,11 +3247,13 @@ def main(page: ft.Page):
     # SHOW LOADING IMMEDIATELY (before storage)
     # ============================================
     loading_container = ft.Container(
-        content=ft.Column([
-            ft.ProgressRing(width=50, height=50),
-        ], horizontal_alignment="center", spacing=20),
+        content=ft.Column(
+            [ft.Text("Connecting to Firebase...", size=16)],
+            horizontal_alignment="center",
+            spacing=12,
+        ),
         expand=True,
-        alignment=ft.alignment.center
+        alignment=ft.alignment.center,
     )
     page.add(loading_container)
     page.update()
@@ -3407,10 +3409,11 @@ def main(page: ft.Page):
     # ============================================
     # UPDATE LOADING MESSAGE
     # ============================================
-    loading_container.content = ft.Column([
-        ft.ProgressRing(width=50, height=50),
-        ft.Text("Connecting to Firebase...", size=16)
-    ], horizontal_alignment="center", spacing=20)
+    loading_container.content = ft.Column(
+        [ft.Text("", size=16)],
+        horizontal_alignment="center",
+        spacing=12,
+    )
     page.update()
     
     # ============================================
@@ -4867,22 +4870,7 @@ def main(page: ft.Page):
             
             save_notification_cache()
 
-            notification_items = []
-
-            if system_notifications:
-                for item in reversed(system_notifications):
-                    notification_items.append(
-                        ft.ListTile(
-                            title=ft.Text(item.get("title", "Notification"), weight="bold"),
-                            subtitle=ft.Text(item.get("message", "")),
-                        )
-                    )
-            else:
-                notification_items.append(ft.Text("No system notifications yet.", size=12, color="grey"))
-
-            notification_items.append(ft.Divider())
-
-            notification_items.append(
+            notification_items = [
                 ft.Row(
                     [
                         ft.Text(
@@ -4895,8 +4883,20 @@ def main(page: ft.Page):
                         ),
                     ],
                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                )
-            )
+                ),
+                ft.Divider(),
+            ]
+
+            if system_notifications:
+                for item in reversed(system_notifications):
+                    notification_items.append(
+                        ft.ListTile(
+                            title=ft.Text(item.get("title", "Notification"), weight="bold"),
+                            subtitle=ft.Text(item.get("message", "")),
+                        )
+                    )
+            else:
+                notification_items.append(ft.Text("No system notifications yet.", size=12, color="grey"))
 
             dialog = ft.AlertDialog(
                 title=ft.Text("Notifications", size=18, weight="bold"),
@@ -6106,6 +6106,9 @@ def main(page: ft.Page):
             width=420,
         )
 
+        referral_submit_button = None
+        referral_submit_in_progress = {"value": False}
+
         def reset_referral_errors():
             promoter_full_name_field.error_text = None
             primary_platform_dropdown.error_text = None
@@ -6131,69 +6134,86 @@ def main(page: ft.Page):
             page.update()
 
         def submit_promoter_referral(e):
-            reset_referral_errors()
-            valid = True
-
-            if not promoter_full_name_field.value:
-                promoter_full_name_field.error_text = "Required"
-                valid = False
-
-            if not primary_platform_dropdown.value:
-                primary_platform_dropdown.error_text = "Required"
-                valid = False
-
-            profile_link = platform_profile_link_field.value or ""
-            if not profile_link.strip():
-                platform_profile_link_field.error_text = "Required"
-                valid = False
-
-            if not estimated_followers_field.value:
-                estimated_followers_field.error_text = "Required"
-                valid = False
-
-            email_value = (contact_email_field.value or "").strip()
-            if not email_value or "@" not in email_value or "." not in email_value:
-                contact_email_field.error_text = "Enter a valid email"
-                valid = False
-
-            if not referral_reason_field.value:
-                referral_reason_field.error_text = "Required"
-                valid = False
-
-            selected_promotions = [
-                checkbox.label for checkbox in promotion_type_checkboxes if checkbox.value
-            ]
-            if not selected_promotions:
-                show_snackbar("Please select at least one Promotion Type")
-                valid = False
-
-            if not valid:
-                page.update()
+            if referral_submit_in_progress["value"]:
                 return
 
-            referral_payload = {
-                "full_name": promoter_full_name_field.value.strip(),
-                "primary_platform": primary_platform_dropdown.value,
-                "profile_link": profile_link.strip(),
-                "followers": estimated_followers_field.value.strip(),
-                "email": email_value,
-                "phone": (phone_number_field.value or "").strip(),
-                "referral_reason": referral_reason_field.value.strip(),
-                "promotion_type": ", ".join(selected_promotions),
-                "additional_info": (additional_info_field.value or "").strip(),
-                "introducer_id": promoter_referral_id,
-            }
-
-            success, message = get_gsheet_manager().submit_promoter_referral(referral_payload)
-
-            if success:
-                show_snackbar("Promoter referral submitted successfully.")
-                clear_referral_form_fields()
-                referral_dialog.open = False
-            else:
-                show_snackbar(message or "Failed to submit promoter referral. Please try again.")
-
+            referral_submit_in_progress["value"] = True
+            if referral_submit_button:
+                referral_submit_button.disabled = True
             page.update()
+
+            try:
+                reset_referral_errors()
+                valid = True
+
+                if not promoter_full_name_field.value:
+                    promoter_full_name_field.error_text = "Required"
+                    valid = False
+
+                if not primary_platform_dropdown.value:
+                    primary_platform_dropdown.error_text = "Required"
+                    valid = False
+
+                profile_link = platform_profile_link_field.value or ""
+                if not profile_link.strip():
+                    platform_profile_link_field.error_text = "Required"
+                    valid = False
+
+                if not estimated_followers_field.value:
+                    estimated_followers_field.error_text = "Required"
+                    valid = False
+
+                email_value = (contact_email_field.value or "").strip()
+                if not email_value or "@" not in email_value or "." not in email_value:
+                    contact_email_field.error_text = "Enter a valid email"
+                    valid = False
+
+                if not referral_reason_field.value:
+                    referral_reason_field.error_text = "Required"
+                    valid = False
+
+                selected_promotions = [
+                    checkbox.label for checkbox in promotion_type_checkboxes if checkbox.value
+                ]
+                if not selected_promotions:
+                    show_snackbar("Please select at least one Promotion Type")
+                    valid = False
+
+                if not valid:
+                    page.update()
+                    return
+
+                referral_payload = {
+                    "full_name": promoter_full_name_field.value.strip(),
+                    "primary_platform": primary_platform_dropdown.value,
+                    "profile_link": profile_link.strip(),
+                    "followers": estimated_followers_field.value.strip(),
+                    "email": email_value,
+                    "phone": (phone_number_field.value or "").strip(),
+                    "referral_reason": referral_reason_field.value.strip(),
+                    "promotion_type": ", ".join(selected_promotions),
+                    "additional_info": (additional_info_field.value or "").strip(),
+                    "introducer_id": promoter_referral_id,
+                }
+
+                success, message = get_gsheet_manager().submit_promoter_referral(referral_payload)
+
+                if success:
+                    show_snackbar("Promoter referral submitted successfully.")
+                    clear_referral_form_fields()
+                    referral_dialog.open = False
+                else:
+                    show_snackbar(message or "Failed to submit promoter referral. Please try again.")
+
+            finally:
+                referral_submit_in_progress["value"] = False
+                if referral_submit_button:
+                    referral_submit_button.disabled = False
+                page.update()
+
+        referral_submit_button = ft.FilledButton(
+            "Submit", on_click=submit_promoter_referral
+        )
 
         referral_dialog = ft.AlertDialog(
             modal=True,
@@ -6230,7 +6250,7 @@ def main(page: ft.Page):
             ),
             actions=[
                 ft.TextButton("Cancel", on_click=close_referral_dialog),
-                ft.FilledButton("Submit", on_click=submit_promoter_referral),
+                referral_submit_button,
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
@@ -7694,7 +7714,6 @@ def main(page: ft.Page):
                         ft.Text("Private Chats", size=20, weight="bold", expand=True)
                     ]),
                     padding=ft.padding.only(left=10, right=15, top=10, bottom=10),
-                    bgcolor="#E3F2FD"
                 ),
                 ft.Container(
                     content=private_chats_column,
