@@ -252,141 +252,170 @@ class PushNotificationManager:
         """Handle when user taps notification - Navigate to chat (NO RAW JSON DISPLAY)"""
         try:
             push_debug(f"Notification tapped!")
-            push_debug(f"Raw notification data: {e.data if hasattr(e, 'data') else 'No data'}")
             
-            # Get notification data
+            # ✅ FIX 2: Get raw data and parse it properly
+            raw_data = None
+            if hasattr(e, 'data'):
+                raw_data = e.data
+            elif hasattr(e, 'notification'):
+                raw_data = e.notification
+            
+            push_debug(f"Raw notification data type: {type(raw_data)}")
+            
+            # ✅ FIX 2: Parse the notification data - handle all formats
             notification_data = {}
-            if hasattr(e, 'data') and e.data:
-                if isinstance(e.data, str):
+            actual_data = {}
+            
+            if raw_data:
+                # If it's a string, try to parse as JSON
+                if isinstance(raw_data, str):
                     try:
-                        notification_data = json.loads(e.data)
-                    except Exception as parse_ex:
-                        push_debug(f"Failed to parse notification data as JSON: {parse_ex}")
-                        # ✅ FIX 2: Don't show error to user, just log it
-                        return
-                elif isinstance(e.data, dict):
-                    notification_data = e.data
+                        notification_data = json.loads(raw_data)
+                    except:
+                        push_debug(f"Could not parse raw_data as JSON")
+                        notification_data = {}
+                elif isinstance(raw_data, dict):
+                    notification_data = raw_data
+                else:
+                    push_debug(f"Unknown raw_data type: {type(raw_data)}")
+                    notification_data = {}
             
-            push_debug(f"Parsed notification_data: {notification_data}")
+            push_debug(f"Parsed notification_data keys: {notification_data.keys() if notification_data else 'empty'}")
             
-            # ✅ FIX 2: Extract from nested structure (custom.a)
-            # Android/FCM wraps our data in: custom -> a -> {our_data}
-            # NOTE: custom can be a STRING containing JSON, not a dict!
-            actual_data = notification_data
+            # ✅ FIX 2: Extract actual data from nested structures
+            # OneSignal/FCM can nest data in multiple ways:
+            # 1. Direct: {chat_id, sender_id, type, ...}
+            # 2. Nested in 'custom': {"custom": {"a": {chat_id, ...}}}
+            # 3. Nested in 'custom' as string: {"custom": '{"a": {"chat_id": ...}}'}
+            # 4. Nested in 'data': {"data": {chat_id, ...}}
+            
+            actual_data = notification_data.copy()
+            
+            # Try to extract from 'custom' field
             if 'custom' in notification_data:
                 custom = notification_data['custom']
                 
-                # ✅ FIX 2: Handle custom being a JSON string
+                # Parse if string
                 if isinstance(custom, str):
                     try:
                         custom = json.loads(custom)
-                        push_debug(f"Parsed custom from string: {custom}")
                     except:
-                        push_debug(f"Could not parse custom string")
                         custom = {}
                 
-                if isinstance(custom, dict) and 'a' in custom:
-                    additional_data = custom['a']
-                    # ✅ FIX 2: additional_data might also be a JSON string
-                    if isinstance(additional_data, str):
-                        try:
-                            additional_data = json.loads(additional_data)
-                        except:
-                            additional_data = {}
-                    actual_data = additional_data
-                    push_debug(f"Extracted data from custom.a: {actual_data}")
+                # Extract from 'a' (additional data)
+                if isinstance(custom, dict):
+                    if 'a' in custom:
+                        a_data = custom['a']
+                        if isinstance(a_data, str):
+                            try:
+                                a_data = json.loads(a_data)
+                            except:
+                                a_data = {}
+                        if isinstance(a_data, dict):
+                            actual_data = a_data
+                    elif 'i' in custom:
+                        # Sometimes data is in 'i' field
+                        pass
             
-            # Extract chat info (from our data field)
+            # Try to extract from 'data' field
+            if 'data' in notification_data and isinstance(notification_data['data'], dict):
+                actual_data = notification_data['data']
+            
+            # ✅ FIX 2: Extract chat info
             chat_id = actual_data.get('chat_id', '')
             sender_id = actual_data.get('sender_id', '')
             sender_name = actual_data.get('sender_name', 'Someone')
             message_type = actual_data.get('type', '')
-            is_admin = actual_data.get('is_admin', False)
-            
-            # ✅ FIX 2: Also check for group message type
+            is_admin_msg = actual_data.get('is_admin', False)
             group_id = actual_data.get('group_id', '')
             group_name = actual_data.get('group_name', '')
             
-            push_debug(f"Chat info - ID: {chat_id}, Sender: {sender_name}, Type: {message_type}")
+            push_debug(f"Extracted - type: {message_type}, chat_id: {chat_id}, group_id: {group_id}")
             
-            # ✅ FIX 2: Navigate to the appropriate chat
+            # ✅ FIX 2: Handle navigation based on message type
             if message_type == 'new_message' and chat_id:
-                push_debug(f"Opening private chat: {chat_id}")
-                
-                # Store the chat info so we can open it when app becomes active
                 self.pending_navigation = {
                     'type': 'private_chat',
                     'chat_id': chat_id,
                     'sender_id': sender_id,
                     'sender_name': sender_name,
-                    'is_admin': is_admin
+                    'is_admin': is_admin_msg
                 }
+                push_debug(f"✅ Set pending navigation for private chat")
                 
-                push_debug(f"✅ Stored pending navigation: {self.pending_navigation}")
-                
-                # Try to navigate immediately if page is available
-                if self.page and hasattr(self.page, 'route'):
-                    try:
-                        self.page.update()
-                        push_debug("✅ Page updated to trigger navigation")
-                    except Exception as nav_ex:
-                        push_debug(f"Could not navigate immediately: {nav_ex}")
-                        
             elif message_type == 'group_message' and group_id:
-                push_debug(f"Opening group chat: {group_id}")
-                
                 self.pending_navigation = {
                     'type': 'group_chat',
                     'group_id': group_id,
                     'group_name': group_name,
                     'sender_id': sender_id,
                     'sender_name': sender_name,
-                    'is_admin': is_admin
+                    'is_admin': is_admin_msg
                 }
-                
-                push_debug(f"✅ Stored pending group navigation: {self.pending_navigation}")
-                
-                if self.page and hasattr(self.page, 'route'):
-                    try:
-                        self.page.update()
-                    except Exception as nav_ex:
-                        push_debug(f"Could not navigate immediately: {nav_ex}")
+                push_debug(f"✅ Set pending navigation for group chat")
             else:
-                push_debug(f"⚠️ Unknown message type or missing chat_id: type={message_type}, chat_id={chat_id}")
-                # ✅ FIX 2: Don't show any dialog with raw data - just silently log
+                # ✅ FIX 2: Even if we can't parse, just open the app normally
+                # DON'T show any JSON or error dialog
+                push_debug(f"⚠️ Unknown notification type, opening app normally")
+                self.pending_navigation = None
             
+            # Try to trigger navigation
+            if self.page:
+                try:
+                    self.page.update()
+                except:
+                    pass
+                    
         except Exception as exc:
+            # ✅ FIX 2: Never show errors to user - just log
             push_debug(f"Error handling notification tap: {exc}")
             import traceback
             push_debug(traceback.format_exc())
-            # ✅ FIX 2: Don't show error to user
 
     def handle_notification_received(self, e):
+        """Handle notification received while app is open - DON'T show raw JSON"""
         try:
-            notification = getattr(e, "notification_received", None) or {}
-            push_debug(f"Notification RECEIVED: {notification}")
+            push_debug(f"Notification RECEIVED in foreground")
             
-            title = "Notification"
+            # ✅ FIX 2: Get notification info safely
+            title = "New Message"
             body = ""
-
-            if isinstance(notification, dict):
-                title = notification.get("title") or title
-                body = notification.get("body") or body
+            
+            # Try to extract title/body from event
+            if hasattr(e, 'notification_received'):
+                notif = e.notification_received
+                if isinstance(notif, dict):
+                    title = notif.get('title', title)
+                    body = notif.get('body', '')
+                elif isinstance(notif, str):
+                    # ✅ FIX 2: Don't show raw JSON string
+                    if notif.startswith('{'):
+                        try:
+                            parsed = json.loads(notif)
+                            title = parsed.get('title', title)
+                            body = parsed.get('body', '')
+                        except:
+                            # If it's JSON we can't parse, don't show it
+                            body = "You have a new notification"
+                    else:
+                        body = notif
+            
+            # ✅ FIX 2: Only show clean notification, never raw JSON
+            if body and not body.startswith('{') and not '"google.' in body:
+                snack = ft.SnackBar(
+                    content=ft.Column([
+                        ft.Text(title, weight="bold", color="white"),
+                        ft.Text(body[:100], color="white"),  # Limit length
+                    ], spacing=2),
+                    bgcolor="#2196F3",
+                    duration=4000,
+                )
+                self.page.overlay.append(snack)
+                snack.open = True
+                self.page.update()
             else:
-                body = str(notification)
-
-            # Show in-app notification banner
-            snack = ft.SnackBar(
-                content=ft.Column([
-                    ft.Text(title, weight="bold", color="white"),
-                    ft.Text(body, color="white"),
-                ], spacing=2),
-                bgcolor="#2196F3",
-                duration=4000,
-            )
-            self.page.overlay.append(snack)
-            snack.open = True
-            self.page.update()
+                # Don't show anything if body looks like JSON
+                push_debug("Suppressed raw JSON notification display")
             
         except Exception as exc:
             push_debug(f"Notification received error: {exc}")
@@ -3338,40 +3367,85 @@ def main(page: ft.Page):
             dialog.open = False
             page.update()
             
-            # ✅ FIX 1: Directly launch Android notification settings
-            try:
-                # Get package name - try multiple methods
-                package_name = "com.example.chat_app"  # Default
-                
-                try:
-                    # Try to get from Flet page
-                    if hasattr(page, 'package_name') and page.package_name:
-                        package_name = page.package_name
-                except:
-                    pass
-                
-                # Try environment variable
-                env_package = os.environ.get("ANDROID_PACKAGE_NAME")
-                if env_package:
-                    package_name = env_package
-                
-                # Launch Android notification settings directly using Intent
-                intent_cmd = f"am start -a android.settings.APP_NOTIFICATION_SETTINGS --es android.provider.extra.APP_PACKAGE {package_name}"
-                
-                print(f"[NOTIFICATION] Launching settings with command: {intent_cmd}")
-                result = os.system(intent_cmd)
-                
-                if result != 0:
-                    # Fallback: Try alternative intent format
-                    alt_cmd = f"am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d package:{package_name}"
-                    os.system(alt_cmd)
-                
-                print(f"[NOTIFICATION] Launched settings for package: {package_name}")
-                show_snackbar("Opening notification settings...")
-                
-            except Exception as settings_ex:
-                print(f"[NOTIFICATION] Could not open settings directly: {settings_ex}")
-                show_snackbar("Go to Settings > Apps > Chat App > Notifications to enable")
+            # ✅ FIX 1: Show instructions dialog since we can't directly open settings from Flet
+            instructions_dialog = ft.AlertDialog(
+                modal=True,
+                title=ft.Row([
+                    ft.Icon(ft.Icons.SETTINGS, color="blue", size=24),
+                    ft.Text("Enable Notifications", size=18, weight="bold")
+                ], spacing=8),
+                content=ft.Container(
+                    content=ft.Column([
+                        ft.Text("To enable notifications:", size=14, weight="bold"),
+                        ft.Container(height=10),
+                        ft.Row([
+                            ft.Container(
+                                content=ft.Text("1", size=12, color="white", weight="bold"),
+                                width=24, height=24, bgcolor="blue",
+                                border_radius=12, alignment=ft.alignment.center
+                            ),
+                            ft.Text("Long press this app icon on home screen", size=13, expand=True)
+                        ], spacing=10),
+                        ft.Container(height=8),
+                        ft.Row([
+                            ft.Container(
+                                content=ft.Text("2", size=12, color="white", weight="bold"),
+                                width=24, height=24, bgcolor="blue",
+                                border_radius=12, alignment=ft.alignment.center
+                            ),
+                            ft.Text("Tap 'App info' or ⓘ icon", size=13, expand=True)
+                        ], spacing=10),
+                        ft.Container(height=8),
+                        ft.Row([
+                            ft.Container(
+                                content=ft.Text("3", size=12, color="white", weight="bold"),
+                                width=24, height=24, bgcolor="blue",
+                                border_radius=12, alignment=ft.alignment.center
+                            ),
+                            ft.Text("Tap 'Notifications'", size=13, expand=True)
+                        ], spacing=10),
+                        ft.Container(height=8),
+                        ft.Row([
+                            ft.Container(
+                                content=ft.Text("4", size=12, color="white", weight="bold"),
+                                width=24, height=24, bgcolor="blue",
+                                border_radius=12, alignment=ft.alignment.center
+                            ),
+                            ft.Text("Enable 'All notifications'", size=13, expand=True)
+                        ], spacing=10),
+                        ft.Container(height=15),
+                        ft.Container(
+                            content=ft.Row([
+                                ft.Icon(ft.Icons.LIGHTBULB, size=16, color="orange"),
+                                ft.Text("Or: Settings → Apps → Chat App → Notifications", 
+                                       size=11, color="grey", italic=True, expand=True)
+                            ], spacing=5),
+                            bgcolor="#FFF3E0",
+                            padding=10,
+                            border_radius=8
+                        ),
+                    ], spacing=0, tight=True),
+                    width=300,
+                    padding=10
+                ),
+                actions=[
+                    ft.ElevatedButton(
+                        "Done", 
+                        on_click=lambda e: close_instructions(e),
+                        bgcolor="blue",
+                        color="white"
+                    )
+                ],
+                actions_alignment=ft.MainAxisAlignment.CENTER,
+            )
+            
+            def close_instructions(e):
+                instructions_dialog.open = False
+                page.update()
+            
+            page.overlay.append(instructions_dialog)
+            instructions_dialog.open = True
+            page.update()
             
             # Mark as shown
             mark_notification_permission_shown()
@@ -4323,78 +4397,106 @@ def main(page: ft.Page):
             total_unread = unread_system_notifications["count"] + unread_private_messages["count"]
             notification_badge_text.value = str(total_unread)
             notification_badge_container.visible = total_unread > 0
+            print(f"[BADGE] Updated: system={unread_system_notifications['count']}, private={unread_private_messages['count']}, total={total_unread}")
             if notification_badge_container.page:
-                notification_badge_container.update()
+                try:
+                    notification_badge_container.update()
+                except:
+                    pass
 
         # ✅ FIX 4: Load unread private messages count at startup
         def load_unread_private_messages_count():
-            """Load unread private message count from Firebase/cache for notification badge"""
-            try:
-                # First try to get from cache
-                cached_chats = CacheManager.load_from_cache('private_chats')
-                if cached_chats:
-                    total_unread = 0
-                    for chat in cached_chats:
-                        unread = chat.get('unread', 0)
-                        try:
-                            unread_val = int(unread) if unread else 0
-                        except:
-                            unread_val = 0
-                        total_unread += unread_val
-                    unread_private_messages["count"] = total_unread
-                    print(f"[NOTIFICATION] Loaded unread count from cache: {total_unread}")
-                    update_notification_badge()
-                
-                # Then fetch fresh data in background
-                def fetch_fresh_unread():
-                    try:
-                        if not NetworkChecker.is_online():
-                            return
-                        
-                        # Get all private chats for current user
-                        chats_url = f"{db.database_url}/private_chats.json?auth={db.auth_token}"
-                        response = requests.get(chats_url, timeout=10)
-                        
-                        if response.status_code == 200:
-                            all_chats = response.json() or {}
+            """Load unread private message count from Firebase for notification badge"""
+            print("[NOTIFICATION BADGE] Starting to load unread count...")
+            
+            def fetch_unread_count():
+                try:
+                    # Check if db and auth are ready
+                    if not db or not auth or not auth.user_id:
+                        print("[NOTIFICATION BADGE] db or auth not ready, skipping")
+                        return
+                    
+                    if not NetworkChecker.is_online():
+                        print("[NOTIFICATION BADGE] Offline, trying cache only")
+                        # Try cache
+                        cached_chats = CacheManager.load_from_cache('private_chats')
+                        if cached_chats:
                             total_unread = 0
-                            
-                            for chat_id, chat_data in all_chats.items():
-                                if not chat_data or not isinstance(chat_data, dict):
-                                    continue
-                                
-                                # Check if current user is part of this chat
-                                participants = chat_data.get('participants', {})
-                                if auth.user_id not in participants:
-                                    continue
-                                
-                                # Check if chat is accepted
-                                status = chat_data.get('status', '')
-                                if status != 'accepted':
-                                    continue
-                                
-                                # Get unread count for current user
-                                unread_counts = chat_data.get('unread_counts', {})
-                                unread = unread_counts.get(auth.user_id, 0)
+                            for chat in cached_chats:
+                                unread = chat.get('unread', 0)
                                 try:
-                                    unread_val = int(unread) if unread else 0
+                                    unread_val = int(unread) if unread and str(unread).isdigit() else 0
                                 except:
                                     unread_val = 0
                                 total_unread += unread_val
-                            
                             unread_private_messages["count"] = total_unread
-                            print(f"[NOTIFICATION] Fresh unread count: {total_unread}")
+                            print(f"[NOTIFICATION BADGE] From cache: {total_unread}")
                             update_notification_badge()
+                        return
+                    
+                    print(f"[NOTIFICATION BADGE] Fetching for user: {auth.user_id}")
+                    
+                    # Fetch all private chats from Firebase
+                    chats_url = f"{db.database_url}/private_chats.json?auth={db.auth_token}"
+                    response = requests.get(chats_url, timeout=15)
+                    
+                    if response.status_code == 200:
+                        all_chats = response.json() or {}
+                        total_unread = 0
+                        chats_checked = 0
+                        
+                        for chat_id, chat_data in all_chats.items():
+                            if not chat_data or not isinstance(chat_data, dict):
+                                continue
                             
-                    except Exception as fetch_ex:
-                        print(f"[NOTIFICATION] Error fetching unread count: {fetch_ex}")
-                
-                threading.Thread(target=fetch_fresh_unread, daemon=True).start()
-                
-            except Exception as e:
-                print(f"[NOTIFICATION] Error loading unread count: {e}")
+                            # Check if current user is part of this chat
+                            participants = chat_data.get('participants', {})
+                            if auth.user_id not in participants:
+                                continue
+                            
+                            chats_checked += 1
+                            
+                            # Check if chat is accepted
+                            status = chat_data.get('status', '')
+                            if status != 'accepted':
+                                continue
+                            
+                            # Get unread count for current user from unread_counts
+                            unread_counts = chat_data.get('unread_counts', {})
+                            unread = unread_counts.get(auth.user_id, 0)
+                            
+                            try:
+                                if unread is None:
+                                    unread_val = 0
+                                elif isinstance(unread, (int, float)):
+                                    unread_val = int(unread)
+                                elif isinstance(unread, str) and unread.isdigit():
+                                    unread_val = int(unread)
+                                else:
+                                    unread_val = 0
+                            except:
+                                unread_val = 0
+                            
+                            if unread_val > 0:
+                                print(f"[NOTIFICATION BADGE] Chat {chat_id}: {unread_val} unread")
+                            total_unread += unread_val
+                        
+                        unread_private_messages["count"] = total_unread
+                        print(f"[NOTIFICATION BADGE] Total: {total_unread} unread from {chats_checked} chats")
+                        update_notification_badge()
+                        
+                    else:
+                        print(f"[NOTIFICATION BADGE] HTTP error: {response.status_code}")
+                        
+                except Exception as fetch_ex:
+                    print(f"[NOTIFICATION BADGE] Error: {fetch_ex}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Run in background thread
+            threading.Thread(target=fetch_unread_count, daemon=True).start()
 
-        # ✅ FIX 4: Load unread count immediately
+        # ✅ FIX 4: Load unread count immediately when main menu loads
         load_unread_private_messages_count()
 
         update_notification_badge()
