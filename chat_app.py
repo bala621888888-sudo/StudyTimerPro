@@ -7973,19 +7973,17 @@ def main(page: ft.Page):
 
         # Build Hall of Fame tab UI
         hof_scope_toggle_global = ft.Container(
-            content=ft.Text("Global Rankings", size=13, weight="bold"),
+            content=ft.Text("Global Rankings", size=13, weight="bold", color="white"),
             padding=ft.padding.symmetric(horizontal=20, vertical=10),
             bgcolor="#2196F3",
-            color="white",
             border_radius=20,
             on_click=on_scope_toggle("global")
         )
 
         hof_scope_toggle_local = ft.Container(
-            content=ft.Text("Local Rankings", size=13, weight="bold"),
+            content=ft.Text("Local Rankings", size=13, weight="bold", color="#2196F3"),
             padding=ft.padding.symmetric(horizontal=20, vertical=10),
             bgcolor=ft.colors.with_opacity(0.1, ft.colors.BLUE),
-            color="#2196F3",
             border_radius=20,
             on_click=on_scope_toggle("local")
         )
