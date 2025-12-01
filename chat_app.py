@@ -1743,34 +1743,6 @@ class FirebaseDatabase:
             print(f"[DEBUG] get_group_messages_by_id exception: {e}")
             return []
 
-    def get_group_messages_before(self, group_id, before_timestamp, limit=30):
-        """Get group messages before a specific timestamp for pagination"""
-        url = f"{self.database_url}/groups/{group_id}/messages.json?auth={self.auth_token}&orderBy=\"timestamp\""
-
-        if before_timestamp:
-            url += f"&endAt={before_timestamp - 1}"
-
-        url += f"&limitToLast={limit}"
-
-        try:
-            response = requests.get(url)
-            if response.status_code == 200:
-                messages = response.json() or {}
-                if messages:
-                    message_list = []
-                    for msg_id, msg_data in messages.items():
-                        if not isinstance(msg_data, dict):
-                            continue
-                        msg_data['id'] = msg_id
-                        message_list.append(msg_data)
-                    message_list.sort(key=lambda x: x.get('timestamp', 0))
-                    return message_list
-                return []
-            return []
-        except Exception as e:
-            print(f"[DEBUG] get_group_messages_before exception: {e}")
-            return []
-
     def send_group_message_by_id(self, group_id, sender_id, sender_username, message_text, is_admin=False, file_url=None, file_name=None, file_size=None):
         """Send message to a specific group"""
         url = f"{self.database_url}/groups/{group_id}/messages.json?auth={self.auth_token}"
@@ -1867,31 +1839,6 @@ class FirebaseDatabase:
     def get_messages(self, chat_id, limit=20):
         url = f"{self.database_url}/chats/{chat_id}/messages.json?auth={self.auth_token}&orderBy=\"timestamp\"&limitToLast={limit}"
         
-        try:
-            response = requests.get(url)
-            if response.status_code == 200:
-                messages = response.json()
-                if messages:
-                    message_list = []
-                    for msg_id, msg_data in messages.items():
-                        msg_data['id'] = msg_id
-                        message_list.append(msg_data)
-                    message_list.sort(key=lambda x: x.get('timestamp', 0))
-                    return message_list
-                return []
-            return []
-        except:
-            return []
-
-    def get_messages_before(self, chat_id, before_timestamp, limit=30):
-        """Get messages before a specific timestamp for pagination"""
-        url = f"{self.database_url}/chats/{chat_id}/messages.json?auth={self.auth_token}&orderBy=\"timestamp\""
-
-        if before_timestamp:
-            url += f"&endAt={before_timestamp - 1}"
-
-        url += f"&limitToLast={limit}"
-
         try:
             response = requests.get(url)
             if response.status_code == 200:
@@ -3478,23 +3425,6 @@ def main(page: ft.Page):
     current_chat_id = None
     current_chat_user = None
     current_group_id = None
-
-    # Pagination state for lazy loading messages
-    private_chat_pagination = {
-        "message_limit": 30,  # Initial messages to load
-        "has_more": True,  # Whether there are more messages to load
-        "is_loading": False,  # Whether currently loading
-        "oldest_timestamp": None,  # Timestamp of oldest loaded message
-        "all_messages": []  # Store all loaded messages
-    }
-
-    group_chat_pagination = {
-        "message_limit": 30,  # Initial messages to load
-        "has_more": True,  # Whether there are more messages to load
-        "is_loading": False,  # Whether currently loading
-        "oldest_timestamp": None,  # Timestamp of oldest loaded message
-        "all_messages": []  # Store all loaded messages
-    }
     is_admin = False
     user_is_group_admin = False
     current_username = None
@@ -3518,7 +3448,7 @@ def main(page: ft.Page):
     # UI COMPONENT DEFINITIONS
     # ============================================
     # Define UI components that will be used across multiple functions
-    group_messages_list = ft.Column(scroll="auto", expand=True, spacing=10, auto_scroll=False)
+    group_messages_list = ft.Column(scroll="auto", expand=True, spacing=10, auto_scroll=True)
     group_message_input = ft.TextField(
         hint_text="Type a message to the group...", 
         expand=True, 
@@ -3532,7 +3462,7 @@ def main(page: ft.Page):
     group_displayed_message_ids = set()
     group_chat_header = ft.Row(spacing=10)
     
-    messages_list = ft.Column(scroll="auto", expand=True, spacing=10, auto_scroll=False)
+    messages_list = ft.Column(scroll="auto", expand=True, spacing=10, auto_scroll=True)
     message_input = ft.TextField(hint_text="Type a message...", expand=True, multiline=True, max_lines=3)
     chat_header = ft.Row(spacing=10)
     
@@ -5568,72 +5498,14 @@ def main(page: ft.Page):
             start_auto_refresh_messages(interval=5)
             refresh_control["active"] = True  # ✅ Enable refresh just like private chat
 
-        def load_specific_group_messages(group_id, load_more=False):
-            """Load messages for a specific group with pagination"""
-            nonlocal group_chat_pagination
-
-            # Reset pagination state when loading a new chat (not loading more)
-            if not load_more:
-                group_chat_pagination["all_messages"] = []
-                group_chat_pagination["oldest_timestamp"] = None
-                group_chat_pagination["has_more"] = True
-
-            if group_chat_pagination["is_loading"]:
-                return  # Already loading
-
-            group_chat_pagination["is_loading"] = True
-
+        def load_specific_group_messages(group_id):
+            """Load messages for a specific group (always rebuild UI)"""
             try:
-                if load_more and group_chat_pagination["oldest_timestamp"]:
-                    # Load older messages
-                    messages = db.get_group_messages_before(group_id, group_chat_pagination["oldest_timestamp"], group_chat_pagination["message_limit"])
-                else:
-                    # Load latest messages
-                    messages = db.get_group_messages_by_id(group_id, group_chat_pagination["message_limit"])
+                messages = db.get_group_messages_by_id(group_id)
 
-                if load_more:
-                    # Prepend older messages
-                    if messages:
-                        group_chat_pagination["all_messages"] = messages + group_chat_pagination["all_messages"]
-                        group_chat_pagination["oldest_timestamp"] = messages[0].get('timestamp')
-                        group_chat_pagination["has_more"] = len(messages) >= group_chat_pagination["message_limit"]
-                        display_group_messages_ui(group_chat_pagination["all_messages"], scroll_to_bottom=False)
-                    else:
-                        group_chat_pagination["has_more"] = False
-                else:
-                    # Initial load or refresh
-                    group_chat_pagination["all_messages"] = messages
-                    if len(messages) > 0:
-                        group_chat_pagination["oldest_timestamp"] = messages[0].get('timestamp')
-                    group_chat_pagination["has_more"] = len(messages) >= group_chat_pagination["message_limit"]
-                    display_group_messages_ui(messages, scroll_to_bottom=True)
-
-            except Exception as ex:
-                print(f"Error loading group messages: {ex}")
-            finally:
-                group_chat_pagination["is_loading"] = False
-
-        def display_group_messages_ui(messages, scroll_to_bottom=False):
-            """Display group messages with pagination support"""
-            nonlocal group_chat_pagination
-
-            try:
                 # Always rebuild the message list to avoid stale / empty UI when re-entering
                 group_displayed_message_ids.clear()
                 group_messages_list.controls.clear()
-
-                # Add "Load More" button at the top if there are more messages
-                if group_chat_pagination["has_more"] and len(messages) >= group_chat_pagination["message_limit"]:
-                    load_more_btn = ft.Container(
-                        content=ft.TextButton(
-                            "Load older messages",
-                            icon=ft.Icons.ARROW_UPWARD,
-                            on_click=lambda e: load_specific_group_messages(current_group_id, load_more=True)
-                        ),
-                        alignment=ft.alignment.center,
-                        padding=10
-                    )
-                    group_messages_list.controls.append(load_more_btn)
 
                 if not messages:
                     group_messages_list.controls.append(
@@ -5731,14 +5603,6 @@ def main(page: ft.Page):
                         group_messages_list.controls.append(row)
 
                 page.update()
-
-                # Scroll to bottom only on initial load or new message
-                if scroll_to_bottom:
-                    try:
-                        group_messages_list.scroll_to(offset=-1, duration=300)
-                    except:
-                        pass  # Scroll might not be supported in all contexts
-
             except Exception as ex:
                 print(f"Error loading group messages: {ex}")
         
@@ -5752,9 +5616,7 @@ def main(page: ft.Page):
                         # Check if we're still on the same group
                         if update['chat_id'] == group_id and active_screen["current"] == "group_chat":
                             print(f"[QUEUE] Processing update for group {update['chat_id']}")
-                            # Update pagination state with new messages
-                            group_chat_pagination["all_messages"] = update.get('messages', [])
-                            display_group_messages_ui(group_chat_pagination["all_messages"], scroll_to_bottom=True)
+                            load_specific_group_messages(group_id)
             except queue.Empty:
                 pass
             except Exception as e:
@@ -9442,69 +9304,30 @@ def main(page: ft.Page):
         messages_list.controls.append(ft.Row([placeholder], alignment="end"))
         page.update()
     
-    def load_messages(load_more=False):
-        """Load messages with offline support and pagination"""
-        nonlocal private_chat_pagination
-
+    def load_messages():
+        """Load messages with offline support"""
         if not current_chat_id:
             return
-
-        # Reset pagination state when loading a new chat (not loading more)
-        if not load_more:
-            private_chat_pagination["all_messages"] = []
-            private_chat_pagination["oldest_timestamp"] = None
-            private_chat_pagination["has_more"] = True
-
-        if private_chat_pagination["is_loading"]:
-            return  # Already loading
-
-        private_chat_pagination["is_loading"] = True
-
-        # Step 1: Try to load from cache first (only on initial load)
+        
+        # Step 1: Try to load from cache first
         cache_key = f"messages_{current_chat_id}"
-        if not load_more:
-            cached_messages = CacheManager.load_from_cache(cache_key)
-
-            if cached_messages:
-                # Show cached messages immediately
-                private_chat_pagination["all_messages"] = cached_messages[-private_chat_pagination["message_limit"]:]
-                if len(private_chat_pagination["all_messages"]) > 0:
-                    private_chat_pagination["oldest_timestamp"] = private_chat_pagination["all_messages"][0].get('timestamp')
-                display_messages_ui(private_chat_pagination["all_messages"], scroll_to_bottom=True)
-
+        cached_messages = CacheManager.load_from_cache(cache_key)
+        
+        if cached_messages:
+            # Show cached messages immediately
+            display_messages_ui(cached_messages)
+        
         # Step 2: Update from network
         try:
             if NetworkChecker.is_online():
-                if load_more and private_chat_pagination["oldest_timestamp"]:
-                    # Load older messages
-                    messages = db.get_messages_before(current_chat_id, private_chat_pagination["oldest_timestamp"], private_chat_pagination["message_limit"])
-                else:
-                    # Load latest messages
-                    messages = db.get_messages(current_chat_id, private_chat_pagination["message_limit"])
-
-                if load_more:
-                    # Prepend older messages
-                    if messages:
-                        private_chat_pagination["all_messages"] = messages + private_chat_pagination["all_messages"]
-                        private_chat_pagination["oldest_timestamp"] = messages[0].get('timestamp')
-                        private_chat_pagination["has_more"] = len(messages) >= private_chat_pagination["message_limit"]
-                        display_messages_ui(private_chat_pagination["all_messages"], scroll_to_bottom=False)
-                    else:
-                        private_chat_pagination["has_more"] = False
-                else:
-                    # Initial load or refresh
-                    private_chat_pagination["all_messages"] = messages
-                    if len(messages) > 0:
-                        private_chat_pagination["oldest_timestamp"] = messages[0].get('timestamp')
-                    private_chat_pagination["has_more"] = len(messages) >= private_chat_pagination["message_limit"]
-
-                    # Save to cache
-                    CacheManager.save_to_cache(cache_key, messages)
-
-                    # Display fresh messages and scroll to bottom
-                    display_messages_ui(messages, scroll_to_bottom=True)
-
-            elif not load_more and not private_chat_pagination["all_messages"]:
+                messages = db.get_messages(current_chat_id)
+                
+                # Save to cache
+                CacheManager.save_to_cache(cache_key, messages)
+                
+                # Display fresh messages
+                display_messages_ui(messages)
+            elif not cached_messages:
                 messages_list.controls.clear()
                 messages_list.controls.append(
                     ft.Container(
@@ -9519,48 +9342,31 @@ def main(page: ft.Page):
                 page.update()
         except Exception as e:
             print(f"Message load error: {e}")
-            if not load_more and not private_chat_pagination["all_messages"]:
+            if not cached_messages:
                 messages_list.controls.clear()
                 messages_list.controls.append(
                     ft.Container(content=ft.Text("Error loading messages", color="red"), padding=20)
                 )
                 page.update()
-        finally:
-            private_chat_pagination["is_loading"] = False
 
 
     # Add this NEW function - extracts UI logic from load_messages
-    def display_messages_ui(messages, scroll_to_bottom=False):
+    def display_messages_ui(messages):
         """Display messages (separated from loading logic)"""
-        nonlocal private_chat_pagination
-
         try:
             # Get chat status
             chat_status = db.get_chat_status(current_chat_id)
             chat_requester = db.get_chat_requester(current_chat_id)
             current_chat_status["status"] = chat_status
-
+            
             current_ids = {msg['id'] for msg in messages}
-
+            
             if current_ids != displayed_message_ids:
                 displayed_message_ids.clear()
                 displayed_message_ids.update(current_ids)
-
+                
                 messages_list.controls.clear()
-
-                # Add "Load More" button at the top if there are more messages
-                if private_chat_pagination["has_more"] and len(messages) >= private_chat_pagination["message_limit"]:
-                    load_more_btn = ft.Container(
-                        content=ft.TextButton(
-                            "Load older messages",
-                            icon=ft.Icons.ARROW_UPWARD,
-                            on_click=lambda e: load_messages(load_more=True)
-                        ),
-                        alignment=ft.alignment.center,
-                        padding=10
-                    )
-                    messages_list.controls.append(load_more_btn)
-
+                
                 # Show message request banner if pending
                 if chat_status == "pending" and chat_requester and chat_requester != auth.user_id:
                     request_banner = ft.Container(
@@ -9676,15 +9482,8 @@ def main(page: ft.Page):
                         messages_list.controls.append(
                             ft.Row([message_bubble], alignment="end" if is_me else "start")
                         )
-
+                
                 page.update()
-
-                # Scroll to bottom only on initial load or new message
-                if scroll_to_bottom:
-                    try:
-                        messages_list.scroll_to(offset=-1, duration=300)
-                    except:
-                        pass  # Scroll might not be supported in all contexts
 
                 # Mark as seen if accepted
                 if chat_status == "accepted":
@@ -9731,9 +9530,7 @@ def main(page: ft.Page):
                     # Check if we're still on the same chat
                     if update['chat_id'] == current_chat_id and active_screen["current"] == "private_chat":
                         print(f"[QUEUE] Processing update for private chat {update['chat_id']}")
-                        # Update pagination state with new messages
-                        private_chat_pagination["all_messages"] = update['messages']
-                        display_messages_ui(update['messages'], scroll_to_bottom=True)
+                        display_messages_ui(update['messages'])
                         private_unread_counts[update['chat_id']] = 0
                         unread_private_messages["count"] = sum(private_unread_counts.values())
                         update_notification_badge()
