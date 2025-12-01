@@ -7724,7 +7724,320 @@ def main(page: ft.Page):
             expand=True
         )
 
-        # TAB 4 → SETTINGS (with Create Group button for admin)
+        # ==== HALL OF FAME / RANKINGS UI ====
+
+        # Hall of Fame data and state
+        hof_state = {
+            "scope": "global",  # "global" or "local"
+            "entries": [],
+            "initialized": False
+        }
+
+        def get_mock_hof_data(scope="global"):
+            """
+            Return list of dicts sorted by subs descending.
+
+            Each item:
+            {
+                "rank": int,
+                "name": str,
+                "avatar_emoji": str,  # simple emoji or 1-letter initials
+                "subs": int,          # subscription count
+                "earnings": float,    # total earnings in INR
+                "highlight": str|None # "gold"|"silver"|"bronze"|None
+            }
+            """
+            # Mock data for preview - replace with backend call later
+            mock_data = [
+                {"rank": 1, "name": "Rajesh Kumar", "avatar_emoji": "R", "subs": 5208, "earnings": 1250.0, "highlight": "gold"},
+                {"rank": 2, "name": "Priya Sharma", "avatar_emoji": "P", "subs": 5156, "earnings": 1180.0, "highlight": "silver"},
+                {"rank": 3, "name": "Amit Patel", "avatar_emoji": "A", "subs": 5124, "earnings": 1150.0, "highlight": "bronze"},
+                {"rank": 4, "name": "Sneha Reddy", "avatar_emoji": "S", "subs": 5114, "earnings": 980.0, "highlight": None},
+                {"rank": 5, "name": "Vikram Singh", "avatar_emoji": "V", "subs": 5089, "earnings": 920.0, "highlight": None},
+                {"rank": 6, "name": "Anjali Desai", "avatar_emoji": "A", "subs": 5067, "earnings": 890.0, "highlight": None},
+                {"rank": 7, "name": "Karthik Iyer", "avatar_emoji": "K", "subs": 5045, "earnings": 850.0, "highlight": None},
+                {"rank": 8, "name": "Neha Gupta", "avatar_emoji": "N", "subs": 5023, "earnings": 820.0, "highlight": None},
+                {"rank": 9, "name": "Rohan Mehta", "avatar_emoji": "R", "subs": 5001, "earnings": 780.0, "highlight": None},
+                {"rank": 10, "name": "Divya Nair", "avatar_emoji": "D", "subs": 4987, "earnings": 750.0, "highlight": None},
+            ]
+
+            # Later: add different data for local scope
+            if scope == "local":
+                # For now, return same data - replace with actual local rankings later
+                return mock_data
+
+            return mock_data
+
+        def load_hof_data(scope="global"):
+            """Load Hall of Fame data for given scope"""
+            hof_state["scope"] = scope
+            hof_state["entries"] = get_mock_hof_data(scope)
+            hof_state["initialized"] = True
+
+        # Hall of Fame UI components
+        hof_podium_row = ft.Row(spacing=8, alignment=ft.MainAxisAlignment.CENTER)
+        hof_list_view = ft.ListView(spacing=8, expand=True, padding=10)
+        hof_scope_toggle_global = None
+        hof_scope_toggle_local = None
+
+        def create_podium_card(entry, is_center=False):
+            """Create a podium card for top 3"""
+            if not entry:
+                return ft.Container()
+
+            # Colors for medals
+            medal_colors = {
+                "gold": "#FFD700",
+                "silver": "#C0C0C0",
+                "bronze": "#CD7F32"
+            }
+
+            highlight = entry.get("highlight")
+            medal_color = medal_colors.get(highlight, "#2196F3")
+            card_height = 200 if is_center else 180
+
+            return ft.Container(
+                content=ft.Column([
+                    ft.Container(height=10 if is_center else 20),
+                    # Avatar
+                    ft.Container(
+                        content=ft.Text(
+                            entry.get("avatar_emoji", "?"),
+                            size=24 if is_center else 20,
+                            weight="bold",
+                            color="white"
+                        ),
+                        width=60 if is_center else 50,
+                        height=60 if is_center else 50,
+                        bgcolor="#2196F3",
+                        border_radius=30 if is_center else 25,
+                        alignment=ft.alignment.center
+                    ),
+                    ft.Container(height=8),
+                    # Name
+                    ft.Text(
+                        entry.get("name", "Unknown"),
+                        size=13 if is_center else 12,
+                        weight="bold",
+                        text_align=ft.TextAlign.CENTER,
+                        max_lines=2,
+                        overflow=ft.TextOverflow.ELLIPSIS
+                    ),
+                    ft.Container(height=4),
+                    # Rank medal
+                    ft.Row([
+                        ft.Icon(ft.icons.EMOJI_EVENTS, size=16, color=medal_color),
+                        ft.Text(f"#{entry.get('rank', 0)}", size=12, weight="bold", color=medal_color)
+                    ], alignment=ft.MainAxisAlignment.CENTER, spacing=4),
+                    ft.Container(height=8),
+                    # Stats
+                    ft.Column([
+                        ft.Row([
+                            ft.Icon(ft.icons.EMOJI_EVENTS_OUTLINED, size=14),
+                            ft.Text(str(entry.get("subs", 0)), size=11)
+                        ], alignment=ft.MainAxisAlignment.CENTER, spacing=4),
+                        ft.Row([
+                            ft.Icon(ft.icons.CURRENCY_RUPEE, size=14),
+                            ft.Text(f"{entry.get('earnings', 0):.0f}", size=11)
+                        ], alignment=ft.MainAxisAlignment.CENTER, spacing=4)
+                    ], spacing=4)
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=0),
+                width=110 if is_center else 100,
+                height=card_height,
+                bgcolor=ft.colors.with_opacity(0.15, ft.colors.BLUE),
+                border_radius=15,
+                padding=10,
+                border=ft.border.all(2, medal_color) if highlight else None
+            )
+
+        def create_list_row(entry):
+            """Create a row for ranks 4+"""
+            if not entry:
+                return ft.Container()
+
+            return ft.Container(
+                padding=10,
+                border_radius=15,
+                bgcolor=ft.colors.with_opacity(0.1, ft.colors.BLUE),
+                content=ft.Row(
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    controls=[
+                        ft.Row(
+                            spacing=10,
+                            controls=[
+                                ft.Text(str(entry.get("rank", 0)), weight="bold", size=14, width=25),
+                                ft.Container(
+                                    content=ft.Text(
+                                        entry.get("avatar_emoji", "?"),
+                                        size=12,
+                                        weight="bold",
+                                        color="white"
+                                    ),
+                                    width=30,
+                                    height=30,
+                                    bgcolor="#2196F3",
+                                    border_radius=15,
+                                    alignment=ft.alignment.center
+                                ),
+                                ft.Text(
+                                    entry.get("name", "Unknown"),
+                                    size=13,
+                                    overflow=ft.TextOverflow.ELLIPSIS,
+                                    max_lines=1
+                                )
+                            ]
+                        ),
+                        ft.Row(
+                            spacing=12,
+                            controls=[
+                                ft.Row(
+                                    spacing=4,
+                                    controls=[
+                                        ft.Icon(ft.icons.EMOJI_EVENTS_OUTLINED, size=16),
+                                        ft.Text(str(entry.get("subs", 0)), size=12)
+                                    ]
+                                ),
+                                ft.Row(
+                                    spacing=4,
+                                    controls=[
+                                        ft.Icon(ft.icons.CURRENCY_RUPEE, size=16),
+                                        ft.Text(f"{entry.get('earnings', 0):.0f}", size=12)
+                                    ]
+                                )
+                            ]
+                        )
+                    ]
+                )
+            )
+
+        def refresh_hof_view():
+            """Rebuild Hall of Fame UI from current data"""
+            try:
+                entries = hof_state.get("entries", [])
+
+                # Update podium (top 3)
+                hof_podium_row.controls.clear()
+
+                if len(entries) >= 3:
+                    # Podium order: 2nd, 1st (center), 3rd
+                    hof_podium_row.controls.append(create_podium_card(entries[1], is_center=False))  # 2nd
+                    hof_podium_row.controls.append(create_podium_card(entries[0], is_center=True))   # 1st
+                    hof_podium_row.controls.append(create_podium_card(entries[2], is_center=False))  # 3rd
+                elif len(entries) == 2:
+                    hof_podium_row.controls.append(create_podium_card(entries[1], is_center=False))
+                    hof_podium_row.controls.append(create_podium_card(entries[0], is_center=True))
+                elif len(entries) == 1:
+                    hof_podium_row.controls.append(create_podium_card(entries[0], is_center=True))
+
+                # Update list (rank 4+)
+                hof_list_view.controls.clear()
+
+                if len(entries) > 3:
+                    for entry in entries[3:]:
+                        hof_list_view.controls.append(create_list_row(entry))
+
+                # Update scope toggle buttons
+                current_scope = hof_state.get("scope", "global")
+                if hof_scope_toggle_global and hof_scope_toggle_local:
+                    if current_scope == "global":
+                        hof_scope_toggle_global.bgcolor = "#2196F3"
+                        hof_scope_toggle_global.color = "white"
+                        hof_scope_toggle_local.bgcolor = ft.colors.with_opacity(0.1, ft.colors.BLUE)
+                        hof_scope_toggle_local.color = "#2196F3"
+                    else:
+                        hof_scope_toggle_global.bgcolor = ft.colors.with_opacity(0.1, ft.colors.BLUE)
+                        hof_scope_toggle_global.color = "#2196F3"
+                        hof_scope_toggle_local.bgcolor = "#2196F3"
+                        hof_scope_toggle_local.color = "white"
+
+                # Update UI
+                if page:
+                    try:
+                        hof_podium_row.update()
+                        hof_list_view.update()
+                        if hof_scope_toggle_global:
+                            hof_scope_toggle_global.update()
+                        if hof_scope_toggle_local:
+                            hof_scope_toggle_local.update()
+                    except:
+                        pass
+            except Exception as e:
+                print(f"[HOF] Error refreshing view: {e}")
+
+        def on_scope_toggle(scope):
+            """Handle scope toggle button click"""
+            def handler(e):
+                load_hof_data(scope)
+                refresh_hof_view()
+            return handler
+
+        # Build Hall of Fame tab UI
+        hof_scope_toggle_global = ft.Container(
+            content=ft.Text("Global Rankings", size=13, weight="bold"),
+            padding=ft.padding.symmetric(horizontal=20, vertical=10),
+            bgcolor="#2196F3",
+            color="white",
+            border_radius=20,
+            on_click=on_scope_toggle("global")
+        )
+
+        hof_scope_toggle_local = ft.Container(
+            content=ft.Text("Local Rankings", size=13, weight="bold"),
+            padding=ft.padding.symmetric(horizontal=20, vertical=10),
+            bgcolor=ft.colors.with_opacity(0.1, ft.colors.BLUE),
+            color="#2196F3",
+            border_radius=20,
+            on_click=on_scope_toggle("local")
+        )
+
+        hof_content = ft.Column([
+            # Scope toggle
+            ft.Container(
+                content=ft.Row([
+                    hof_scope_toggle_global,
+                    hof_scope_toggle_local
+                ], alignment=ft.MainAxisAlignment.CENTER, spacing=10),
+                padding=ft.padding.only(top=20, bottom=15)
+            ),
+            # Podium
+            ft.Container(
+                content=hof_podium_row,
+                padding=ft.padding.symmetric(vertical=10)
+            ),
+            # List title
+            ft.Container(
+                content=ft.Text("Rankings", size=16, weight="bold"),
+                padding=ft.padding.only(left=20, top=10, bottom=5)
+            ),
+            # Scrollable list
+            ft.Container(
+                content=hof_list_view,
+                expand=True
+            ),
+            # Footer
+            ft.Container(
+                content=ft.Text(
+                    "Rankings refresh every 5 minutes • Amounts shown in INR",
+                    size=11,
+                    color=ft.colors.with_opacity(0.7, ft.colors.BLACK),
+                    text_align=ft.TextAlign.CENTER
+                ),
+                padding=ft.padding.symmetric(vertical=10)
+            )
+        ], spacing=0, expand=True)
+
+        # TAB 4 → HALL OF FAME
+        screen_hall_of_fame = ft.Container(
+            content=hof_content,
+            expand=True,
+            bgcolor="#F5F8FF"
+        )
+
+        # Initialize Hall of Fame data
+        load_hof_data("global")
+        refresh_hof_view()
+
+        # TAB 5 → SETTINGS (with Create Group button for admin)
         # ✅ FIX 5: Only create settings content for admin
         settings_buttons = []
         
@@ -7768,9 +8081,9 @@ def main(page: ft.Page):
         page_controller = page_controller_cls(initial_page=selected_index) if page_controller_cls else None
 
         # ✅ FIX 5: Determine number of tabs based on admin status
-        # Admin: 5 tabs (Promoter, Groups, Members, Private, Settings)
-        # Non-admin: 4 tabs (Promoter, Groups, Members, Private) - no Settings
-        num_tabs = 5 if is_admin else 4
+        # Admin: 6 tabs (Promoter, Groups, Members, Private, Hall of Fame, Settings)
+        # Non-admin: 5 tabs (Promoter, Groups, Members, Private, Hall of Fame) - no Settings
+        num_tabs = 6 if is_admin else 5
 
         # SELECT WHICH SCREEN TO SHOW (with optimized lazy loading)
 
@@ -7810,7 +8123,12 @@ def main(page: ft.Page):
                     update_notification_badge()
                 except Exception as ex:
                     print(f"[PRIVATE TAB AUTO-LOAD ERROR] {ex}")
-            # ✅ FIX 5: Tab 4 (Settings) only exists for admin
+            elif selected_index == 4:
+                # Hall of Fame tab - reload data if not initialized
+                if not hof_state.get("initialized", False):
+                    load_hof_data("global")
+                    refresh_hof_view()
+            # ✅ FIX 5: Tab 5 (Settings) only exists for admin
             page.update()
 
         def switch_tab(e):
@@ -7855,8 +8173,13 @@ def main(page: ft.Page):
                     selected_icon=ft.Icons.PERSON,
                     label="Private"
                 ),
+                ft.NavigationBarDestination(
+                    icon=ft.Icons.EMOJI_EVENTS_OUTLINED,
+                    selected_icon=ft.Icons.EMOJI_EVENTS,
+                    label="Hall of Fame"
+                ),
             ]
-            
+
             # ✅ FIX 5: Only add Settings tab for admin
             if is_admin:
                 nav_destinations.append(
@@ -7901,8 +8224,12 @@ def main(page: ft.Page):
                             load_private_chats(force_refresh=True)
                     except Exception as ex:
                         print(f"[PULL REFRESH PRIVATE] {ex}")
+                elif selected_index == 4:
+                    # Hall of Fame tab - reload data
+                    load_hof_data(hof_state.get("scope", "global"))
+                    refresh_hof_view()
                 # ✅ FIX 5: Only handle Settings tab refresh if admin
-                elif selected_index == 4 and is_admin:
+                elif selected_index == 5 and is_admin:
                     # Settings tab - nothing to refresh yet
                     pass
             except Exception as ex:
@@ -7987,8 +8314,9 @@ def main(page: ft.Page):
             ft.Container(content=screen_groups, expand=True),
             ft.Container(content=screen_members, expand=True),
             ft.Container(content=screen_private_chat, expand=True),  # ✅ Changed from chat_list_view
+            ft.Container(content=screen_hall_of_fame, expand=True),
         ]
-        
+
         # ✅ FIX 5: Only add Settings tab for admin
         if is_admin:
             tab_pages.append(ft.Container(content=screen_settings, expand=True))
