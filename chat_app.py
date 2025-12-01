@@ -7941,14 +7941,14 @@ def main(page: ft.Page):
                 if hof_scope_toggle_global and hof_scope_toggle_local:
                     if current_scope == "global":
                         hof_scope_toggle_global.bgcolor = "#2196F3"
-                        hof_scope_toggle_global.color = "white"
+                        hof_scope_toggle_global.content.color = "white"
                         hof_scope_toggle_local.bgcolor = ft.colors.with_opacity(0.1, ft.colors.BLUE)
-                        hof_scope_toggle_local.color = "#2196F3"
+                        hof_scope_toggle_local.content.color = "#2196F3"
                     else:
                         hof_scope_toggle_global.bgcolor = ft.colors.with_opacity(0.1, ft.colors.BLUE)
-                        hof_scope_toggle_global.color = "#2196F3"
+                        hof_scope_toggle_global.content.color = "#2196F3"
                         hof_scope_toggle_local.bgcolor = "#2196F3"
-                        hof_scope_toggle_local.color = "white"
+                        hof_scope_toggle_local.content.color = "white"
 
                 # Update UI
                 if page:
@@ -7973,19 +7973,17 @@ def main(page: ft.Page):
 
         # Build Hall of Fame tab UI
         hof_scope_toggle_global = ft.Container(
-            content=ft.Text("Global Rankings", size=13, weight="bold"),
+            content=ft.Text("Global Rankings", size=13, weight="bold", color="white"),
             padding=ft.padding.symmetric(horizontal=20, vertical=10),
             bgcolor="#2196F3",
-            color="white",
             border_radius=20,
             on_click=on_scope_toggle("global")
         )
 
         hof_scope_toggle_local = ft.Container(
-            content=ft.Text("Local Rankings", size=13, weight="bold"),
+            content=ft.Text("Local Rankings", size=13, weight="bold", color="#2196F3"),
             padding=ft.padding.symmetric(horizontal=20, vertical=10),
             bgcolor=ft.colors.with_opacity(0.1, ft.colors.BLUE),
-            color="#2196F3",
             border_radius=20,
             on_click=on_scope_toggle("local")
         )
