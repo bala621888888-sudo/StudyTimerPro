@@ -2014,12 +2014,23 @@ class FirebaseDatabase:
                         if user_id in seen_ids:
                             continue
                         
+                        # Skip if user_data is not a dict
+                        if not isinstance(user_data, dict):
+                            continue
+                        
                         seen_ids.add(user_id)
                         user_data['id'] = user_id
                         
-                        # Ensure username exists
-                        if not user_data.get('username'):
-                            user_data['username'] = user_data.get('email', 'Unknown').split('@')[0]
+                        # ✅ FIX: Ensure username is a STRING, not dict or other type
+                        username = user_data.get('username')
+                        if not username or not isinstance(username, str):
+                            # Username is missing or is a dict/other type
+                            # Try to get from email
+                            email = user_data.get('email', '')
+                            if isinstance(email, str) and email:
+                                user_data['username'] = email.split('@')[0]
+                            else:
+                                user_data['username'] = f"User_{user_id[:6]}"
                         
                         user_list.append(user_data)
                     
@@ -2405,9 +2416,15 @@ class GoogleSheetsManager:
                         if email_in_sheet or upi_in_sheet:
                             return False, "Already registered as promoter", None
                         
-                        # Update email and UPI ID
+                        # Update email and UPI ID in promoters sheet
                         worksheet.update_cell(row_idx, 3, email)  # Column C
                         worksheet.update_cell(row_idx, 4, upi_id)  # Column D
+                        
+                        # ✅ NEW: Also add to referral_program sheet
+                        try:
+                            self._add_to_referral_program(spreadsheet, email, referral_id, upi_id)
+                        except Exception as rp_err:
+                            print(f"⚠️ Could not add to referral_program (non-critical): {rp_err}")
                         
                         print(f"✅ Promoter registered: {email} -> Referral ID: {referral_id}")
                         return True, "Registration successful", referral_id
@@ -2418,6 +2435,66 @@ class GoogleSheetsManager:
         except Exception as e:
             print(f"❌ Promoter registration error: {e}")
             return False, f"Error: {str(e)}", None
+    
+    def _add_to_referral_program(self, spreadsheet, email, referral_id, upi_id):
+        """
+        Add new promoter to referral_program worksheet
+        
+        Columns:
+            D (4) = Contact (Email)
+            E (5) = Referral_ID
+            K (11) = UPI_ID
+        """
+        try:
+            # Open referral_program worksheet
+            try:
+                rp_worksheet = spreadsheet.worksheet("referral_program")
+            except Exception:
+                print("⚠️ referral_program worksheet not found, skipping")
+                return
+            
+            # Get headers to find correct column indices
+            headers = rp_worksheet.row_values(1)
+            headers_lower = [h.strip().lower() for h in headers]
+            
+            # Find column indices (0-based, convert to 1-based for gspread)
+            def find_col(possible_names, default_col):
+                for name in possible_names:
+                    if name in headers_lower:
+                        return headers_lower.index(name) + 1  # 1-based
+                return default_col
+            
+            contact_col = find_col(["contact", "email", "contact email"], 4)  # Default D
+            referral_col = find_col(["referral_id", "referral id"], 5)  # Default E
+            upi_col = find_col(["upi_id", "upi id", "upi"], 11)  # Default K
+            
+            # Check if referral_id already exists to avoid duplicates
+            all_values = rp_worksheet.get_all_values()
+            for row in all_values[1:]:
+                if len(row) >= referral_col:
+                    existing_ref_id = row[referral_col - 1].strip()  # 0-based for list access
+                    if existing_ref_id == referral_id:
+                        print(f"⚠️ Referral ID {referral_id} already exists in referral_program, skipping")
+                        return
+            
+            # Create new row with empty values, then set specific columns
+            # Find the number of columns needed
+            max_col = max(contact_col, referral_col, upi_col, len(headers))
+            new_row = [""] * max_col
+            
+            # Set values (0-based index for list)
+            new_row[contact_col - 1] = email
+            new_row[referral_col - 1] = referral_id
+            new_row[upi_col - 1] = upi_id
+            
+            # Append the row
+            rp_worksheet.append_row(new_row, value_input_option='USER_ENTERED')
+            
+            print(f"✅ Added to referral_program: Email={email}, Referral_ID={referral_id}, UPI={upi_id}")
+            
+        except Exception as e:
+            print(f"❌ Error adding to referral_program: {e}")
+            raise
     
     def get_promoter_stats(self, referral_id):
         """
@@ -2608,6 +2685,13 @@ class GoogleSheetsManager:
             ist_timezone = timezone(timedelta(hours=5, minutes=30))
             timestamp = datetime.now(ist_timezone).strftime("%Y-%m-%d %H:%M")
 
+            # ✅ NEW: Auto-fetch unused activation key from promoters sheet
+            unused_activation_key = self._get_unused_activation_key(spreadsheet)
+            if not unused_activation_key:
+                print("⚠️ No unused activation keys available in promoters sheet")
+                # Still submit but without activation key
+                unused_activation_key = ""
+
             row_data = [
                 "" for _ in headers
             ]
@@ -2630,16 +2714,79 @@ class GoogleSheetsManager:
             set_field(["additional information", "additional info"], referral_data.get("additional_info", ""))
             set_field(["introducer id", "referrer id", "referral id"], referral_data.get("introducer_id", ""))
 
-            set_field(["activation key"], "")
-            set_field(["approval"], "")
+            # ✅ NEW: Set activation key (auto-fetched), leave approval empty
+            set_field(["activation key"], unused_activation_key)
+            set_field(["approval"], "")  # Empty - waiting for admin to set TRUE
 
             worksheet.append_row(row_data)
-            print(f"✅ Promoter referral saved: {row_data}")
+            print(f"✅ Promoter referral saved with activation key: {unused_activation_key}")
             return True, ""
 
         except Exception as e:
             print(f"❌ Error submitting promoter referral: {e}")
             return False, "Failed to submit promoter referral. Please try again."
+
+    def _get_unused_activation_key(self, spreadsheet):
+        """
+        Get an unused activation key from promoters sheet
+        Unused = Column C (Email) is empty AND not already assigned in 'promote referral' sheet
+        
+        Returns:
+            str: Activation key or empty string if none available
+        """
+        try:
+            promoters_ws = spreadsheet.worksheet("promoters")
+            all_values = promoters_ws.get_all_values()
+            
+            if len(all_values) < 2:
+                return ""
+            
+            # ✅ FIX: Get all keys already used in 'promote referral' sheet
+            already_assigned_keys = set()
+            try:
+                referral_ws = spreadsheet.worksheet("promote referral")
+                referral_headers = referral_ws.row_values(1)
+                referral_lower = [h.strip().lower() for h in referral_headers]
+                
+                # Find Activation Key column index
+                activation_key_idx = None
+                for i, h in enumerate(referral_lower):
+                    if h == "activation key":
+                        activation_key_idx = i
+                        break
+                
+                if activation_key_idx is not None:
+                    referral_rows = referral_ws.get_all_values()[1:]  # Skip header
+                    for row in referral_rows:
+                        if len(row) > activation_key_idx:
+                            key = row[activation_key_idx].strip()
+                            if key:
+                                already_assigned_keys.add(key)
+                
+                print(f"[KEY CHECK] Already assigned keys in promote referral: {already_assigned_keys}")
+            except Exception as e:
+                print(f"⚠️ Could not check promote referral sheet: {e}")
+            
+            # Find first row where:
+            # 1. Column A has key
+            # 2. Column C (email) is empty (not registered)
+            # 3. Key is NOT in already_assigned_keys
+            for row in all_values[1:]:  # Skip header
+                if len(row) >= 3:
+                    activation_key = row[0].strip()  # Column A
+                    email = row[2].strip() if len(row) > 2 else ""  # Column C
+                    
+                    # Key exists, email is empty, and not already assigned
+                    if activation_key and not email and activation_key not in already_assigned_keys:
+                        print(f"✅ Found unused activation key: {activation_key}")
+                        return activation_key
+            
+            print("⚠️ No unused activation keys found (all either registered or already assigned)")
+            return ""
+            
+        except Exception as e:
+            print(f"❌ Error fetching unused activation key: {e}")
+            return ""
 
     def get_downline_data(self, introducer_id):
         """Fetch approved referred promoters and their subscription counts."""
@@ -2873,6 +3020,100 @@ class GoogleSheetsManager:
             print(f"❌ Error assigning activation keys: {e}")
             return assigned
 
+    def check_approved_referrals(self, introducer_id, notified_keys_set):
+        """
+        Check for newly approved referrals that haven't been notified yet
+        
+        Args:
+            introducer_id: The referral ID of the introducer (current user)
+            notified_keys_set: Set of activation keys already notified (to avoid duplicates)
+        
+        Returns:
+            list of dicts: [{name, activation_key}, ...] for newly approved referrals
+        """
+        try:
+            if not self.client or not self.sheet_id or not introducer_id:
+                print(f"[REFERRAL CHECK] Missing: client={bool(self.client)}, sheet_id={bool(self.sheet_id)}, introducer_id={introducer_id}")
+                return []
+
+            spreadsheet = self.client.open_by_key(self.sheet_id)
+
+            try:
+                referral_ws = spreadsheet.worksheet("promote referral")
+            except Exception as e:
+                print(f"❌ promote referral sheet missing: {e}")
+                return []
+
+            referral_headers = referral_ws.row_values(1)
+            referral_lower = [h.strip().lower() for h in referral_headers]
+            
+            print(f"[REFERRAL CHECK] Headers found: {referral_headers}")
+
+            def idx(names):
+                for name in names:
+                    if name in referral_lower:
+                        return referral_lower.index(name)
+                return None
+
+            intro_idx = idx(["introducer id", "introducer", "referrer id"])
+            approval_idx = idx(["approval", "approved", "status"])
+            activation_idx = idx(["activation key"])
+            name_idx = idx(["promoter full name", "full name", "name"])
+
+            print(f"[REFERRAL CHECK] Column indices: intro={intro_idx}, approval={approval_idx}, activation={activation_idx}, name={name_idx}")
+
+            if intro_idx is None or approval_idx is None or activation_idx is None:
+                print(f"⚠️ Required columns not found in promote referral sheet")
+                print(f"⚠️ Available headers: {referral_lower}")
+                return []
+
+            referral_rows = referral_ws.get_all_values()[1:]  # Skip header
+            
+            print(f"[REFERRAL CHECK] Found {len(referral_rows)} rows to check")
+            print(f"[REFERRAL CHECK] Looking for introducer_id: '{introducer_id}'")
+            print(f"[REFERRAL CHECK] Already notified keys: {notified_keys_set}")
+            
+            newly_approved = []
+            
+            for row_num, row in enumerate(referral_rows, start=2):
+                intro_val = row[intro_idx].strip() if len(row) > intro_idx else ""
+                approval_val = row[approval_idx].strip() if len(row) > approval_idx else ""
+                activation_key = row[activation_idx].strip() if len(row) > activation_idx else ""
+                name = row[name_idx].strip() if name_idx is not None and len(row) > name_idx else "Someone"
+                
+                print(f"[REFERRAL CHECK] Row {row_num}: intro='{intro_val}', approval='{approval_val}', key='{activation_key}', name='{name}'")
+                
+                # Check if introducer matches (case-insensitive)
+                intro_match = intro_val.lower() == introducer_id.lower()
+                
+                # Check if approved - handle various formats: TRUE, true, True, yes, Yes, YES, 1
+                approval_upper = approval_val.upper()
+                is_approved = approval_upper in ["TRUE", "YES", "1", "APPROVED"]
+                
+                # Check if has activation key
+                has_key = bool(activation_key)
+                
+                # Check if not already notified
+                not_notified = activation_key not in notified_keys_set
+                
+                print(f"[REFERRAL CHECK] Row {row_num} checks: intro_match={intro_match}, is_approved={is_approved}, has_key={has_key}, not_notified={not_notified}")
+                
+                if intro_match and is_approved and has_key and not_notified:
+                    newly_approved.append({
+                        "name": name,
+                        "activation_key": activation_key
+                    })
+                    print(f"✅ Found newly approved referral: {name} with key {activation_key}")
+            
+            print(f"[REFERRAL CHECK] Total newly approved: {len(newly_approved)}")
+            return newly_approved
+
+        except Exception as e:
+            print(f"❌ Error checking approved referrals: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
 # ⚡ LAZY INIT - Initialize Google Sheets Manager only when needed
 gsheet_manager = None
 
@@ -2888,6 +3129,29 @@ def main(page: ft.Page):
     global NOTIFICATIONS_CACHE_FILE
     import warnings
     warnings.filterwarnings("ignore", category=DeprecationWarning)
+    
+    # ✅ FIX: Define these at main() level so all functions can access them
+    private_unread_counts = {}
+    unread_private_messages = {"count": 0}
+    unread_system_notifications = {"count": 0}
+    system_notifications = []
+    notification_badge_container = None  # Will be set in show_main_menu
+    notification_badge_text = None  # Will be set in show_main_menu
+    
+    def update_notification_badge():
+        """Update notification badge - accessible from all functions"""
+        nonlocal notification_badge_container, notification_badge_text
+        if notification_badge_container is None or notification_badge_text is None:
+            return
+        total_unread = unread_system_notifications["count"] + unread_private_messages["count"]
+        notification_badge_text.value = str(total_unread)
+        notification_badge_container.visible = total_unread > 0
+        print(f"[BADGE] Updated: system={unread_system_notifications['count']}, private={unread_private_messages['count']}, total={total_unread}")
+        if notification_badge_container.page:
+            try:
+                notification_badge_container.update()
+            except:
+                pass
     
     # ============================================
     # 🔥 CRITICAL FIX: Global NaN Protection
@@ -4340,11 +4604,11 @@ def main(page: ft.Page):
         profile_avatar_ref["widget"] = create_profile_avatar()
 
         # ---------------- TOP BAR (CRITICAL FIX - Ensure all numeric values are safe) ----------------
-       
-        system_notifications = []
-        unread_system_notifications = {"count": 0}
-        unread_private_messages = {"count": 0}
-        private_unread_counts = {}
+        
+        # ✅ FIX: Use nonlocal to access variables from main() scope
+        nonlocal private_unread_counts, unread_private_messages, unread_system_notifications
+        nonlocal system_notifications, notification_badge_container, notification_badge_text
+        
         activate_tab_ref = {"fn": None}
 
         def load_notification_cache():
@@ -4354,6 +4618,7 @@ def main(page: ft.Page):
                         cached = json.load(f)
                     stored_notifications = cached.get("system_notifications")
                     if isinstance(stored_notifications, list):
+                        system_notifications.clear()
                         system_notifications.extend(stored_notifications)
                     unread_count = cached.get("unread_system_count")
                     if isinstance(unread_count, int) and unread_count >= 0:
@@ -4375,6 +4640,7 @@ def main(page: ft.Page):
             except Exception as e:
                 print(f"⚠️ Could not save notifications cache: {e}")
 
+        # ✅ FIX: Create badge UI and assign to main() level variables
         notification_badge_text = ft.Text(
             "0", size=10, color="white", weight="bold"
         )
@@ -4393,20 +4659,9 @@ def main(page: ft.Page):
 
         load_notification_cache()
 
-        def update_notification_badge():
-            total_unread = unread_system_notifications["count"] + unread_private_messages["count"]
-            notification_badge_text.value = str(total_unread)
-            notification_badge_container.visible = total_unread > 0
-            print(f"[BADGE] Updated: system={unread_system_notifications['count']}, private={unread_private_messages['count']}, total={total_unread}")
-            if notification_badge_container.page:
-                try:
-                    notification_badge_container.update()
-                except:
-                    pass
-
         # ✅ FIX 4: Load unread private messages count at startup
         def load_unread_private_messages_count():
-            """Load unread private message count from Firebase for notification badge"""
+            """Load unread private message count for notification badge"""
             print("[NOTIFICATION BADGE] Starting to load unread count...")
             
             def fetch_unread_count():
@@ -4416,77 +4671,63 @@ def main(page: ft.Page):
                         print("[NOTIFICATION BADGE] db or auth not ready, skipping")
                         return
                     
-                    if not NetworkChecker.is_online():
-                        print("[NOTIFICATION BADGE] Offline, trying cache only")
-                        # Try cache
-                        cached_chats = CacheManager.load_from_cache('private_chats')
-                        if cached_chats:
-                            total_unread = 0
-                            for chat in cached_chats:
-                                unread = chat.get('unread', 0)
-                                try:
-                                    unread_val = int(unread) if unread and str(unread).isdigit() else 0
-                                except:
-                                    unread_val = 0
-                                total_unread += unread_val
+                    # ✅ FIX 4: First try cache for instant display
+                    cached_chats = CacheManager.load_from_cache('private_chats')
+                    if cached_chats:
+                        total_unread = 0
+                        for chat in cached_chats:
+                            unread = chat.get('unread', 0)
+                            try:
+                                unread_val = int(unread) if unread else 0
+                            except:
+                                unread_val = 0
+                            total_unread += unread_val
+                        
+                        if total_unread > 0:
                             unread_private_messages["count"] = total_unread
                             print(f"[NOTIFICATION BADGE] From cache: {total_unread}")
                             update_notification_badge()
+                    
+                    if not NetworkChecker.is_online():
+                        print("[NOTIFICATION BADGE] Offline, using cache only")
                         return
                     
-                    print(f"[NOTIFICATION BADGE] Fetching for user: {auth.user_id}")
+                    print(f"[NOTIFICATION BADGE] Fetching fresh data for user: {auth.user_id}")
                     
-                    # Fetch all private chats from Firebase
-                    chats_url = f"{db.database_url}/private_chats.json?auth={db.auth_token}"
-                    response = requests.get(chats_url, timeout=15)
+                    # ✅ FIX 4: Use same logic as load_private_chats - count unseen messages
+                    all_users = db.get_all_users()
+                    total_unread = 0
+                    chats_with_unread = 0
                     
-                    if response.status_code == 200:
-                        all_chats = response.json() or {}
-                        total_unread = 0
-                        chats_checked = 0
+                    for user in all_users:
+                        if user['id'] == auth.user_id:
+                            continue
                         
-                        for chat_id, chat_data in all_chats.items():
-                            if not chat_data or not isinstance(chat_data, dict):
-                                continue
-                            
-                            # Check if current user is part of this chat
-                            participants = chat_data.get('participants', {})
-                            if auth.user_id not in participants:
-                                continue
-                            
-                            chats_checked += 1
-                            
-                            # Check if chat is accepted
-                            status = chat_data.get('status', '')
-                            if status != 'accepted':
-                                continue
-                            
-                            # Get unread count for current user from unread_counts
-                            unread_counts = chat_data.get('unread_counts', {})
-                            unread = unread_counts.get(auth.user_id, 0)
-                            
-                            try:
-                                if unread is None:
-                                    unread_val = 0
-                                elif isinstance(unread, (int, float)):
-                                    unread_val = int(unread)
-                                elif isinstance(unread, str) and unread.isdigit():
-                                    unread_val = int(unread)
-                                else:
-                                    unread_val = 0
-                            except:
-                                unread_val = 0
-                            
-                            if unread_val > 0:
-                                print(f"[NOTIFICATION BADGE] Chat {chat_id}: {unread_val} unread")
-                            total_unread += unread_val
+                        # Create chat ID using same logic
+                        chat_id = create_chat_id(auth.user_id, user['id'])
                         
-                        unread_private_messages["count"] = total_unread
-                        print(f"[NOTIFICATION BADGE] Total: {total_unread} unread from {chats_checked} chats")
-                        update_notification_badge()
+                        # Check if chat is accepted
+                        status = db.get_chat_status(chat_id)
+                        if status != "accepted":
+                            continue
                         
-                    else:
-                        print(f"[NOTIFICATION BADGE] HTTP error: {response.status_code}")
+                        # Get messages and count unseen ones (same logic as refresh_chats)
+                        messages = db.get_messages(chat_id)
+                        if messages:
+                            unread_count = sum(
+                                1 for msg in messages
+                                if msg.get('sender_id') != auth.user_id
+                                and not msg.get('seen', False)
+                            )
+                            
+                            if unread_count > 0:
+                                total_unread += unread_count
+                                chats_with_unread += 1
+                                print(f"[NOTIFICATION BADGE] Chat with {user.get('username', user['id'])}: {unread_count} unread")
+                    
+                    unread_private_messages["count"] = total_unread
+                    print(f"[NOTIFICATION BADGE] Total: {total_unread} unread messages in {chats_with_unread} chats")
+                    update_notification_badge()
                         
                 except Exception as fetch_ex:
                     print(f"[NOTIFICATION BADGE] Error: {fetch_ex}")
@@ -4499,11 +4740,131 @@ def main(page: ft.Page):
         # ✅ FIX 4: Load unread count immediately when main menu loads
         load_unread_private_messages_count()
 
+        # ✅ NEW: Check for approved referrals and show notifications
+        # Track notified keys to avoid duplicate notifications
+        NOTIFIED_REFERRALS_CACHE_FILE = CACHE_DIR.parent / "notified_referral_keys.json" if CACHE_DIR else None
+        
+        def load_notified_referral_keys():
+            """Load set of already notified referral activation keys"""
+            try:
+                if NOTIFIED_REFERRALS_CACHE_FILE and NOTIFIED_REFERRALS_CACHE_FILE.exists():
+                    with open(NOTIFIED_REFERRALS_CACHE_FILE, "r") as f:
+                        data = json.load(f)
+                        return set(data.get("notified_keys", []))
+            except Exception as e:
+                print(f"⚠️ Could not load notified referral keys: {e}")
+            return set()
+        
+        def save_notified_referral_keys(keys_set):
+            """Save set of notified referral activation keys"""
+            try:
+                if NOTIFIED_REFERRALS_CACHE_FILE:
+                    NOTIFIED_REFERRALS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    with open(NOTIFIED_REFERRALS_CACHE_FILE, "w") as f:
+                        json.dump({"notified_keys": list(keys_set)}, f)
+            except Exception as e:
+                print(f"⚠️ Could not save notified referral keys: {e}")
+        
+        def check_and_notify_approved_referrals():
+            """Check Google Sheets for newly approved referrals and add system notifications"""
+            def do_check():
+                try:
+                    # Get current user's referral ID from Firebase profile
+                    if not db or not auth or not auth.user_id:
+                        print("[REFERRAL CHECK] db or auth not ready")
+                        return
+                    
+                    # Fetch user's promoter status
+                    profile_url = f"{db.database_url}/users/{auth.user_id}.json?auth={db.auth_token}"
+                    response = requests.get(profile_url, timeout=10)
+                    
+                    if response.status_code != 200:
+                        print("[REFERRAL CHECK] Could not fetch user profile")
+                        return
+                    
+                    profile_data = response.json() or {}
+                    promoter_status = profile_data.get("promoter_status", {})
+                    
+                    if not promoter_status.get("registered"):
+                        print("[REFERRAL CHECK] User is not a registered promoter")
+                        return
+                    
+                    referral_id = promoter_status.get("referral_id", "")
+                    if not referral_id:
+                        print("[REFERRAL CHECK] User has no referral ID")
+                        return
+                    
+                    print(f"[REFERRAL CHECK] Checking for approved referrals for: {referral_id}")
+                    
+                    # Load already notified keys
+                    notified_keys = load_notified_referral_keys()
+                    
+                    # Check Google Sheets for newly approved referrals
+                    gs_manager = get_gsheet_manager()
+                    newly_approved = gs_manager.check_approved_referrals(referral_id, notified_keys)
+                    
+                    if newly_approved:
+                        print(f"[REFERRAL CHECK] Found {len(newly_approved)} newly approved referrals")
+                        
+                        for referral in newly_approved:
+                            name = referral.get("name", "Someone")
+                            activation_key = referral.get("activation_key", "")
+                            
+                            # Add to system notifications
+                            notification = {
+                                "title": "🎉 Referral Approved!",
+                                "message": f"Your referred person '{name}' has been approved!\n\nActivation Key: {activation_key}\n\nShare this key with them to register as a promoter.",
+                                "timestamp": int(time.time() * 1000),
+                                "type": "referral_approved"
+                            }
+                            system_notifications.append(notification)
+                            unread_system_notifications["count"] += 1
+                            
+                            # Mark as notified
+                            notified_keys.add(activation_key)
+                            
+                            print(f"[REFERRAL CHECK] ✅ Added notification for {name}")
+                        
+                        # Save notified keys
+                        save_notified_referral_keys(notified_keys)
+                        
+                        # Save notification cache
+                        save_notification_cache()
+                        
+                        # Update badge
+                        update_notification_badge()
+                    else:
+                        print("[REFERRAL CHECK] No newly approved referrals found")
+                        
+                except Exception as e:
+                    print(f"[REFERRAL CHECK] Error: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Run in background thread
+            threading.Thread(target=do_check, daemon=True).start()
+        
+        # Check for approved referrals when app opens
+        check_and_notify_approved_referrals()
+
         update_notification_badge()
 
         def open_notifications_dialog(e=None):
+            # ✅ FIX: Clear system notification count and update badge IMMEDIATELY
             unread_system_notifications["count"] = 0
-            update_notification_badge()
+            
+            # ✅ FIX: Force badge to hide immediately
+            notification_badge_container.visible = False
+            notification_badge_text.value = str(unread_private_messages["count"])
+            if unread_private_messages["count"] > 0:
+                notification_badge_container.visible = True
+            
+            # Force UI update for badge
+            try:
+                notification_badge_container.update()
+            except:
+                pass
+            
             save_notification_cache()
 
             notification_items = []
@@ -7092,11 +7453,18 @@ def main(page: ft.Page):
                             messages = db.get_messages(chat_id)
                             last_msg = messages[-1] if messages else None
 
-                            unread_count = sum(
-                                1 for msg in messages
-                                if msg.get('sender_id') != auth.user_id
-                                and not msg.get('seen', False)
-                            )
+                            # ✅ DEBUG: Log message details for unread calculation
+                            unread_count = 0
+                            for msg in messages:
+                                sender_id = msg.get('sender_id', '')
+                                seen = msg.get('seen', False)
+                                is_from_other = sender_id != auth.user_id
+                                is_unseen = not seen
+                                
+                                if is_from_other and is_unseen:
+                                    unread_count += 1
+                            
+                            print(f"[UNREAD DEBUG] Chat {chat_id}: total_msgs={len(messages)}, unread={unread_count}")
 
                             accepted_chats.append({
                                 'user': user,
@@ -7139,14 +7507,20 @@ def main(page: ft.Page):
 
         def display_private_chats_from_cache(accepted_chats):
             """Display private chats from data (accepted + pending requests)"""
+            print(f"[DISPLAY CHATS] Starting with {len(accepted_chats)} chats")
             private_chats_column.controls.clear()
 
             try:
                 private_unread_counts.clear()
                 for chat in accepted_chats:
-                    private_unread_counts[chat.get('chat_id')] = int(chat.get('unread', 0) or 0)
+                    chat_unread = int(chat.get('unread', 0) or 0)
+                    chat_id = chat.get('chat_id', 'unknown')
+                    private_unread_counts[chat_id] = chat_unread
+                    print(f"[DISPLAY CHATS] Chat {chat_id}: unread={chat_unread}")
                 unread_private_messages["count"] = sum(private_unread_counts.values())
-            except Exception:
+                print(f"[DISPLAY CHATS] Total unread: {unread_private_messages['count']}")
+            except Exception as e:
+                print(f"[DISPLAY CHATS] Error calculating unread: {e}")
                 unread_private_messages["count"] = 0
                 private_unread_counts.clear()
             update_notification_badge()
@@ -7200,7 +7574,25 @@ def main(page: ft.Page):
                             print(f"🔥 FOUND NaN in unread count for user {user.get('username')}")
                             unread = 0
 
-                    uname = user.get('username', user.get('email', 'User').split('@')[0])
+                    # ✅ FIX: Properly extract username - handle cases where user data might be malformed
+                    uname = "User"
+                    if isinstance(user, dict):
+                        # Try to get username first
+                        if user.get('username') and isinstance(user.get('username'), str):
+                            uname = user.get('username')
+                        # Fallback to email
+                        elif user.get('email') and isinstance(user.get('email'), str):
+                            uname = user.get('email').split('@')[0]
+                        # If username is a dict (Firebase returned wrong data), skip it
+                        elif isinstance(user.get('username'), dict):
+                            # This is the bug - username contains promoter_status dict
+                            # Try to get from email instead
+                            if user.get('email') and isinstance(user.get('email'), str):
+                                uname = user.get('email').split('@')[0]
+                            else:
+                                uname = f"User_{user.get('id', '')[:6]}"
+                    
+                    print(f"[PRIVATE CHAT DEBUG] User data: {user.get('id')}, username type: {type(user.get('username'))}, extracted uname: {uname}")
 
                     # Avatar from cache
                     cached_path = None
@@ -7253,12 +7645,18 @@ def main(page: ft.Page):
                         unread_count_safe = int(unread) if unread and not math.isnan(float(unread)) else 0
                     except Exception:
                         unread_count_safe = 0
+                    
+                    # ✅ DEBUG: Log unread count for each chat
+                    print(f"[PRIVATE CHAT] {uname}: unread={unread_count_safe}")
 
+                    # ✅ FIX: Create visible unread badge with proper styling
                     unread_badge = ft.Container(
-                        content=ft.Text(str(unread_count_safe), size=10, color="white", weight="bold"),
+                        content=ft.Text(str(unread_count_safe), size=11, color="white", weight="bold"),
                         bgcolor="red",
-                        border_radius=10,
-                        padding=ft.padding.only(left=6, right=6, top=2, bottom=2),
+                        border_radius=12,
+                        width=24 if unread_count_safe < 10 else 28,
+                        height=24,
+                        alignment=ft.alignment.center,
                         visible=(unread_count_safe > 0)
                     )
 
@@ -7286,9 +7684,15 @@ def main(page: ft.Page):
             content=ft.Column([
                 ft.Container(
                     content=ft.Row([
+                        ft.IconButton(
+                            icon=ft.Icons.ARROW_BACK,
+                            on_click=lambda e: activate_tab(0),  # Go to Promoter tab
+                            tooltip="Back"
+                        ),
                         ft.Text("Private Chats", size=20, weight="bold", expand=True)
                     ]),
-                    padding=15
+                    padding=ft.padding.only(left=10, right=15, top=10, bottom=10),
+                    bgcolor="#E3F2FD"
                 ),
                 ft.Container(
                     content=private_chats_column,
@@ -7376,10 +7780,11 @@ def main(page: ft.Page):
                 if not members_cache["loaded"]:
                     load_all_members()
             elif selected_index == 3:
-                active_screen["current"] = "chat_list"
-                if not users_list.controls:
+                # ✅ FIX: Use private_chats view with proper unread badges
+                active_screen["current"] = "private_chats"
+                if not private_chats_cache.get("loaded"):
                     try:
-                        load_users()
+                        load_private_chats()
                     except Exception as ex:
                         print(f"[PRIVATE TAB AUTO-LOAD ERROR] {ex}")
             # ✅ FIX 5: Tab 4 (Settings) only exists for admin
@@ -7553,11 +7958,12 @@ def main(page: ft.Page):
         chat_list_view.content = chat_list_refreshable
 
         # ✅ FIX 5: Build horizontal pager with conditional Settings tab
+        # ✅ FIX: Use screen_private_chat (has unread badges) instead of chat_list_view (no badges)
         tab_pages = [
             ft.Container(content=screen_promoter, expand=True),
             ft.Container(content=screen_groups, expand=True),
             ft.Container(content=screen_members, expand=True),
-            ft.Container(content=chat_list_view, expand=True),
+            ft.Container(content=screen_private_chat, expand=True),  # ✅ Changed from chat_list_view
         ]
         
         # ✅ FIX 5: Only add Settings tab for admin
