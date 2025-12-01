@@ -7460,10 +7460,10 @@ def main(page: ft.Page):
                                 seen = msg.get('seen', False)
                                 is_from_other = sender_id != auth.user_id
                                 is_unseen = not seen
-                                
+
                                 if is_from_other and is_unseen:
                                     unread_count += 1
-                            
+
                             print(f"[UNREAD DEBUG] Chat {chat_id}: total_msgs={len(messages)}, unread={unread_count}")
 
                             accepted_chats.append({
@@ -7502,7 +7502,9 @@ def main(page: ft.Page):
                             ft.Container(content=ft.Text("Error loading chats", color="red"), padding=20)
                         )
                         page.update()
-                refresh_chats()
+
+            # Run refresh in background so the UI isn't blocked on slow loads
+            threading.Thread(target=refresh_chats, daemon=True).start()
 
 
         def display_private_chats_from_cache(accepted_chats):
@@ -7782,11 +7784,13 @@ def main(page: ft.Page):
             elif selected_index == 3:
                 # ✅ FIX: Use private_chats view with proper unread badges
                 active_screen["current"] = "private_chats"
-                if not private_chats_cache.get("loaded"):
-                    try:
-                        load_private_chats()
-                    except Exception as ex:
-                        print(f"[PRIVATE TAB AUTO-LOAD ERROR] {ex}")
+                # Always refresh when opening Private tab so badges/list stay in sync
+                try:
+                    print("[PRIVATE TAB] Opening private chats - triggering refresh")
+                    load_private_chats(force_refresh=True)
+                    update_notification_badge()
+                except Exception as ex:
+                    print(f"[PRIVATE TAB AUTO-LOAD ERROR] {ex}")
             # ✅ FIX 5: Tab 4 (Settings) only exists for admin
             page.update()
 
