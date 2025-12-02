@@ -7277,8 +7277,8 @@ def main(page: ft.Page):
                     # Show success message
                     show_snackbar(f"✅ Registered successfully! Referral ID: {referral_id}")
                     
-                    # Refresh promoter screen to show dashboard
-                    refresh_promoter_screen()
+                    # Refresh promoter screen to show dashboard (ensure UI thread reloads fresh status)
+                    page.invoke_later(lambda: refresh_promoter_screen(force_reload=True))
                 else:
                     promoter_status_text.value = f"❌ {message}"
                     promoter_status_text.color = "red"
@@ -7328,7 +7328,7 @@ def main(page: ft.Page):
                 import traceback
                 traceback.print_exc()
         
-        def refresh_promoter_screen(use_cached=False):
+        def refresh_promoter_screen(use_cached=False, force_reload=False):
             """Refresh the promoter screen content - OPTIMIZED for instant display"""
             nonlocal promoter_screen_initialized, promoter_needs_refresh
 
@@ -7341,6 +7341,9 @@ def main(page: ft.Page):
             promoter_content.controls.clear()
             update_notification_badge()
             promoter_needs_refresh = False
+
+            if force_reload or (auth and (not is_registered_promoter or not promoter_referral_id)):
+                reload_promoter_status()
 
             # ⚡ Show UI immediately if we have cached promoter_referral_id
             if is_registered_promoter and promoter_referral_id:
