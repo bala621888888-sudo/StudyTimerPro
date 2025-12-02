@@ -744,13 +744,9 @@ class FirebaseAuth:
 
             if response.status_code == 200:
                 methods = data.get('signInMethods', []) or []
-                registered = data.get('registered', False)
-                return (len(methods) > 0) or bool(registered), None
+                return len(methods) > 0, None
 
             error_msg = data.get('error', {}).get('message', 'Unknown error')
-            # Treat EMAIL_NOT_FOUND as a non-error "not found" to keep UX clean
-            if error_msg == "EMAIL_NOT_FOUND":
-                return False, None
             return False, error_msg
         except Exception as e:
             return False, str(e)
@@ -1337,13 +1333,9 @@ class FirebaseAuth:
 
             if response.status_code == 200:
                 methods = data.get('signInMethods', []) or []
-                registered = data.get('registered', False)
-                return (len(methods) > 0) or bool(registered), None
+                return len(methods) > 0, None
 
             error_msg = data.get('error', {}).get('message', 'Unknown error')
-            # Treat EMAIL_NOT_FOUND as a non-error "not found" to keep UX clean
-            if error_msg == "EMAIL_NOT_FOUND":
-                return False, None
             return False, error_msg
         except Exception as e:
             return False, str(e)
@@ -4094,19 +4086,7 @@ def main(page: ft.Page):
             show_snackbar("Please enter email")
             return
 
-        show_snackbar("Checking account...")
-        page.update()
-
-        # Verify the account exists before sending OTP.
-        exists, error = auth.email_exists(email)
-        if error:
-            show_snackbar(f"Unable to verify account: {error}. Please try again.")
-            return
-        if not exists:
-            show_snackbar("Account not found. Please sign up first.")
-            return
-
-        # Explicitly reset OTP flow to sign-in to avoid accidental sign-ups
+        # No need to check if account exists - we'll create it automatically if needed
         pending_otp_data["is_signup"] = False
         pending_otp_data["username"] = None
         pending_otp_data["email"] = email
@@ -4122,7 +4102,7 @@ def main(page: ft.Page):
 
             if success:
                 pending_otp_data["email"] = email
-                pending_otp_data["username"] = None  # Will be fetched during verification
+                pending_otp_data["username"] = None  # Will be auto-generated if needed
                 pending_otp_data["is_signup"] = False
                 show_snackbar("OTP sent to your email!")
                 show_otp_verify_view()
@@ -4264,8 +4244,8 @@ def main(page: ft.Page):
                             show_snackbar("Network error. Please check your internet connection and try again.")
                             return
             else:
-                # Sign in existing user
-                show_snackbar("Logging in...")
+                # Sign in existing user OR create account automatically if new
+                show_snackbar("Verifying...")
                 page.update()
                 
                 # Try local credentials first (using refresh token)
@@ -4302,12 +4282,13 @@ def main(page: ft.Page):
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        show_snackbar(f"Attempting to sign in... ({attempt + 1}/{max_retries})")
+                        show_snackbar(f"Signing in... ({attempt + 1}/{max_retries})")
                         page.update()
                         
                         success_signin, message_signin = auth.sign_in(email, temp_password)
                         
                         if success_signin:
+                            # Existing account - sign in successful
                             db = FirebaseDatabase(FIREBASE_CONFIG['databaseURL'], auth.id_token)
                             storage = FirebaseStorage(FIREBASE_CONFIG['storageBucket'], auth.id_token)
 
@@ -4338,20 +4319,59 @@ def main(page: ft.Page):
                             show_main_menu()
                             return
                         else:
-                            # Check specific error
+                            # Check if account doesn't exist - create it automatically
                             if "USER_NOT_FOUND" in message_signin or "INVALID" in message_signin:
+                                # Auto-create account for new user
+                                show_snackbar("Creating your account...")
+                                page.update()
+                                
+                                success_signup, message_signup = auth.sign_up(email, temp_password)
+                                
+                                if success_signup:
+                                    # New account created
+                                    db = FirebaseDatabase(FIREBASE_CONFIG['databaseURL'], auth.id_token)
+                                    storage = FirebaseStorage(FIREBASE_CONFIG['storageBucket'], auth.id_token)
+                                    
+                                    # Auto-generate username from email
+                                    auto_username = email.split('@')[0]
+                                    db.create_user_profile(auth.user_id, auth.email, auto_username)
+                                    db.store_user_token(auth.user_id, auth.email, auto_username, auth.refresh_token)
+
+                                    current_username = auto_username
+                                    is_admin = (auth.email == ADMIN_EMAIL)
+                                    user_is_group_admin = False
+                                    group_info = {}
+                                    CredentialsManager.save_credentials(auth.email, auth.refresh_token, current_username)
+
+                                    show_snackbar("🎉 Account created! Welcome!")
+                                    push_debug(f"Auto-signup success: calling login_user() with uid={auth.user_id}")
+                                    push_manager.login_user(auth.user_id, db_instance=db)
+                                    request_notification_permission_dialog() 
+                                    show_main_menu()
+                                    return
+                                elif "EMAIL_EXISTS" in message_signup:
+                                    # Account exists but password mismatch - try to recover
+                                    if attempt < max_retries - 1:
+                                        show_snackbar(f"Connection issue, retrying... ({attempt + 1}/{max_retries})")
+                                        time.sleep(2)
+                                        continue
+                                    else:
+                                        show_snackbar("❌ Account exists but cannot access. Please contact support.")
+                                        time.sleep(2)
+                                        show_login_view()
+                                        return
+                                else:
+                                    show_snackbar(f"❌ Signup error: {message_signup}")
+                                    return
+                            else:
+                                # Other error - retry or show error
                                 if attempt < max_retries - 1:
                                     show_snackbar(f"Connection issue, retrying... ({attempt + 1}/{max_retries})")
                                     time.sleep(2)
                                     continue
                                 else:
-                                    show_snackbar("Account not found. Please sign up first or check your connection.")
-                                    time.sleep(1)
-                                    show_login_view()
+                                    show_snackbar(f"❌ Sign in error: {message_signin}")
                                     return
-                            else:
-                                show_snackbar(f"Sign in error: {message_signin}")
-                                return
                                 
                     except Exception as network_error:
                         print(f"Network error during sign in (Attempt {attempt + 1}): {network_error}")
@@ -4386,63 +4406,23 @@ def main(page: ft.Page):
                 ft.Text("💬", size=60),
                 ft.Text("Promoter Hub", size=28, weight="bold"),
                 ft.Container(height=20),
-                # 🔥 FIX: Use proper tab structure without scroll conflicts
-                ft.Tabs(
-                    selected_index=0,
-                    animation_duration=300,
-                    height=400,  # 🔥 Fixed height prevents infinite scroll
-                    tabs=[
-                        ft.Tab(
-                            text="Sign In",
-                            content=ft.Container(
-                                content=ft.Column([
-                                    ft.Container(height=20),
-                                    ft.Text("Sign in with OTP", size=18, weight="bold"),
-                                    ft.Container(height=20),
-                                    signin_email_field,
-                                    ft.Container(height=20),
-                                    ft.ElevatedButton(
-                                        "Send OTP", 
-                                        width=200, 
-                                        on_click=send_otp_for_signin
-                                    ),
-                                ], 
-                                horizontal_alignment="center",
-                                spacing=0  # 🔥 Use Container(height=X) for spacing instead
-                                ),
-                                padding=20,
-                                alignment=ft.alignment.top_center  # 🔥 Align to top
-                            )
-                        ),
-                        ft.Tab(
-                            text="Sign Up",
-                            content=ft.Container(
-                                content=ft.Column([
-                                    ft.Container(height=20),
-                                    ft.Text("Create new account", size=18, weight="bold"),
-                                    ft.Container(height=20),
-                                    signup_email_field,
-                                    ft.Container(height=15),
-                                    signup_username_field,
-                                    ft.Container(height=20),
-                                    ft.ElevatedButton(
-                                        "Send OTP", 
-                                        width=200, 
-                                        on_click=send_otp_for_signup
-                                    ),
-                                ], 
-                                horizontal_alignment="center",
-                                spacing=0
-                                ),
-                                padding=20,
-                                alignment=ft.alignment.top_center
-                            )
-                        )
-                    ]
-                )
+                ft.Text("Sign in with OTP", size=18, weight="bold"),
+                ft.Container(height=20),
+                signin_email_field,
+                ft.Container(height=20),
+                ft.ElevatedButton(
+                    "Send OTP", 
+                    width=200, 
+                    on_click=send_otp_for_signin
+                ),
+                ft.Container(height=20),
+                ft.Text("New users: Just enter your email and we'll create your account!", 
+                       size=12, 
+                       color="grey",
+                       text_align="center")
             ], 
             horizontal_alignment="center",
-            spacing=0  # 🔥 No spacing here either
+            spacing=0
             ),
             padding=20,
             expand=True,
@@ -7559,7 +7539,7 @@ def main(page: ft.Page):
                             content=ft.Column([
                                 ft.Row([
                                     ft.Icon(ft.Icons.CHECK_CIRCLE, color="green", size=20),
-                                    ft.Text("Earn for every install", size=14)
+                                    ft.Text("Welcome to our community", size=14)
                                 ], spacing=10),
                                 ft.Row([
                                     ft.Icon(ft.Icons.CHECK_CIRCLE, color="green", size=20),
