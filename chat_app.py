@@ -517,11 +517,12 @@ MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB in bytes
 class MessageListener:
     """Firebase real-time message listener using polling"""
 
-    def __init__(self, chat_id, callback, db_instance, is_group=False):
+    def __init__(self, chat_id, callback, db_instance, is_group=False, member_joined_at=None):
         self.chat_id = chat_id
         self.callback = callback
         self.db = db_instance
         self.is_group = is_group
+        self.member_joined_at = member_joined_at
         self.running = False
         self.thread = None
         self.last_message_count = 0
@@ -558,7 +559,7 @@ class MessageListener:
                 
                 # Fetch latest messages
                 if self.is_group:
-                    messages = self.db.get_group_messages_by_id(self.chat_id)
+                    messages = self.db.get_group_messages_by_id(self.chat_id, joined_after=self.member_joined_at)
                 else:
                     messages = self.db.get_messages(self.chat_id)
                 
@@ -1729,8 +1730,15 @@ class FirebaseDatabase:
         except:
             return []
 
-    def get_group_messages_by_id(self, group_id, limit=50):
-        """Get messages for a specific group"""
+    def get_group_messages_by_id(self, group_id, limit=50, joined_after=None):
+        """Get messages for a specific group.
+
+        Args:
+            group_id: ID of the group to fetch messages for.
+            limit: Maximum number of messages to return.
+            joined_after: Optional timestamp (ms) to filter out messages sent
+                before a member joined the group.
+        """
         url = f"{self.database_url}/groups/{group_id}/messages.json?auth={self.auth_token}"
         print(f"[DEBUG] get_group_messages_by_id called for group_id={group_id}, url={url}")
         try:
@@ -1749,6 +1757,14 @@ class FirebaseDatabase:
                             continue
                         msg_data["id"] = msg_id
                         message_list.append(msg_data)
+
+                    # Filter messages to hide history before the user joined
+                    if joined_after:
+                        message_list = [
+                            msg for msg in message_list
+                            if msg.get("timestamp", 0) >= joined_after
+                        ]
+
                     message_list.sort(key=lambda x: x.get("timestamp", 0))
                     if len(message_list) > limit:
                         message_list = message_list[-limit:]
@@ -2187,7 +2203,7 @@ def format_file_size(size_bytes):
 # ============================================
 # LISTENER MANAGEMENT FUNCTIONS
 # ============================================
-def start_message_listener(chat_id, db_instance, page_ref, is_group=False):
+def start_message_listener(chat_id, db_instance, page_ref, is_group=False, member_joined_at=None):
     """Start a real-time listener for a chat"""
     global active_listeners
     
@@ -2210,7 +2226,13 @@ def start_message_listener(chat_id, db_instance, page_ref, is_group=False):
             except Exception as e:
                 print(f"[CALLBACK ERROR] {e}")
         
-        listener = MessageListener(chat_id, on_new_messages, db_instance, is_group=is_group)
+        listener = MessageListener(
+            chat_id,
+            on_new_messages,
+            db_instance,
+            is_group=is_group,
+            member_joined_at=member_joined_at,
+        )
         listener.start()
         active_listeners[chat_id] = listener
         
@@ -3445,6 +3467,7 @@ def main(page: ft.Page):
     current_chat_id = None
     current_chat_user = None
     current_group_id = None
+    current_group_joined_at = None  # Track when the user joined the currently open group
     is_admin = False
     user_is_group_admin = False
     current_username = None
@@ -4017,7 +4040,11 @@ def main(page: ft.Page):
         if not signin_email_field.value:
             show_snackbar("Please enter email")
             return
-        
+
+        # Explicitly reset OTP flow to sign-in to avoid accidental sign-ups
+        pending_otp_data["is_signup"] = False
+        pending_otp_data["username"] = None
+
         show_snackbar("Sending OTP...")
         page.update()
         
@@ -4073,6 +4100,10 @@ def main(page: ft.Page):
         email = pending_otp_data["email"]
         username = pending_otp_data["username"]
         is_signup = pending_otp_data["is_signup"]
+
+        # Only allow sign-up when username is present to prevent unintended account creation
+        if is_signup and not username:
+            is_signup = False
         
         if otp_manager.verify_otp(email, otp_code_field.value):
             show_snackbar("OTP verified!")
@@ -5339,8 +5370,8 @@ def main(page: ft.Page):
     
         def open_specific_group_chat(group_id):
             """Open a specific group chat"""
-            
-            nonlocal current_group_id
+
+            nonlocal current_group_id, current_group_joined_at
             current_group_id = group_id
             
             # Check if this is the old default group
@@ -5355,11 +5386,13 @@ def main(page: ft.Page):
                 show_snackbar("You are not a member of this group")
                 return
             
-            # Check if user is admin of this group
+            # Capture membership details for current user
             user_is_group_admin_check = False
+            current_group_joined_at = None
             for member in members:
                 if member['id'] == auth.user_id:
                     user_is_group_admin_check = member.get('is_admin', False)
+                    current_group_joined_at = member.get('joined_at')
                     break
             
             # Show group chat
@@ -5368,11 +5401,18 @@ def main(page: ft.Page):
 
         def show_specific_group_chat(group_id, group_info_data, members, user_is_admin_in_group):
             """Show chat screen for a specific group"""
-            nonlocal current_group_id, group_info, user_is_group_admin
+            nonlocal current_group_id, group_info, user_is_group_admin, current_group_joined_at
             
             active_screen["current"] = "group_chat"
             current_group_id = group_id
             user_is_group_admin = user_is_admin_in_group
+
+            # Ensure join timestamp is captured for message filtering
+            if current_group_joined_at is None:
+                for member in members or []:
+                    if member.get("id") == auth.user_id:
+                        current_group_joined_at = member.get("joined_at")
+                        break
             
             navigation_stack.clear()
             navigation_stack.append(show_main_menu)
@@ -5552,7 +5592,7 @@ def main(page: ft.Page):
             load_specific_group_messages(group_id)
             
             # Start real-time listener for this group
-            start_message_listener(group_id, db, page, is_group=True)
+            start_message_listener(group_id, db, page, is_group=True, member_joined_at=current_group_joined_at)
             print(f"[DEBUG] Started listener for group chat: {group_id}")
             
             # ✅ Start auto-refresh timer
@@ -5562,7 +5602,7 @@ def main(page: ft.Page):
         def load_specific_group_messages(group_id):
             """Load messages for a specific group (always rebuild UI)"""
             try:
-                messages = db.get_group_messages_by_id(group_id)
+                messages = db.get_group_messages_by_id(group_id, joined_after=current_group_joined_at)
 
                 # Always rebuild the message list to avoid stale / empty UI when re-entering
                 group_displayed_message_ids.clear()
