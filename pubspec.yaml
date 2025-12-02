@@ -1,5 +1,5 @@
 name: chat_app
-description: Chat App (Flet + Flutter)
+description: ST Promoter Hub (Flet + Flutter)
 publish_to: "none"
 version: 1.0.0+1
 environment:
@@ -22,6 +22,7 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  flutter_launcher_icons: ^0.14.1
 
 flutter:
   uses-material-design: true
@@ -34,3 +35,10 @@ flutter:
     - family: MaterialIcons
       fonts:
         - asset: assets/fonts/MaterialIcons-Regular.otf
+
+# Run `flutter pub run flutter_launcher_icons` after updating this configuration.
+flutter_icons:
+  android: true
+  ios: false
+  image_path: "assets/chat_app_icon.png"
+  min_sdk_android: 21
