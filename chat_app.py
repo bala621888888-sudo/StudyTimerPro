@@ -6281,7 +6281,7 @@ def main(page: ft.Page):
                 return ""
 
         def update_promoter_upi_id(new_upi_id):
-            """Update UPI ID in Google Sheets promoters worksheet"""
+            """Update UPI ID in promoters and referral_program worksheets"""
             try:
                 if not promoter_referral_id:
                     return False, "No referral ID"
@@ -6321,6 +6321,46 @@ def main(page: ft.Page):
                         worksheet.update_cell(row_idx, upi_idx + 1, new_upi_id)
                         promoter_upi_state["upi_id"] = new_upi_id
                         print(f"[UPI] Updated successfully at row {row_idx}")
+
+                        # Mirror the change to referral_program worksheet (Column K)
+                        try:
+                            rp_sheet = spreadsheet.worksheet("referral_program")
+                            rp_headers = [h.strip().lower() for h in rp_sheet.row_values(1)]
+
+                            def find_col(possible_names, default_col):
+                                for name in possible_names:
+                                    if name in rp_headers:
+                                        return rp_headers.index(name) + 1
+                                return default_col
+
+                            rp_referral_col = find_col(["referral_id", "referral id"], 5)  # Default E
+                            rp_upi_col = find_col(["upi_id", "upi id", "upi"], 11)  # Default K
+
+                            rp_values = rp_sheet.get_all_values()
+                            updated_referral = False
+                            for rp_row_idx, rp_row in enumerate(rp_values[1:], start=2):
+                                rp_ref_id = rp_row[rp_referral_col - 1].strip() if len(rp_row) >= rp_referral_col else ""
+                                if rp_ref_id == promoter_referral_id:
+                                    rp_sheet.update_cell(rp_row_idx, rp_upi_col, new_upi_id)
+                                    updated_referral = True
+                                    print(f"[UPI] referral_program updated at row {rp_row_idx}, col {rp_upi_col}")
+                                    break
+
+                            if not updated_referral:
+                                print("[UPI] Referral ID missing in referral_program; adding new row")
+                                # Reuse helper to ensure the record exists
+                                try:
+                                    get_gsheet_manager()._add_to_referral_program(
+                                        spreadsheet,
+                                        email_field_promoter.value.strip(),
+                                        promoter_referral_id,
+                                        new_upi_id,
+                                    )
+                                except Exception as rp_err:
+                                    print(f"[UPI] Failed to append referral_program row: {rp_err}")
+                        except Exception as rp_sheet_err:
+                            print(f"[UPI] Could not update referral_program: {rp_sheet_err}")
+
                         return True, "UPI updated successfully"
                 
                 return False, "Referral ID not found"
@@ -7227,39 +7267,51 @@ def main(page: ft.Page):
                     
                     # 🎯 AUTO-JOIN BRONZE CATEGORY GROUPS
                     try:
-                        print("🔍 Checking for Bronze category groups to auto-join...")
+                        def auto_join_bronze_groups():
+                            """Join all Bronze category groups, ensuring joined_at is recorded."""
+                            if not db:
+                                print("⚠️ Database client not ready; skipping Bronze auto-join")
+                                return 0
 
-                        # Use the FirebaseDatabase helper to fetch groups so we respect auth tokens
-                        all_groups = db.get_all_groups()
-                        joined_count = 0
+                            print("🔍 Checking for Bronze category groups to auto-join...")
+                            all_groups = db.get_all_groups() or []
+                            joined_count_local = 0
 
-                        print(f"   Found {len(all_groups)} total groups")
+                            print(f"   Found {len(all_groups)} total groups")
 
-                        for group in all_groups:
-                            gid = group.get("id")
-                            category = (group.get("category") or "").strip()
-                            group_name = group.get("name", gid or "Group")
+                            for group in all_groups:
+                                gid = group.get("id")
+                                category = (group.get("category") or "").strip()
+                                group_name = group.get("name", gid or "Group")
 
-                            print(f"   Checking group: {group_name}, category: {category}")
+                                print(f"   Checking group: {group_name}, category: {category}")
 
-                            if category.lower() == "bronze" and gid:
-                                members = group.get("members", {}) or {}
-                                if auth.user_id not in members:
-                                    # Add user to group using helper (ensures joined_at saved for hiding old messages)
-                                    joined = db.add_member_to_group(
-                                        gid,
-                                        auth.user_id,
-                                        current_username,
-                                        is_admin=False,
-                                    )
+                                if gid and "bronze" in category.lower():
+                                    members = group.get("members", {}) or {}
+                                    member_info = members.get(auth.user_id, {}) if members else {}
 
-                                    print(f"   Join attempt for {group_name}: status {joined}")
+                                    # Add missing joined_at for existing members to hide old messages
+                                    needs_join = auth.user_id not in members
+                                    needs_joined_at = not needs_join and not member_info.get("joined_at")
 
-                                    if joined:
-                                        joined_count += 1
-                                        print(f"✅ Auto-joined Bronze group: {group_name}")
-                                else:
-                                    print(f"   Already a member of {group_name}")
+                                    if needs_join or needs_joined_at:
+                                        joined = db.add_member_to_group(
+                                            gid,
+                                            auth.user_id,
+                                            current_username,
+                                            is_admin=member_info.get("is_admin", False),
+                                        )
+                                        print(f"   Join attempt for {group_name}: status {joined}")
+
+                                        if joined:
+                                            joined_count_local += 1
+                                            print(f"✅ Auto-joined Bronze group: {group_name}")
+                                    else:
+                                        print(f"   Already a member of {group_name} with join timestamp")
+
+                            return joined_count_local
+
+                        joined_count = auto_join_bronze_groups()
 
                         if joined_count > 0:
                             print(f"🎉 Successfully auto-joined {joined_count} Bronze category group(s)!")
