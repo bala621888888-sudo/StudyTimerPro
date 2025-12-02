@@ -57,6 +57,14 @@ jobs:
           ls -lh android/app/google-services.json
           echo "==========================="
 
+      # ⚠️ NEW: get Flutter deps
+      - name: Flutter pub get
+        run: flutter pub get
+
+      # ⚠️ NEW: generate launcher icons from assets/chat_app_icon.png
+      - name: Generate launcher icons
+        run: flutter pub run flutter_launcher_icons
+
       - name: Build APK with Flet
         env:
           FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
