@@ -24,10 +24,10 @@ build-backend = "setuptools.build_meta"
 # =========================
 [tool.flet]
 org = "com.flet"
-product = "Chat App"
+product = "ST Promoter Hub"
 
 [tool.flet.app]
-name = "Chat App"
+name = ST Promoter Hub"
 description = "Firebase-based Chat Application"
 version = "1.0.0"
 module = "chat_app"
