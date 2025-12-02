@@ -9191,15 +9191,22 @@ def main(page: ft.Page):
             group_info = {}
     def handle_logout():
         push_debug("Logout triggered: calling logout_user()")
-        
+        nonlocal promoter_screen_initialized, promoter_needs_refresh, main_menu_initialized, promoter_content
+
         # ✅ FIX 3: Clear ALL cached data to prevent data leakage between accounts
         print("[LOGOUT] ===== CLEARING ALL DATA =====")
         print(f"[LOGOUT] Current auth.user_id before logout: {auth.user_id if auth else 'None'}")
-        
-        # Clear stats cache
+
+        # ✅ Ensure promoter tab fully resets between accounts
         promoter_stats_cache["loaded"] = False
         promoter_stats_cache["data"] = None
         promoter_stats_cache["timestamp"] = 0
+        promoter_screen_initialized = False
+        promoter_needs_refresh = True
+        main_menu_initialized = False
+        promoter_content.controls.clear() if promoter_content else None
+
+        # Clear stats cache
         print("[LOGOUT] ✅ Stats cache cleared")
         
         # ✅ FIX 3: Clear ALL file-based caches
