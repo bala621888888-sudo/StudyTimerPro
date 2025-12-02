@@ -732,7 +732,25 @@ class FirebaseAuth:
                 return False, error_msg
         except Exception as e:
             return False, str(e)
-    
+
+    def email_exists(self, email):
+        """Check if an email is registered in Firebase Auth."""
+        url = f"https://identitytoolkit.googleapis.com/v1/accounts:createAuthUri?key={self.api_key}"
+        payload = {"identifier": email, "continueUri": "http://localhost"}
+
+        try:
+            response = requests.post(url, json=payload)
+            data = response.json()
+
+            if response.status_code == 200:
+                methods = data.get('signInMethods', []) or []
+                return len(methods) > 0, None
+
+            error_msg = data.get('error', {}).get('message', 'Unknown error')
+            return False, error_msg
+        except Exception as e:
+            return False, str(e)
+
     def refresh_id_token(self):
         """Refresh the ID token using refresh token"""
         if not self.refresh_token:
@@ -1303,7 +1321,25 @@ class FirebaseAuth:
                 return False, error_msg
         except Exception as e:
             return False, str(e)
-    
+
+    def email_exists(self, email):
+        """Check if an email is registered in Firebase Auth."""
+        url = f"https://identitytoolkit.googleapis.com/v1/accounts:createAuthUri?key={self.api_key}"
+        payload = {"identifier": email, "continueUri": "http://localhost"}
+
+        try:
+            response = requests.post(url, json=payload)
+            data = response.json()
+
+            if response.status_code == 200:
+                methods = data.get('signInMethods', []) or []
+                return len(methods) > 0, None
+
+            error_msg = data.get('error', {}).get('message', 'Unknown error')
+            return False, error_msg
+        except Exception as e:
+            return False, str(e)
+
     def refresh_id_token(self):
         """Refresh the ID token using refresh token"""
         if not self.refresh_token:
@@ -4039,6 +4075,19 @@ def main(page: ft.Page):
     def send_otp_for_signin(e):
         if not signin_email_field.value:
             show_snackbar("Please enter email")
+            return
+
+        show_snackbar("Checking account...")
+        page.update()
+
+        # Verify the account exists before sending OTP
+        exists, error = auth.email_exists(signin_email_field.value)
+        if error:
+            show_snackbar(f"Unable to verify account: {error}")
+            return
+
+        if not exists:
+            show_snackbar("Account not found. Please sign up first.")
             return
 
         # Explicitly reset OTP flow to sign-in to avoid accidental sign-ups
