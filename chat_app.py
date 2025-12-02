@@ -65,6 +65,26 @@ except AttributeError:  # pragma: no cover - compatibility shim
 
     ICONS = _Icons()
 
+# Flet colors fallback (older builds may not expose ft.colors)
+try:
+    _ = ft.colors  # type: ignore[attr-defined]
+except AttributeError:  # pragma: no cover - compatibility shim
+    class _Colors:
+        BLUE = "#2196F3"
+        BLACK = "#000000"
+
+        @staticmethod
+        def with_opacity(opacity: float, base_color: str):
+            """Minimal fallback for ft.colors.with_opacity.
+
+            We ignore opacity in this shim and simply return the base color
+            string, which Flet accepts as a normal color.
+            """
+            return base_color
+
+    ft.colors = _Colors()  # type: ignore[attr-defined]
+
+
 ONESIGNAL_APP_ID = "6bb7df1b-6014-498a-ac2e-67abb63e4751"
 ONESIGNAL_REST_API_KEY = "os_v2_app_no356g3acreyvlbom6v3mpshkgsqs54zgyeuoxv6jkcmhcemp5x64wi3ulleqo4ykcl4b3vxomf5gs2mcs6p6y5eeai6quwkg7pxooa" 
 
@@ -5028,9 +5048,9 @@ def main(page: ft.Page):
                     db.set_chat_requester(chat_id, auth.user_id)
                     db.update_chat_status(chat_id, "pending")
                     
-                    # Send notification
+                    # Send notification using OneSignal
                     threading.Thread(
-                        target=db.send_fcm_notification,
+                        target=db.send_onesignal_notification,
                         args=(
                             user['id'],
                             f"💬 Message Request from {current_username}",
@@ -6052,6 +6072,193 @@ def main(page: ft.Page):
 
         # Stats container (will be updated when stats are loaded)
         stats_container = ft.Column([], spacing=10)
+        
+        # UPI ID state
+        promoter_upi_state = {
+            "upi_id": "",
+            "loaded": False
+        }
+        
+        # UPI display control (can be updated dynamically)
+        upi_text_display = ft.Text("Loading...", size=12, weight="w500", color="grey")
+        
+        def update_upi_display():
+            """Update UPI text display with current value"""
+            upi_id = promoter_upi_state.get("upi_id", "")
+            if upi_id:
+                upi_text_display.value = upi_id
+                upi_text_display.color = "#1565C0"
+            else:
+                upi_text_display.value = "Not set"
+                upi_text_display.color = "grey"
+
+        def fetch_promoter_upi_id():
+            """Fetch UPI ID from Google Sheets promoters worksheet"""
+            try:
+                if not promoter_referral_id:
+                    print("[UPI] No referral ID, skipping UPI fetch")
+                    return ""
+                
+                print(f"[UPI] Fetching UPI for referral ID: {promoter_referral_id}")
+                gs_manager = get_gsheet_manager()
+                
+                if not gs_manager or not gs_manager.client or not gs_manager.sheet_id:
+                    print("[UPI] GSheet manager not available")
+                    return ""
+                
+                # Open promoters worksheet
+                spreadsheet = gs_manager.client.open_by_key(gs_manager.sheet_id)
+                worksheet = spreadsheet.worksheet("promoters")
+                
+                all_values = worksheet.get_all_values()
+                
+                if len(all_values) < 2:
+                    return ""
+                
+                # Map headers
+                header = [h.strip().lower() for h in all_values[0]]
+                
+                def find_index(possible_names, fallback_index):
+                    for name in possible_names:
+                        if name in header:
+                            return header.index(name)
+                    return fallback_index
+                
+                upi_idx = find_index(["upi_id", "upi id", "upi"], 3)  # Column D
+                referral_idx = find_index(["referral_id", "referral id"], 4)  # Column E
+                
+                print(f"[UPI] Column indexes - UPI: {upi_idx}, Referral: {referral_idx}")
+                
+                # Find row with matching referral ID
+                for row_idx, row in enumerate(all_values[1:], start=2):
+                    row_referral_id = row[referral_idx].strip() if len(row) > referral_idx else ""
+                    
+                    if row_referral_id == promoter_referral_id:
+                        upi_id = row[upi_idx].strip() if len(row) > upi_idx else ""
+                        print(f"[UPI] Found UPI ID: {upi_id}")
+                        return upi_id
+                
+                print(f"[UPI] Referral ID {promoter_referral_id} not found in promoters sheet")
+                return ""
+                
+            except Exception as e:
+                print(f"[UPI] Error fetching UPI: {e}")
+                return ""
+
+        def update_promoter_upi_id(new_upi_id):
+            """Update UPI ID in Google Sheets promoters worksheet"""
+            try:
+                if not promoter_referral_id:
+                    return False, "No referral ID"
+                
+                print(f"[UPI] Updating UPI to: {new_upi_id}")
+                gs_manager = get_gsheet_manager()
+                
+                if not gs_manager or not gs_manager.client or not gs_manager.sheet_id:
+                    return False, "Sheet manager not available"
+                
+                spreadsheet = gs_manager.client.open_by_key(gs_manager.sheet_id)
+                worksheet = spreadsheet.worksheet("promoters")
+                
+                all_values = worksheet.get_all_values()
+                
+                if len(all_values) < 2:
+                    return False, "No data in sheet"
+                
+                # Map headers
+                header = [h.strip().lower() for h in all_values[0]]
+                
+                def find_index(possible_names, fallback_index):
+                    for name in possible_names:
+                        if name in header:
+                            return header.index(name)
+                    return fallback_index
+                
+                upi_idx = find_index(["upi_id", "upi id", "upi"], 3)  # Column D (0-indexed)
+                referral_idx = find_index(["referral_id", "referral id"], 4)  # Column E
+                
+                # Find row with matching referral ID
+                for row_idx, row in enumerate(all_values[1:], start=2):
+                    row_referral_id = row[referral_idx].strip() if len(row) > referral_idx else ""
+                    
+                    if row_referral_id == promoter_referral_id:
+                        # Update the cell (1-indexed for gspread)
+                        worksheet.update_cell(row_idx, upi_idx + 1, new_upi_id)
+                        promoter_upi_state["upi_id"] = new_upi_id
+                        print(f"[UPI] Updated successfully at row {row_idx}")
+                        return True, "UPI updated successfully"
+                
+                return False, "Referral ID not found"
+                
+            except Exception as e:
+                print(f"[UPI] Error updating UPI: {e}")
+                return False, str(e)
+
+        def show_edit_upi_dialog(e):
+            """Show dialog to edit UPI ID"""
+            upi_input = ft.TextField(
+                label="UPI ID",
+                value=promoter_upi_state.get("upi_id", ""),
+                width=300,
+                hint_text="yourname@upi",
+                autofocus=True
+            )
+            
+            def close_dialog(e):
+                edit_upi_dialog.open = False
+                page.update()
+            
+            def save_upi(e):
+                new_upi = upi_input.value.strip()
+                if not new_upi:
+                    show_snackbar("Please enter a valid UPI ID")
+                    return
+                
+                # Show saving indicator
+                save_btn.disabled = True
+                save_btn.text = "Saving..."
+                page.update()
+                
+                def save_thread():
+                    success, message = update_promoter_upi_id(new_upi)
+                    
+                    if success:
+                        show_snackbar("✅ UPI ID updated successfully")
+                        # Update UPI display immediately
+                        update_upi_display()
+                    else:
+                        show_snackbar(f"❌ Failed to update: {message}")
+                    
+                    edit_upi_dialog.open = False
+                    page.update()
+                
+                threading.Thread(target=save_thread, daemon=True).start()
+            
+            save_btn = ft.ElevatedButton(
+                "Save",
+                on_click=save_upi,
+                bgcolor="blue",
+                color="white"
+            )
+            
+            edit_upi_dialog = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Edit UPI ID", size=18, weight="bold"),
+                content=ft.Column([
+                    ft.Text("Enter your UPI ID for receiving payments:", size=13, color="grey"),
+                    ft.Container(height=10),
+                    upi_input,
+                ], tight=True, spacing=5),
+                actions=[
+                    ft.TextButton("Cancel", on_click=close_dialog),
+                    save_btn,
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+            
+            page.overlay.append(edit_upi_dialog)
+            edit_upi_dialog.open = True
+            page.update()
 
         # Refer a Promoter form fields
         promoter_full_name_field = ft.TextField(label="Promoter Full Name", width=420, autofocus=True)
@@ -6519,6 +6726,24 @@ def main(page: ft.Page):
             """Display promoter stats from cache with improved layout"""
             stats_container.controls.clear()
 
+            # Load UPI ID asynchronously if not loaded yet
+            if not promoter_upi_state.get("loaded", False):
+                def load_upi_async():
+                    upi = fetch_promoter_upi_id()
+                    promoter_upi_state["upi_id"] = upi
+                    promoter_upi_state["loaded"] = True
+                    print(f"[UPI] Async load complete: {upi}")
+                    # Update the display control
+                    update_upi_display()
+                    try:
+                        page.update()
+                    except:
+                        pass
+                threading.Thread(target=load_upi_async, daemon=True).start()
+            else:
+                # UPI already loaded, just update display
+                update_upi_display()
+
             if combined_stats:
                 stats = combined_stats
                 downline_bonus = stats.get('downline_bonus', 0)
@@ -6526,10 +6751,26 @@ def main(page: ft.Page):
 
                 # Create stats cards
                 stats_container.controls.extend([
-                    # Earnings Section
+                    # Earnings Section with UPI on same header row
                     ft.Container(
                         content=ft.Column([
-                            ft.Text("💰 Earnings", size=16, weight="bold"),
+                            # Header row: "💰 Earnings" on left, UPI + edit on right
+                            ft.Row([
+                                ft.Text("💰 Earnings", size=16, weight="bold"),
+                                ft.Container(expand=True),  # Spacer
+                                ft.Icon(ft.Icons.MONETIZATION_ON, size=16, color="#FFD700"),
+                                upi_text_display,
+                                ft.IconButton(
+                                    icon=ft.Icons.EDIT,
+                                    icon_size=16,
+                                    icon_color="#2196F3",
+                                    tooltip="Edit UPI ID",
+                                    on_click=show_edit_upi_dialog,
+                                    padding=0,
+                                    style=ft.ButtonStyle(padding=0),
+                                ),
+                            ], alignment=ft.MainAxisAlignment.START, vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=4),
+                            ft.Container(height=8),
                             ft.Row([
                                 ft.Container(
                                     content=ft.Column([
@@ -6638,10 +6879,26 @@ def main(page: ft.Page):
                 # ✅ Show structure with zeros instead of "No stats yet"
                 # This motivates users and helps them understand the structure
                 stats_container.controls.extend([
-                    # Earnings Section
+                    # Earnings Section with UPI on same header row
                     ft.Container(
                         content=ft.Column([
-                            ft.Text("💰 Earnings", size=16, weight="bold"),
+                            # Header row: "💰 Earnings" on left, UPI + edit on right
+                            ft.Row([
+                                ft.Text("💰 Earnings", size=16, weight="bold"),
+                                ft.Container(expand=True),  # Spacer
+                                ft.Icon(ft.Icons.MONETIZATION_ON, size=16, color="#FFD700"),
+                                upi_text_display,
+                                ft.IconButton(
+                                    icon=ft.Icons.EDIT,
+                                    icon_size=16,
+                                    icon_color="#2196F3",
+                                    tooltip="Edit UPI ID",
+                                    on_click=show_edit_upi_dialog,
+                                    padding=0,
+                                    style=ft.ButtonStyle(padding=0),
+                                ),
+                            ], alignment=ft.MainAxisAlignment.START, vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=4),
+                            ft.Container(height=8),
                             ft.Row([
                                 ft.Container(
                                     content=ft.Column([
@@ -7724,316 +7981,563 @@ def main(page: ft.Page):
             expand=True
         )
 
-        # ==== HALL OF FAME / RANKINGS UI ====
+        # ==== HALL OF FAME / RANKINGS UI (IMPROVED WITH REAL DATA) ====
 
         # Hall of Fame data and state
         hof_state = {
-            "scope": "global",  # "global" or "local"
+            "scope": "global",
             "entries": [],
-            "initialized": False
+            "initialized": False,
+            "loading": False,
+            "last_refresh": None
         }
 
-        def get_mock_hof_data(scope="global"):
+        # Avatar colors for visual variety (used when no profile pic)
+        AVATAR_COLORS = [
+            "#8B5CF6",  # Purple
+            "#F97316",  # Orange  
+            "#06B6D4",  # Cyan
+            "#EC4899",  # Pink
+            "#10B981",  # Emerald
+            "#F59E0B",  # Amber
+            "#6366F1",  # Indigo
+            "#EF4444",  # Red
+        ]
+
+        def get_top_promoters_from_sheets():
             """
-            Return list of dicts sorted by subs descending.
-
-            Each item:
-            {
-                "rank": int,
-                "name": str,
-                "avatar_emoji": str,  # simple emoji or 1-letter initials
-                "subs": int,          # subscription count
-                "earnings": float,    # total earnings in INR
-                "highlight": str|None # "gold"|"silver"|"bronze"|None
-            }
+            Fetch top promoters from Google Sheets referral_program worksheet.
+            Returns list sorted by Total_Earnings (Column Q) descending.
             """
-            # Mock data for preview - replace with backend call later
-            mock_data = [
-                {"rank": 1, "name": "Rajesh Kumar", "avatar_emoji": "R", "subs": 5208, "earnings": 1250.0, "highlight": "gold"},
-                {"rank": 2, "name": "Priya Sharma", "avatar_emoji": "P", "subs": 5156, "earnings": 1180.0, "highlight": "silver"},
-                {"rank": 3, "name": "Amit Patel", "avatar_emoji": "A", "subs": 5124, "earnings": 1150.0, "highlight": "bronze"},
-                {"rank": 4, "name": "Sneha Reddy", "avatar_emoji": "S", "subs": 5114, "earnings": 980.0, "highlight": None},
-                {"rank": 5, "name": "Vikram Singh", "avatar_emoji": "V", "subs": 5089, "earnings": 920.0, "highlight": None},
-                {"rank": 6, "name": "Anjali Desai", "avatar_emoji": "A", "subs": 5067, "earnings": 890.0, "highlight": None},
-                {"rank": 7, "name": "Karthik Iyer", "avatar_emoji": "K", "subs": 5045, "earnings": 850.0, "highlight": None},
-                {"rank": 8, "name": "Neha Gupta", "avatar_emoji": "N", "subs": 5023, "earnings": 820.0, "highlight": None},
-                {"rank": 9, "name": "Rohan Mehta", "avatar_emoji": "R", "subs": 5001, "earnings": 780.0, "highlight": None},
-                {"rank": 10, "name": "Divya Nair", "avatar_emoji": "D", "subs": 4987, "earnings": 750.0, "highlight": None},
-            ]
+            try:
+                print("[HOF] Fetching top promoters from Google Sheets...")
+                gs_manager = get_gsheet_manager()
+                
+                if not gs_manager or not gs_manager.client or not gs_manager.sheet_id:
+                    print("[HOF] GSheet manager not available")
+                    return []
+                
+                # Open spreadsheet and referral_program worksheet
+                spreadsheet = gs_manager.client.open_by_key(gs_manager.sheet_id)
+                worksheet = spreadsheet.worksheet("referral_program")
+                
+                # Get all values
+                all_values = worksheet.get_all_values()
+                
+                if len(all_values) < 2:
+                    print("[HOF] No data in referral_program sheet")
+                    return []
+                
+                # Map headers to indexes
+                header = [h.strip().lower() for h in all_values[0]]
+                
+                def find_index(possible_names, fallback_index):
+                    for name in possible_names:
+                        if name in header:
+                            return header.index(name)
+                    return fallback_index
+                
+                referral_idx = find_index(["referral_id", "referral id"], 4)  # Column E
+                earnings_idx = find_index(["total_earnings", "total earnings", "earnings"], 16)  # Column Q
+                
+                print(f"[HOF] Column indexes - Referral: {referral_idx}, Earnings: {earnings_idx}")
+                
+                # Extract promoters with earnings
+                promoters_data = []
+                for row_idx, row in enumerate(all_values[1:], start=2):
+                    try:
+                        referral_id = row[referral_idx].strip() if len(row) > referral_idx else ""
+                        earnings_str = row[earnings_idx] if len(row) > earnings_idx else "0"
+                        
+                        # Parse earnings (handle empty or invalid values)
+                        try:
+                            earnings = float(earnings_str) if earnings_str else 0.0
+                        except:
+                            earnings = 0.0
+                        
+                        if referral_id and earnings > 0:
+                            promoters_data.append({
+                                "referral_id": referral_id,
+                                "earnings": earnings
+                            })
+                    except Exception as row_err:
+                        print(f"[HOF] Error parsing row {row_idx}: {row_err}")
+                        continue
+                
+                # Sort by earnings descending
+                promoters_data.sort(key=lambda x: x["earnings"], reverse=True)
+                
+                # Take top 10
+                top_promoters = promoters_data[:10]
+                print(f"[HOF] Found {len(top_promoters)} top promoters")
+                
+                return top_promoters
+                
+            except Exception as e:
+                print(f"[HOF] Error fetching from sheets: {e}")
+                import traceback
+                traceback.print_exc()
+                return []
 
-            # Later: add different data for local scope
-            if scope == "local":
-                # For now, return same data - replace with actual local rankings later
-                return mock_data
-
-            return mock_data
+        def match_promoters_with_firebase(promoters_data):
+            """
+            Match referral IDs with Firebase users to get names and profile pics.
+            """
+            try:
+                if not promoters_data:
+                    return []
+                
+                print(f"[HOF] Matching {len(promoters_data)} promoters with Firebase...")
+                
+                # Get all users from Firebase
+                all_users = db.get_all_users()
+                
+                if not all_users:
+                    print("[HOF] No users found in Firebase")
+                    return []
+                
+                # Create a map of referral_id -> user info
+                referral_to_user = {}
+                for user in all_users:
+                    user_id = user.get('id', '')
+                    promoter_status = user.get('promoter_status', {})
+                    if isinstance(promoter_status, dict):
+                        ref_id = promoter_status.get('referral_id', '')
+                        if ref_id:
+                            referral_to_user[ref_id] = {
+                                "user_id": user_id,
+                                "username": user.get('username', 'Unknown'),
+                                "profile_image_url": user.get('profile_image_url', '')
+                            }
+                
+                print(f"[HOF] Found {len(referral_to_user)} users with referral IDs")
+                
+                # Match promoters with user info
+                matched_entries = []
+                for rank, promoter in enumerate(promoters_data, start=1):
+                    ref_id = promoter.get("referral_id", "")
+                    earnings = promoter.get("earnings", 0)
+                    
+                    user_info = referral_to_user.get(ref_id, {})
+                    username = user_info.get("username", "Promoter")
+                    profile_pic = user_info.get("profile_image_url", "")
+                    
+                    # Determine highlight (medal) for top 3
+                    highlight = None
+                    if rank == 1:
+                        highlight = "gold"
+                    elif rank == 2:
+                        highlight = "silver"
+                    elif rank == 3:
+                        highlight = "bronze"
+                    
+                    matched_entries.append({
+                        "rank": rank,
+                        "name": username if username else "Promoter",
+                        "referral_id": ref_id,
+                        "earnings": earnings,
+                        "profile_image_url": profile_pic,
+                        "highlight": highlight
+                    })
+                
+                print(f"[HOF] Matched {len(matched_entries)} entries")
+                return matched_entries
+                
+            except Exception as e:
+                print(f"[HOF] Error matching with Firebase: {e}")
+                import traceback
+                traceback.print_exc()
+                return []
 
         def load_hof_data(scope="global"):
-            """Load Hall of Fame data for given scope"""
-            hof_state["scope"] = scope
-            hof_state["entries"] = get_mock_hof_data(scope)
-            hof_state["initialized"] = True
+            """Load Hall of Fame data from real sources"""
+            try:
+                hof_state["loading"] = True
+                hof_state["scope"] = scope
+                
+                print("[HOF] Loading real data...")
+                
+                # Get top promoters from sheets
+                promoters_data = get_top_promoters_from_sheets()
+                
+                # Match with Firebase for names and profile pics
+                entries = match_promoters_with_firebase(promoters_data)
+                
+                if entries:
+                    hof_state["entries"] = entries
+                    hof_state["initialized"] = True
+                    hof_state["last_refresh"] = datetime.now()
+                    print(f"[HOF] Loaded {len(entries)} entries successfully")
+                else:
+                    print("[HOF] No entries found, keeping previous data")
+                
+                hof_state["loading"] = False
+                
+            except Exception as e:
+                print(f"[HOF] Error loading data: {e}")
+                hof_state["loading"] = False
 
-        # Hall of Fame UI components
-        hof_podium_row = ft.Row(spacing=8, alignment=ft.MainAxisAlignment.CENTER)
-        hof_list_view = ft.ListView(spacing=8, expand=True, padding=10)
-        hof_scope_toggle_global = None
-        hof_scope_toggle_local = None
+        def create_hof_rank_badge(rank):
+            """Create rank badge (1st, 2nd, 3rd with medal colors)"""
+            if rank == 1:
+                return ft.Container(
+                    content=ft.Text("1", size=16, weight="bold", color="white"),
+                    width=36,
+                    height=36,
+                    bgcolor="#FFD700",  # Gold
+                    border_radius=18,
+                    alignment=ft.alignment.center,
+                )
+            elif rank == 2:
+                return ft.Container(
+                    content=ft.Text("2", size=14, weight="bold", color="white"),
+                    width=32,
+                    height=32,
+                    bgcolor="#94A3B8",  # Silver
+                    border_radius=16,
+                    alignment=ft.alignment.center
+                )
+            elif rank == 3:
+                return ft.Container(
+                    content=ft.Text("3", size=14, weight="bold", color="white"),
+                    width=32,
+                    height=32,
+                    bgcolor="#CD7F32",  # Bronze
+                    border_radius=16,
+                    alignment=ft.alignment.center
+                )
+            return None
 
-        def create_podium_card(entry, is_center=False):
-            """Create a podium card for top 3"""
+        def create_hof_avatar(entry, size=60, is_top3=False):
+            """Create avatar container with profile pic or fallback initial"""
+            rank = entry.get("rank", 0)
+            avatar_color = AVATAR_COLORS[(rank - 1) % len(AVATAR_COLORS)]
+            profile_pic_url = entry.get("profile_image_url", "")
+            name = entry.get("name", "?")
+            
+            # Get first letter for fallback
+            initial = name[0].upper() if name else "?"
+            
+            if profile_pic_url:
+                # Use profile picture
+                return ft.Container(
+                    content=ft.Image(
+                        src=profile_pic_url,
+                        width=size,
+                        height=size,
+                        fit=ft.ImageFit.COVER,
+                        border_radius=12,
+                    ),
+                    width=size,
+                    height=size,
+                    border_radius=12,
+                    border=ft.border.all(3, "white") if is_top3 else ft.border.all(2, "white"),
+                    clip_behavior=ft.ClipBehavior.HARD_EDGE,
+                )
+            else:
+                # Fallback to initial letter
+                return ft.Container(
+                    content=ft.Text(initial, size=size//2, weight="bold", color="white"),
+                    width=size,
+                    height=size,
+                    bgcolor=avatar_color,
+                    border_radius=12,
+                    alignment=ft.alignment.center,
+                    border=ft.border.all(3, "white") if is_top3 else ft.border.all(2, "white")
+                )
+
+        def create_hof_podium_card(entry, position="center"):
+            """Create a podium card for top 3 with gaming style"""
             if not entry:
-                return ft.Container()
-
-            # Colors for medals
-            medal_colors = {
-                "gold": "#FFD700",
-                "silver": "#C0C0C0",
-                "bronze": "#CD7F32"
-            }
-
-            highlight = entry.get("highlight")
-            medal_color = medal_colors.get(highlight, "#2196F3")
-            card_height = 200 if is_center else 180
-
+                return ft.Container(width=100)
+            
+            rank = entry.get("rank", 0)
+            
+            if position == "center":
+                avatar_size = 80
+                card_width = 120
+                top_padding = 0
+                name_size = 14
+                score_size = 16
+            else:
+                avatar_size = 65
+                card_width = 100
+                top_padding = 25
+                name_size = 12
+                score_size = 14
+            
+            # Medal colors for badge
+            medal_colors = {1: "#FFD700", 2: "#94A3B8", 3: "#CD7F32"}
+            medal_color = medal_colors.get(rank, "#FFD700")
+            
+            # Format earnings
+            earnings = entry.get("earnings", 0)
+            if earnings >= 1000:
+                earnings_text = f"₹{earnings/1000:.1f}K"
+            else:
+                earnings_text = f"₹{earnings:.0f}"
+            
             return ft.Container(
                 content=ft.Column([
-                    ft.Container(height=10 if is_center else 20),
-                    # Avatar
-                    ft.Container(
-                        content=ft.Text(
-                            entry.get("avatar_emoji", "?"),
-                            size=24 if is_center else 20,
-                            weight="bold",
-                            color="white"
-                        ),
-                        width=60 if is_center else 50,
-                        height=60 if is_center else 50,
-                        bgcolor="#2196F3",
-                        border_radius=30 if is_center else 25,
-                        alignment=ft.alignment.center
-                    ),
+                    ft.Container(height=top_padding),
+                    ft.Stack([
+                        create_hof_avatar(entry, size=avatar_size, is_top3=True),
+                        ft.Container(
+                            content=create_hof_rank_badge(rank),
+                            right=-5,
+                            bottom=-5,
+                        )
+                    ], width=avatar_size + 10, height=avatar_size + 10),
                     ft.Container(height=8),
-                    # Name
                     ft.Text(
                         entry.get("name", "Unknown"),
-                        size=13 if is_center else 12,
+                        size=name_size,
                         weight="bold",
+                        color="white",
                         text_align=ft.TextAlign.CENTER,
-                        max_lines=2,
-                        overflow=ft.TextOverflow.ELLIPSIS
+                        max_lines=1,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                        width=card_width - 10
                     ),
                     ft.Container(height=4),
-                    # Rank medal
-                    ft.Row([
-                        ft.Icon(ft.icons.EMOJI_EVENTS, size=16, color=medal_color),
-                        ft.Text(f"#{entry.get('rank', 0)}", size=12, weight="bold", color=medal_color)
-                    ], alignment=ft.MainAxisAlignment.CENTER, spacing=4),
-                    ft.Container(height=8),
-                    # Stats
-                    ft.Column([
-                        ft.Row([
-                            ft.Icon(ft.icons.EMOJI_EVENTS_OUTLINED, size=14),
-                            ft.Text(str(entry.get("subs", 0)), size=11)
+                    ft.Container(
+                        content=ft.Row([
+                            ft.Icon(ft.Icons.MONETIZATION_ON, size=score_size, color="#FFD700"),
+                            ft.Text(
+                                earnings_text,
+                                size=score_size,
+                                weight="bold",
+                                color="white"
+                            ),
+                            ft.Container(
+                                content=ft.Icon(ft.Icons.WORKSPACE_PREMIUM, size=14, color="white"),
+                                bgcolor=medal_color,
+                                border_radius=4,
+                                padding=2,
+                                margin=ft.margin.only(left=4)
+                            )
                         ], alignment=ft.MainAxisAlignment.CENTER, spacing=4),
-                        ft.Row([
-                            ft.Icon(ft.icons.CURRENCY_RUPEE, size=14),
-                            ft.Text(f"{entry.get('earnings', 0):.0f}", size=11)
-                        ], alignment=ft.MainAxisAlignment.CENTER, spacing=4)
-                    ], spacing=4)
+                    ),
                 ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=0),
-                width=110 if is_center else 100,
-                height=card_height,
-                bgcolor=ft.colors.with_opacity(0.15, ft.colors.BLUE),
-                border_radius=15,
-                padding=10,
-                border=ft.border.all(2, medal_color) if highlight else None
+                width=card_width,
             )
 
-        def create_list_row(entry):
-            """Create a row for ranks 4+"""
+        def create_hof_list_row(entry):
+            """Create a row for ranks 4+ with gaming style"""
             if not entry:
                 return ft.Container()
-
+            
+            rank = entry.get("rank", 0)
+            badge_colors = ["#F59E0B", "#10B981", "#6366F1", "#EC4899", "#06B6D4"]
+            badge_color = badge_colors[(rank - 4) % len(badge_colors)]
+            
+            # Format earnings
+            earnings = entry.get("earnings", 0)
+            if earnings >= 1000:
+                earnings_text = f"₹{earnings/1000:.1f}K"
+            else:
+                earnings_text = f"₹{earnings:.0f}"
+            
             return ft.Container(
-                padding=10,
-                border_radius=15,
-                bgcolor=ft.colors.with_opacity(0.1, ft.colors.BLUE),
-                content=ft.Row(
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    controls=[
-                        ft.Row(
-                            spacing=10,
-                            controls=[
-                                ft.Text(str(entry.get("rank", 0)), weight="bold", size=14, width=25),
-                                ft.Container(
-                                    content=ft.Text(
-                                        entry.get("avatar_emoji", "?"),
-                                        size=12,
-                                        weight="bold",
-                                        color="white"
-                                    ),
-                                    width=30,
-                                    height=30,
-                                    bgcolor="#2196F3",
-                                    border_radius=15,
-                                    alignment=ft.alignment.center
-                                ),
-                                ft.Text(
-                                    entry.get("name", "Unknown"),
-                                    size=13,
-                                    overflow=ft.TextOverflow.ELLIPSIS,
-                                    max_lines=1
-                                )
-                            ]
+                content=ft.Row([
+                    ft.Container(
+                        content=ft.Text(str(rank), size=16, weight="bold", color="#1E3A5F"),
+                        width=30,
+                    ),
+                    create_hof_avatar(entry, size=50, is_top3=False),
+                    ft.Container(width=10),
+                    ft.Container(
+                        content=ft.Text(
+                            entry.get("name", "Unknown"),
+                            size=14,
+                            weight="w500",
+                            color="#1E3A5F",
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                            max_lines=1,
                         ),
-                        ft.Row(
-                            spacing=12,
-                            controls=[
-                                ft.Row(
-                                    spacing=4,
-                                    controls=[
-                                        ft.Icon(ft.icons.EMOJI_EVENTS_OUTLINED, size=16),
-                                        ft.Text(str(entry.get("subs", 0)), size=12)
-                                    ]
-                                ),
-                                ft.Row(
-                                    spacing=4,
-                                    controls=[
-                                        ft.Icon(ft.icons.CURRENCY_RUPEE, size=16),
-                                        ft.Text(f"{entry.get('earnings', 0):.0f}", size=12)
-                                    ]
-                                )
-                            ]
-                        )
-                    ]
-                )
+                        expand=True,
+                    ),
+                    ft.Row([
+                        ft.Icon(ft.Icons.MONETIZATION_ON, size=18, color="#FFD700"),
+                        ft.Text(
+                            earnings_text,
+                            size=14,
+                            weight="bold",
+                            color="#1E3A5F"
+                        ),
+                    ], spacing=4),
+                    ft.Container(width=8),
+                    ft.Container(
+                        content=ft.Icon(ft.Icons.WORKSPACE_PREMIUM, size=16, color="white"),
+                        bgcolor=badge_color,
+                        border_radius=6,
+                        padding=6,
+                    ),
+                ], alignment=ft.MainAxisAlignment.START, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                padding=ft.padding.symmetric(horizontal=15, vertical=12),
+                margin=ft.margin.symmetric(horizontal=10, vertical=4),
+                bgcolor="white",
+                border_radius=15,
             )
+
+        # UI Components for Hall of Fame
+        hof_podium_row = ft.Row(spacing=5, alignment=ft.MainAxisAlignment.CENTER)
+        hof_list_view = ft.ListView(spacing=0, expand=True, padding=ft.padding.only(bottom=20))
+        hof_loading_indicator = ft.ProgressRing(width=40, height=40, stroke_width=3, visible=False)
+        hof_empty_message = ft.Text("No promoters found", size=14, color="#64748B", visible=False)
 
         def refresh_hof_view():
             """Rebuild Hall of Fame UI from current data"""
             try:
                 entries = hof_state.get("entries", [])
-
-                # Update podium (top 3)
+                is_loading = hof_state.get("loading", False)
+                
+                print(f"[HOF] Refreshing view with {len(entries)} entries, loading={is_loading}")
+                
+                # Show/hide loading indicator
+                hof_loading_indicator.visible = is_loading
+                hof_empty_message.visible = not is_loading and len(entries) == 0
+                
                 hof_podium_row.controls.clear()
-
+                
                 if len(entries) >= 3:
-                    # Podium order: 2nd, 1st (center), 3rd
-                    hof_podium_row.controls.append(create_podium_card(entries[1], is_center=False))  # 2nd
-                    hof_podium_row.controls.append(create_podium_card(entries[0], is_center=True))   # 1st
-                    hof_podium_row.controls.append(create_podium_card(entries[2], is_center=False))  # 3rd
+                    hof_podium_row.controls = [
+                        create_hof_podium_card(entries[1], position="left"),
+                        create_hof_podium_card(entries[0], position="center"),
+                        create_hof_podium_card(entries[2], position="right"),
+                    ]
                 elif len(entries) == 2:
-                    hof_podium_row.controls.append(create_podium_card(entries[1], is_center=False))
-                    hof_podium_row.controls.append(create_podium_card(entries[0], is_center=True))
+                    hof_podium_row.controls = [
+                        create_hof_podium_card(entries[1], position="left"),
+                        create_hof_podium_card(entries[0], position="center"),
+                    ]
                 elif len(entries) == 1:
-                    hof_podium_row.controls.append(create_podium_card(entries[0], is_center=True))
-
-                # Update list (rank 4+)
+                    hof_podium_row.controls = [
+                        create_hof_podium_card(entries[0], position="center"),
+                    ]
+                
                 hof_list_view.controls.clear()
-
+                
                 if len(entries) > 3:
                     for entry in entries[3:]:
-                        hof_list_view.controls.append(create_list_row(entry))
-
-                # Update scope toggle buttons
-                current_scope = hof_state.get("scope", "global")
-                if hof_scope_toggle_global and hof_scope_toggle_local:
-                    if current_scope == "global":
-                        hof_scope_toggle_global.bgcolor = "#2196F3"
-                        hof_scope_toggle_global.color = "white"
-                        hof_scope_toggle_local.bgcolor = ft.colors.with_opacity(0.1, ft.colors.BLUE)
-                        hof_scope_toggle_local.color = "#2196F3"
-                    else:
-                        hof_scope_toggle_global.bgcolor = ft.colors.with_opacity(0.1, ft.colors.BLUE)
-                        hof_scope_toggle_global.color = "#2196F3"
-                        hof_scope_toggle_local.bgcolor = "#2196F3"
-                        hof_scope_toggle_local.color = "white"
-
+                        hof_list_view.controls.append(create_hof_list_row(entry))
+                
+                print(f"[HOF] Podium: {len(hof_podium_row.controls)}, List: {len(hof_list_view.controls)}")
+                
                 # Update UI
-                if page:
-                    try:
-                        hof_podium_row.update()
-                        hof_list_view.update()
-                        if hof_scope_toggle_global:
-                            hof_scope_toggle_global.update()
-                        if hof_scope_toggle_local:
-                            hof_scope_toggle_local.update()
-                    except:
-                        pass
+                try:
+                    page.update()
+                except:
+                    pass
+                
             except Exception as e:
                 print(f"[HOF] Error refreshing view: {e}")
+                import traceback
+                traceback.print_exc()
 
-        def on_scope_toggle(scope):
-            """Handle scope toggle button click"""
-            def handler(e):
-                load_hof_data(scope)
-                refresh_hof_view()
-            return handler
+        def load_hof_data_async():
+            """Load Hall of Fame data in background thread"""
+            def background_load():
+                try:
+                    load_hof_data("global")
+                    refresh_hof_view()
+                except Exception as e:
+                    print(f"[HOF] Background load error: {e}")
+            
+            threading.Thread(target=background_load, daemon=True).start()
 
-        # Build Hall of Fame tab UI
-        hof_scope_toggle_global = ft.Container(
-            content=ft.Text("Global Rankings", size=13, weight="bold", color="white"),
-            padding=ft.padding.symmetric(horizontal=20, vertical=10),
-            bgcolor="#2196F3",
+        def on_refresh_hof(e):
+            """Handle refresh button click"""
+            print("[HOF] Manual refresh triggered")
+            hof_state["loading"] = True
+            refresh_hof_view()  # Show loading state
+            load_hof_data_async()
+
+        # Initialize data asynchronously (don't block UI)
+        # Data will be loaded when tab is first viewed
+        hof_state["initialized"] = False
+
+        # Top Promoters button with refresh
+        hof_top_btn = ft.Container(
+            content=ft.Text("Top Promoters", size=14, weight="bold", color="white"),
+            padding=ft.padding.symmetric(horizontal=24, vertical=10),
+            bgcolor="#1E88E5",
             border_radius=20,
-            on_click=on_scope_toggle("global")
+        )
+        
+        hof_refresh_btn = ft.IconButton(
+            icon=ft.Icons.REFRESH,
+            icon_color="white",
+            icon_size=24,
+            on_click=on_refresh_hof,
+            tooltip="Refresh rankings"
         )
 
-        hof_scope_toggle_local = ft.Container(
-            content=ft.Text("Local Rankings", size=13, weight="bold", color="#2196F3"),
-            padding=ft.padding.symmetric(horizontal=20, vertical=10),
-            bgcolor=ft.colors.with_opacity(0.1, ft.colors.BLUE),
-            border_radius=20,
-            on_click=on_scope_toggle("local")
-        )
-
-        hof_content = ft.Column([
-            # Scope toggle
-            ft.Container(
-                content=ft.Row([
-                    hof_scope_toggle_global,
-                    hof_scope_toggle_local
-                ], alignment=ft.MainAxisAlignment.CENTER, spacing=10),
-                padding=ft.padding.only(top=20, bottom=15)
-            ),
-            # Podium
-            ft.Container(
-                content=hof_podium_row,
-                padding=ft.padding.symmetric(vertical=10)
-            ),
-            # List title
-            ft.Container(
-                content=ft.Text("Rankings", size=16, weight="bold"),
-                padding=ft.padding.only(left=20, top=10, bottom=5)
-            ),
-            # Scrollable list
-            ft.Container(
-                content=hof_list_view,
-                expand=True
-            ),
-            # Footer
-            ft.Container(
-                content=ft.Text(
-                    "Rankings refresh every 5 minutes • Amounts shown in INR",
-                    size=11,
-                    color=ft.colors.with_opacity(0.7, ft.colors.BLACK),
-                    text_align=ft.TextAlign.CENTER
+        # Podium section with gradient background
+        hof_podium_section = ft.Container(
+            content=ft.Column([
+                ft.Container(
+                    content=ft.Row([
+                        hof_top_btn,
+                        hof_refresh_btn
+                    ], alignment=ft.MainAxisAlignment.CENTER, spacing=10),
+                    padding=ft.padding.only(top=15, bottom=10),
                 ),
-                padding=ft.padding.symmetric(vertical=10)
-            )
-        ], spacing=0, expand=True)
-
-        # TAB 4 → HALL OF FAME
-        screen_hall_of_fame = ft.Container(
-            content=hof_content,
-            expand=True,
-            bgcolor="#F5F8FF"
+                # Loading indicator (centered)
+                ft.Container(
+                    content=hof_loading_indicator,
+                    alignment=ft.alignment.center,
+                    padding=ft.padding.only(bottom=10),
+                ),
+                ft.Container(
+                    content=hof_podium_row,
+                    padding=ft.padding.only(bottom=20),
+                ),
+            ], spacing=0),
+            gradient=ft.LinearGradient(
+                begin=ft.alignment.top_center,
+                end=ft.alignment.bottom_center,
+                colors=["#1565C0", "#1976D2", "#2196F3", "#42A5F5"]
+            ),
+            border_radius=ft.border_radius.only(bottom_left=30, bottom_right=30),
+            padding=ft.padding.only(bottom=10),
         )
 
-        # Initialize Hall of Fame data
-        load_hof_data("global")
-        refresh_hof_view()
+        # Rankings list section
+        hof_rankings_section = ft.Container(
+            content=ft.Column([
+                ft.Container(height=15),
+                # Empty message (shown when no data)
+                ft.Container(
+                    content=hof_empty_message,
+                    alignment=ft.alignment.center,
+                    padding=10,
+                ),
+                hof_list_view,
+                ft.Container(
+                    content=ft.Text(
+                        "Rankings based on Total Earnings • Refreshes on tab switch",
+                        size=11,
+                        color="#64748B",
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                    padding=ft.padding.symmetric(vertical=10),
+                    alignment=ft.alignment.center,
+                ),
+            ], spacing=0),
+            expand=True,
+            bgcolor="#EEF2FF",
+        )
+
+        # TAB 1 → HALL OF FAME (Complete Screen)
+        screen_hall_of_fame = ft.Container(
+            content=ft.Column([
+                hof_podium_section,
+                hof_rankings_section,
+            ], spacing=0, expand=True),
+            expand=True,
+            bgcolor="#EEF2FF",
+        )
 
         # TAB 5 → SETTINGS (with Create Group button for admin)
         # ✅ FIX 5: Only create settings content for admin
@@ -8079,8 +8583,8 @@ def main(page: ft.Page):
         page_controller = page_controller_cls(initial_page=selected_index) if page_controller_cls else None
 
         # ✅ FIX 5: Determine number of tabs based on admin status
-        # Admin: 6 tabs (Promoter, Groups, Members, Private, Hall of Fame, Settings)
-        # Non-admin: 5 tabs (Promoter, Groups, Members, Private, Hall of Fame) - no Settings
+        # Admin: 6 tabs (Promoter, Hall of Fame, Groups, Members, Private, Settings)
+        # Non-admin: 5 tabs (Promoter, Hall of Fame, Groups, Members, Private) - no Settings
         num_tabs = 6 if is_admin else 5
 
         # SELECT WHICH SCREEN TO SHOW (with optimized lazy loading)
@@ -8106,12 +8610,19 @@ def main(page: ft.Page):
             if selected_index == 0:
                 refresh_promoter_screen(use_cached=True)
             elif selected_index == 1:
+                # Hall of Fame tab - reload data if not initialized
+                if not hof_state.get("initialized", False):
+                    print("[HOF] Tab selected - loading data async...")
+                    hof_state["loading"] = True
+                    refresh_hof_view()  # Show loading state
+                    load_hof_data_async()
+            elif selected_index == 2:
                 # Groups already loaded
                 pass
-            elif selected_index == 2:
+            elif selected_index == 3:
                 if not members_cache["loaded"]:
                     load_all_members()
-            elif selected_index == 3:
+            elif selected_index == 4:
                 # ✅ FIX: Use private_chats view with proper unread badges
                 active_screen["current"] = "private_chats"
                 # Always refresh when opening Private tab so badges/list stay in sync
@@ -8121,11 +8632,6 @@ def main(page: ft.Page):
                     update_notification_badge()
                 except Exception as ex:
                     print(f"[PRIVATE TAB AUTO-LOAD ERROR] {ex}")
-            elif selected_index == 4:
-                # Hall of Fame tab - reload data if not initialized
-                if not hof_state.get("initialized", False):
-                    load_hof_data("global")
-                    refresh_hof_view()
             # ✅ FIX 5: Tab 5 (Settings) only exists for admin
             page.update()
 
@@ -8157,6 +8663,11 @@ def main(page: ft.Page):
                     label="Promoter"
                 ),
                 ft.NavigationBarDestination(
+                    icon=ft.Icons.EMOJI_EVENTS_OUTLINED,
+                    selected_icon=ft.Icons.EMOJI_EVENTS,
+                    label="Hall of Fame"
+                ),
+                ft.NavigationBarDestination(
                     icon=ft.Icons.CHAT_OUTLINED,
                     selected_icon=ft.Icons.CHAT,
                     label="Groups"
@@ -8170,11 +8681,6 @@ def main(page: ft.Page):
                     icon=ft.Icons.PERSON_OUTLINED,
                     selected_icon=ft.Icons.PERSON,
                     label="Private"
-                ),
-                ft.NavigationBarDestination(
-                    icon=ft.Icons.EMOJI_EVENTS_OUTLINED,
-                    selected_icon=ft.Icons.EMOJI_EVENTS,
-                    label="Hall of Fame"
                 ),
             ]
 
@@ -8207,12 +8713,18 @@ def main(page: ft.Page):
                     # Promoter tab
                     refresh_promoter_screen()
                 elif selected_index == 1:
+                    # Hall of Fame tab - reload data
+                    print("[HOF] Pull refresh - reloading data async...")
+                    hof_state["loading"] = True
+                    refresh_hof_view()  # Show loading state
+                    load_hof_data_async()
+                elif selected_index == 2:
                     # Groups tab
                     load_groups_list(force_refresh=True)
-                elif selected_index == 2:
+                elif selected_index == 3:
                     # Members tab
                     load_all_members(force_refresh=True)
-                elif selected_index == 3:
+                elif selected_index == 4:
                     # Private tab: chat list or private chats
                     try:
                         current_screen = active_screen.get("current")
@@ -8222,10 +8734,6 @@ def main(page: ft.Page):
                             load_private_chats(force_refresh=True)
                     except Exception as ex:
                         print(f"[PULL REFRESH PRIVATE] {ex}")
-                elif selected_index == 4:
-                    # Hall of Fame tab - reload data
-                    load_hof_data(hof_state.get("scope", "global"))
-                    refresh_hof_view()
                 # ✅ FIX 5: Only handle Settings tab refresh if admin
                 elif selected_index == 5 and is_admin:
                     # Settings tab - nothing to refresh yet
@@ -8309,10 +8817,10 @@ def main(page: ft.Page):
         # ✅ FIX: Use screen_private_chat (has unread badges) instead of chat_list_view (no badges)
         tab_pages = [
             ft.Container(content=screen_promoter, expand=True),
+            ft.Container(content=screen_hall_of_fame, expand=True),
             ft.Container(content=screen_groups, expand=True),
             ft.Container(content=screen_members, expand=True),
             ft.Container(content=screen_private_chat, expand=True),  # ✅ Changed from chat_list_view
-            ft.Container(content=screen_hall_of_fame, expand=True),
         ]
 
         # ✅ FIX 5: Only add Settings tab for admin
