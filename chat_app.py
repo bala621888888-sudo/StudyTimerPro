@@ -4024,6 +4024,10 @@ def main(page: ft.Page):
     ])
         
     # OTP Views for Sign In and Sign Up
+    def normalize_email(email: str) -> str:
+        """Normalize user-provided email for consistent auth lookups."""
+        return (email or "").strip().lower()
+
     signin_email_field = ft.TextField(
         label="Email",
         autofocus=False,
@@ -4073,7 +4077,12 @@ def main(page: ft.Page):
         threading.Thread(target=resend_otp_thread, daemon=True).start()
         
     def send_otp_for_signin(e):
-        if not signin_email_field.value:
+        email = normalize_email(signin_email_field.value)
+
+        # Keep field value normalized for subsequent operations
+        signin_email_field.value = email
+
+        if not email:
             show_snackbar("Please enter email")
             return
 
@@ -4081,7 +4090,7 @@ def main(page: ft.Page):
         page.update()
 
         # Verify the account exists before sending OTP
-        exists, error = auth.email_exists(signin_email_field.value)
+        exists, error = auth.email_exists(email)
         if error:
             show_snackbar(f"Unable to verify account: {error}")
             return
@@ -4093,6 +4102,7 @@ def main(page: ft.Page):
         # Explicitly reset OTP flow to sign-in to avoid accidental sign-ups
         pending_otp_data["is_signup"] = False
         pending_otp_data["username"] = None
+        pending_otp_data["email"] = email
 
         show_snackbar("Sending OTP...")
         page.update()
@@ -4101,10 +4111,10 @@ def main(page: ft.Page):
         
         # Run OTP sending in background thread to avoid blocking UI
         def send_otp_thread():
-            success = otp_manager.send_otp(signin_email_field.value, otp)
-            
+            success = otp_manager.send_otp(email, otp)
+
             if success:
-                pending_otp_data["email"] = signin_email_field.value
+                pending_otp_data["email"] = email
                 pending_otp_data["username"] = None  # Will be fetched during verification
                 pending_otp_data["is_signup"] = False
                 show_snackbar("OTP sent to your email!")
@@ -4115,7 +4125,12 @@ def main(page: ft.Page):
         threading.Thread(target=send_otp_thread, daemon=True).start()
     
     def send_otp_for_signup(e):
-        if not signup_email_field.value or not signup_username_field.value:
+        email = normalize_email(signup_email_field.value)
+
+        # Keep field value normalized so password derivation stays stable
+        signup_email_field.value = email
+
+        if not email or not signup_username_field.value:
             show_snackbar("Please fill all fields")
             return
         
@@ -4126,10 +4141,10 @@ def main(page: ft.Page):
         
         # Run OTP sending in background thread to avoid blocking UI
         def send_otp_thread():
-            success = otp_manager.send_otp(signup_email_field.value, otp)
-            
+            success = otp_manager.send_otp(email, otp)
+
             if success:
-                pending_otp_data["email"] = signup_email_field.value
+                pending_otp_data["email"] = email
                 pending_otp_data["username"] = signup_username_field.value
                 pending_otp_data["is_signup"] = True
                 show_snackbar("OTP sent to your email!")
@@ -4146,9 +4161,12 @@ def main(page: ft.Page):
             show_snackbar("Please enter OTP")
             return
         
-        email = pending_otp_data["email"]
+        email = normalize_email(pending_otp_data["email"])
         username = pending_otp_data["username"]
         is_signup = pending_otp_data["is_signup"]
+
+        # Persist normalized email for any future attempts in the same flow
+        pending_otp_data["email"] = email
 
         # Only allow sign-up when username is present to prevent unintended account creation
         if is_signup and not username:
