@@ -744,9 +744,13 @@ class FirebaseAuth:
 
             if response.status_code == 200:
                 methods = data.get('signInMethods', []) or []
-                return len(methods) > 0, None
+                registered = data.get('registered', False)
+                return (len(methods) > 0) or bool(registered), None
 
             error_msg = data.get('error', {}).get('message', 'Unknown error')
+            # Treat EMAIL_NOT_FOUND as a non-error "not found" to keep UX clean
+            if error_msg == "EMAIL_NOT_FOUND":
+                return False, None
             return False, error_msg
         except Exception as e:
             return False, str(e)
@@ -1333,9 +1337,13 @@ class FirebaseAuth:
 
             if response.status_code == 200:
                 methods = data.get('signInMethods', []) or []
-                return len(methods) > 0, None
+                registered = data.get('registered', False)
+                return (len(methods) > 0) or bool(registered), None
 
             error_msg = data.get('error', {}).get('message', 'Unknown error')
+            # Treat EMAIL_NOT_FOUND as a non-error "not found" to keep UX clean
+            if error_msg == "EMAIL_NOT_FOUND":
+                return False, None
             return False, error_msg
         except Exception as e:
             return False, str(e)
