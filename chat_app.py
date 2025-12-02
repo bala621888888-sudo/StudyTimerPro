@@ -3268,7 +3268,7 @@ def main(page: ft.Page):
     # ============================================
     loading_container = ft.Container(
         content=ft.Column(
-            [ft.Text("Connecting to Firebase...", size=16)],
+            [ft.Text("", size=16)],
             horizontal_alignment="center",
             spacing=12,
         ),
@@ -4279,7 +4279,7 @@ def main(page: ft.Page):
             content=ft.Column([
                 ft.Container(height=30),
                 ft.Text("💬", size=60),
-                ft.Text("Chat App", size=28, weight="bold"),
+                ft.Text("Promoter Hub", size=28, weight="bold"),
                 ft.Container(height=20),
                 # 🔥 FIX: Use proper tab structure without scroll conflicts
                 ft.Tabs(
@@ -4368,12 +4368,6 @@ def main(page: ft.Page):
             if clipboard_status["active"]:
                 methods.append("📋 Clipboard Monitor")
             
-            if methods:
-                status_text.value = f"Auto-fill enabled: {' + '.join(methods)}"
-                status_text.color = "green"
-            else:
-                status_text.value = "Manual entry mode"
-                status_text.color = "orange"
             page.update()
         
         def on_otp_detected(otp_code, source=""):
@@ -4413,8 +4407,6 @@ def main(page: ft.Page):
                 ft.Text(f"OTP sent to {pending_otp_data['email']}", size=14, color="grey"),
                 ft.Container(height=15),
                 status_text,
-                ft.Container(height=5),
-                ft.Text("💡 OTP will auto-fill from SMS or copied text", size=10, color="grey", italic=True),
                 ft.Container(height=30),
                 otp_code_field,
                 ft.Container(height=20),
@@ -6807,7 +6799,7 @@ def main(page: ft.Page):
                             ft.Row([
                                 ft.Text("💰 Earnings", size=16, weight="bold"),
                                 ft.Container(expand=True),  # Spacer
-                                ft.Icon(ft.Icons.MONETIZATION_ON, size=16, color="#FFD700"),
+                                ft.Text("UPI", size=16, weight="bold"),                               
                                 upi_text_display,
                                 ft.IconButton(
                                     icon=ft.Icons.EDIT,
@@ -7311,7 +7303,7 @@ def main(page: ft.Page):
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                     ft.Row(
-                        [ft.Text("Track your promoter performance", size=12, color="grey")],
+                        [ft.Text("Track your performance", size=12, color="grey")],
                         alignment=ft.MainAxisAlignment.CENTER,
                     ),
                 ], spacing=6)
