@@ -3812,18 +3812,55 @@ def main(page: ft.Page):
             auto_refresh_timer["thread"].join(timeout=1)
         print("[AUTO-REFRESH] Stopped")        
     
+    # Track last back press time for double-tap to exit
+    last_back_press = {"time": 0}
+    # Reference to activate_tab function (will be set later)
+    activate_tab_ref = {"fn": None, "current_tab": 0, "bottom_nav": None}
+    
     def handle_back_navigation(e=None):
         """Handle Android back button and swipe back - OPTIMIZED"""
+        print(f"[BACK] handle_back_navigation called, stack size: {len(navigation_stack)}")
+        
+        # First check if navigation stack has items (e.g., inside a chat)
         if len(navigation_stack) > 0:
             stop_auto_refresh()
             previous_view = navigation_stack.pop()
             previous_view()
             return True  # Indicate we handled the back action
-        else:
-            # Stack is empty - allow app to close
-            return False
         
-    # Set up back button handler
+        # If on main menu, check if we can go to tab 0 first
+        try:
+            current_tab = activate_tab_ref.get("current_tab", 0)
+            if current_tab > 0 and activate_tab_ref.get("fn"):
+                # Go back to first tab (Promoter)
+                print(f"[BACK] On tab {current_tab}, going to tab 0")
+                activate_tab_ref["fn"](0)
+                return True
+        except Exception as tab_ex:
+            print(f"[BACK] Tab check error: {tab_ex}")
+        
+        # Double-tap to exit logic
+        current_time = time.time()
+        if current_time - last_back_press["time"] < 2:  # 2 seconds window
+            # Second press within 2 seconds - allow exit
+            print("[BACK] Double back press - allowing exit")
+            return False
+        else:
+            # First press - show toast and wait for second
+            last_back_press["time"] = current_time
+            try:
+                page.snack_bar = ft.SnackBar(
+                    content=ft.Text("Press back again to exit"),
+                    duration=2000
+                )
+                page.snack_bar.open = True
+                page.update()
+            except:
+                pass
+            print("[BACK] First back press - waiting for second")
+            return True  # Don't exit yet
+        
+    # Set up back button handler for keyboard (desktop/escape key)
     page.on_keyboard_event = (
         lambda e: handle_back_navigation(e) if e.key == "Escape" else None
     )
@@ -3833,6 +3870,7 @@ def main(page: ft.Page):
         page.window_prevent_close = True
         
         def on_window_event(e):
+            print(f"[BACK] Window event: {e.data}")
             if e.data == "close":
                 # Try to navigate back first
                 handled = handle_back_navigation(None)
@@ -3841,6 +3879,19 @@ def main(page: ft.Page):
                     page.window_destroy()
         
         page.on_window_event = on_window_event
+        
+        # ✅ NEW: Handle Android back button specifically
+        if hasattr(page, 'on_back_button'):
+            def on_android_back(e):
+                print("[BACK] Android back button pressed")
+                handled = handle_back_navigation(None)
+                if handled:
+                    e.prevent_default = True  # Prevent app from closing
+                # If not handled, let app close naturally
+            
+            page.on_back_button = on_android_back
+            print("[BACK] Android back button handler registered")
+            
     except Exception as ex:
         print(f"Back button setup: {ex}")
     
@@ -4631,8 +4682,6 @@ def main(page: ft.Page):
         # ✅ FIX: Use nonlocal to access variables from main() scope
         nonlocal private_unread_counts, unread_private_messages, unread_system_notifications
         nonlocal system_notifications, notification_badge_container, notification_badge_text
-        
-        activate_tab_ref = {"fn": None}
 
         def load_notification_cache():
             try:
@@ -4899,7 +4948,7 @@ def main(page: ft.Page):
                         ),
                         ft.TextButton(
                             "Open Private Chats",
-                            on_click=lambda ev: activate_tab_ref["fn"](3) if activate_tab_ref.get("fn") else None,
+                            on_click=lambda ev: activate_tab_ref["fn"](4) if activate_tab_ref.get("fn") else None,
                         ),
                     ],
                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -7093,17 +7142,30 @@ def main(page: ft.Page):
                     # 🎯 AUTO-JOIN BRONZE CATEGORY GROUPS
                     try:
                         print("🔍 Checking for Bronze category groups to auto-join...")
+                        print(f"   Using database URL: {db.database_url}")
                         groups_url = f"{db.database_url}/groups.json?auth={db.auth_token}"
                         groups_response = requests.get(groups_url, timeout=10)
+                        
+                        print(f"   Groups fetch status: {groups_response.status_code}")
                         
                         if groups_response.status_code == 200:
                             all_groups = groups_response.json() or {}
                             joined_count = 0
                             
+                            print(f"   Found {len(all_groups)} total groups")
+                            
                             for gid, group_data in all_groups.items():
-                                if isinstance(group_data, dict) and 'info' in group_data:
-                                    group_info = group_data['info']
-                                    category = group_info.get('category', 'None')
+                                if isinstance(group_data, dict):
+                                    # Check both 'info' nested structure and direct structure
+                                    if 'info' in group_data:
+                                        group_info = group_data['info']
+                                    else:
+                                        group_info = group_data
+                                    
+                                    category = group_info.get('category', '')
+                                    group_name = group_info.get('name', gid)
+                                    
+                                    print(f"   Checking group: {group_name}, category: {category}")
                                     
                                     if category == 'Bronze':
                                         # Check if not already a member
@@ -7118,16 +7180,25 @@ def main(page: ft.Page):
                                             }
                                             member_response = requests.put(member_url, json=member_data, timeout=10)
                                             
+                                            print(f"   Join attempt for {group_name}: status {member_response.status_code}")
+                                            
                                             if member_response.status_code == 200:
                                                 joined_count += 1
-                                                print(f"✅ Auto-joined Bronze group: {group_info.get('name', gid)}")
+                                                print(f"✅ Auto-joined Bronze group: {group_name}")
+                                        else:
+                                            print(f"   Already a member of {group_name}")
                             
                             if joined_count > 0:
                                 print(f"🎉 Successfully auto-joined {joined_count} Bronze category group(s)!")
+                                show_snackbar(f"🎉 Joined {joined_count} Bronze group(s)!")
                             else:
                                 print("ℹ️ No Bronze category groups found to join")
+                        else:
+                            print(f"❌ Failed to fetch groups: HTTP {groups_response.status_code}")
                     except Exception as e:
                         print(f"⚠️ Error auto-joining Bronze groups: {e}")
+                        import traceback
+                        traceback.print_exc()
                     
                     # Hide form and show dashboard
                     show_registration_form["visible"] = False
@@ -8593,13 +8664,16 @@ def main(page: ft.Page):
             """Update selection, load data, and sync the bottom nav."""
             nonlocal selected_index
             selected_index = new_index
+            
+            # Track current tab for back button handler
+            activate_tab_ref["current_tab"] = new_index
+            activate_tab_ref["fn"] = activate_tab
+            
             try:
                 if bottom_nav:
                     bottom_nav.selected_index = selected_index
             except Exception as nav_ex:
                 print(f"[NAV SYNC] {nav_ex}")
-
-            activate_tab_ref["fn"] = activate_tab
 
             if not page_view_cls:
                 try:
