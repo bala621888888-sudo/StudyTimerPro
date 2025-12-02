@@ -744,9 +744,13 @@ class FirebaseAuth:
 
             if response.status_code == 200:
                 methods = data.get('signInMethods', []) or []
-                return len(methods) > 0, None
+                registered = data.get('registered', False)
+                return (len(methods) > 0) or bool(registered), None
 
             error_msg = data.get('error', {}).get('message', 'Unknown error')
+            # Treat EMAIL_NOT_FOUND as a non-error "not found" to keep UX clean
+            if error_msg == "EMAIL_NOT_FOUND":
+                return False, None
             return False, error_msg
         except Exception as e:
             return False, str(e)
@@ -1333,9 +1337,13 @@ class FirebaseAuth:
 
             if response.status_code == 200:
                 methods = data.get('signInMethods', []) or []
-                return len(methods) > 0, None
+                registered = data.get('registered', False)
+                return (len(methods) > 0) or bool(registered), None
 
             error_msg = data.get('error', {}).get('message', 'Unknown error')
+            # Treat EMAIL_NOT_FOUND as a non-error "not found" to keep UX clean
+            if error_msg == "EMAIL_NOT_FOUND":
+                return False, None
             return False, error_msg
         except Exception as e:
             return False, str(e)
@@ -4090,13 +4098,13 @@ def main(page: ft.Page):
         page.update()
 
         # Verify the account exists before sending OTP.
-        # If the lookup fails (network issues, API hiccups), continue with login flow so
-        # existing users aren't blocked or pushed into a confusing sign-up loop.
         exists, error = auth.email_exists(email)
         if error:
-            show_snackbar(f"Unable to verify account, continuing with login: {error}")
-        elif not exists:
-            show_snackbar("Could not confirm account, continuing with login. If you're new, please sign up.")
+            show_snackbar(f"Unable to verify account: {error}. Please try again.")
+            return
+        if not exists:
+            show_snackbar("Account not found. Please sign up first.")
+            return
 
         # Explicitly reset OTP flow to sign-in to avoid accidental sign-ups
         pending_otp_data["is_signup"] = False
