@@ -7228,59 +7228,44 @@ def main(page: ft.Page):
                     # 🎯 AUTO-JOIN BRONZE CATEGORY GROUPS
                     try:
                         print("🔍 Checking for Bronze category groups to auto-join...")
-                        print(f"   Using database URL: {db.database_url}")
-                        groups_url = f"{db.database_url}/groups.json?auth={db.auth_token}"
-                        groups_response = requests.get(groups_url, timeout=10)
-                        
-                        print(f"   Groups fetch status: {groups_response.status_code}")
-                        
-                        if groups_response.status_code == 200:
-                            all_groups = groups_response.json() or {}
-                            joined_count = 0
-                            
-                            print(f"   Found {len(all_groups)} total groups")
-                            
-                            for gid, group_data in all_groups.items():
-                                if isinstance(group_data, dict):
-                                    # Check both 'info' nested structure and direct structure
-                                    if 'info' in group_data:
-                                        group_info = group_data['info']
-                                    else:
-                                        group_info = group_data
-                                    
-                                    category = group_info.get('category', '')
-                                    group_name = group_info.get('name', gid)
-                                    
-                                    print(f"   Checking group: {group_name}, category: {category}")
-                                    
-                                    if category == 'Bronze':
-                                        # Check if not already a member
-                                        members = group_data.get('members', {})
-                                        if auth.user_id not in members:
-                                            # Add user to group
-                                            member_url = f"{db.database_url}/groups/{gid}/members/{auth.user_id}.json?auth={db.auth_token}"
-                                            member_data = {
-                                                "username": current_username,
-                                                "joined_at": int(time.time() * 1000),
-                                                "is_admin": False
-                                            }
-                                            member_response = requests.put(member_url, json=member_data, timeout=10)
-                                            
-                                            print(f"   Join attempt for {group_name}: status {member_response.status_code}")
-                                            
-                                            if member_response.status_code == 200:
-                                                joined_count += 1
-                                                print(f"✅ Auto-joined Bronze group: {group_name}")
-                                        else:
-                                            print(f"   Already a member of {group_name}")
-                            
-                            if joined_count > 0:
-                                print(f"🎉 Successfully auto-joined {joined_count} Bronze category group(s)!")
-                                show_snackbar(f"🎉 Joined {joined_count} Bronze group(s)!")
-                            else:
-                                print("ℹ️ No Bronze category groups found to join")
+
+                        # Use the FirebaseDatabase helper to fetch groups so we respect auth tokens
+                        all_groups = db.get_all_groups()
+                        joined_count = 0
+
+                        print(f"   Found {len(all_groups)} total groups")
+
+                        for group in all_groups:
+                            gid = group.get("id")
+                            category = (group.get("category") or "").strip()
+                            group_name = group.get("name", gid or "Group")
+
+                            print(f"   Checking group: {group_name}, category: {category}")
+
+                            if category.lower() == "bronze" and gid:
+                                members = group.get("members", {}) or {}
+                                if auth.user_id not in members:
+                                    # Add user to group using helper (ensures joined_at saved for hiding old messages)
+                                    joined = db.add_member_to_group(
+                                        gid,
+                                        auth.user_id,
+                                        current_username,
+                                        is_admin=False,
+                                    )
+
+                                    print(f"   Join attempt for {group_name}: status {joined}")
+
+                                    if joined:
+                                        joined_count += 1
+                                        print(f"✅ Auto-joined Bronze group: {group_name}")
+                                else:
+                                    print(f"   Already a member of {group_name}")
+
+                        if joined_count > 0:
+                            print(f"🎉 Successfully auto-joined {joined_count} Bronze category group(s)!")
+                            show_snackbar(f"🎉 Joined {joined_count} Bronze group(s)!")
                         else:
-                            print(f"❌ Failed to fetch groups: HTTP {groups_response.status_code}")
+                            print("ℹ️ No Bronze category groups found to join")
                     except Exception as e:
                         print(f"⚠️ Error auto-joining Bronze groups: {e}")
                         import traceback
