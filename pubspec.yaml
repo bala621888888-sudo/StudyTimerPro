@@ -2,6 +2,7 @@ name: chat_app
 description: ST Promoter Hub (Flet + Flutter)
 publish_to: "none"
 version: 1.0.0+1
+
 environment:
   sdk: ">=2.18.0 <4.0.0"
 
@@ -30,6 +31,8 @@ flutter:
   # IMPORTANT — include the service account here so it's packaged into the APK
   assets:
     - assets/firebase_service_account.json
+    # (optional, but fine to include the icon as an asset too)
+    - assets/chat_app_icon.png
 
   fonts:
     - family: MaterialIcons
