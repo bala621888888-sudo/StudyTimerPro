@@ -4089,15 +4089,14 @@ def main(page: ft.Page):
         show_snackbar("Checking account...")
         page.update()
 
-        # Verify the account exists before sending OTP
+        # Verify the account exists before sending OTP.
+        # If the lookup fails (network issues, API hiccups), continue with login flow so
+        # existing users aren't blocked or pushed into a confusing sign-up loop.
         exists, error = auth.email_exists(email)
         if error:
-            show_snackbar(f"Unable to verify account: {error}")
-            return
-
-        if not exists:
-            show_snackbar("Account not found. Please sign up first.")
-            return
+            show_snackbar(f"Unable to verify account, continuing with login: {error}")
+        elif not exists:
+            show_snackbar("Could not confirm account, continuing with login. If you're new, please sign up.")
 
         # Explicitly reset OTP flow to sign-in to avoid accidental sign-ups
         pending_otp_data["is_signup"] = False
