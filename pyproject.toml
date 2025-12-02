@@ -27,7 +27,7 @@ org = "com.flet"
 product = "ST Promoter Hub"
 
 [tool.flet.app]
-name = ST Promoter Hub"
+name = "ST Promoter Hub"
 description = "Firebase-based Chat Application"
 version = "1.0.0"
 module = "chat_app"
