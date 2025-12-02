@@ -16,6 +16,7 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 import smtplib, ssl
+import time, platform, hashlib, uuid
 from email.utils import parsedate_to_datetime
 from config_paths import app_paths
 import hashlib
@@ -2055,6 +2056,7 @@ class ReferralValidator:
         # Add processing lock
         self.processing_lock = threading.Lock()
         self.currently_processing = False
+        self.promoter_manager = getattr(main_app, "promoter_manager", None)
         # Ensure directories exist
         os.makedirs(self.appdata_path, exist_ok=True)
                
@@ -3010,10 +3012,12 @@ StudyTimer Team"""
                 else:
                     # Invalid code
                     print("[DEBUG] Code invalid")
-                    self.validation_window.after(0, lambda: [
-                        self.status_label.config(text="Invalid referral code", fg="red"),
-                        self.apply_btn.config(state="normal", text="Apply Code & Save 40%")
-                    ])
+                    self.validation_window.after(
+                        0,
+                        lambda: self.start_promoter_validation(
+                            referral_code, "Invalid referral code"
+                        ),
+                    )
                     
             except Exception as e:
                 print(f"[DEBUG] Validation error: {e}")
@@ -3058,23 +3062,125 @@ StudyTimer Team"""
         if success:
             # Save locally only if online update succeeds
             self.save_referral_locally(referral_code)
-            
+
             # Send notification to referrer
             self.send_notification_to_referrer(result, user_info, "install")
-            
+
             # Show success
             self.show_success(referral_code, result.get('referrer_name', 'Your friend'))
             return True
         else:
             # All validation failures (duplicates, not found, etc.) - Update UI same as invalid code
             print("❌ Verification failed - referral code validation failed")
-            
+
             # Update UI to show verification failed (same pattern as invalid code)
-            self.status_label.config(text="Verification failed - Device alreaady registered", fg="red")
-            self.apply_btn.config(state="normal", text="Apply Code & Save 40%")
-            
+            self.start_promoter_validation(
+                referral_code,
+                "Verification failed - Device already registered",
+            )
+
             # Do NOT save locally, do NOT send notifications, do NOT show success
             return False
+
+    def start_promoter_validation(self, activation_key, fallback_message):
+        """Secondary validation path to identify promoters when referral fails."""
+        if not self.promoter_manager:
+            self.status_label.config(text=fallback_message, fg="red")
+            self.apply_btn.config(state="normal", text="Apply Code & Save 40%")
+            return
+
+        self.status_label.config(text="Checking promoter access...", fg="blue")
+        self.apply_btn.config(state="disabled", text="Checking promoter...")
+
+        def check_promoter():
+            try:
+                result = self.promoter_manager.verify_and_save_promoter(activation_key)
+            except Exception as e:
+                print(f"[PROMOTER] Error during promoter check: {e}")
+                result = None
+
+            def finish():
+                if result is True:
+                    self.show_promoter_welcome(activation_key)
+                elif result is False:
+                    self.status_label.config(text=fallback_message, fg="red")
+                    self.apply_btn.config(state="normal", text="Apply Code & Save 40%")
+                else:
+                    self.status_label.config(
+                        text=f"{fallback_message} (connect to internet for promoter check)",
+                        fg="red",
+                    )
+                    self.apply_btn.config(state="normal", text="Apply Code & Save 40%")
+
+            if self.validation_window:
+                self.validation_window.after(0, finish)
+
+        threading.Thread(target=check_promoter, daemon=True).start()
+
+    def show_promoter_welcome(self, activation_key):
+        """Show welcome popup for verified promoters."""
+        for widget in self.validation_window.winfo_children():
+            widget.destroy()
+
+        frame = tk.Frame(self.validation_window, bg="white")
+        frame.pack(fill="both", expand=True)
+
+        header = tk.Frame(frame, bg="#4CAF50", height=140)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        tk.Label(header, text="🎉", font=("Arial", 42), bg="#4CAF50", fg="white").pack(pady=10)
+        tk.Label(
+            header,
+            text="Welcome Promoter!",
+            font=("Arial", 18, "bold"),
+            bg="#4CAF50",
+            fg="white",
+        ).pack()
+
+        content = tk.Frame(frame, bg="white", pady=30, padx=20)
+        content.pack(fill="both", expand=True)
+        tk.Label(
+            content,
+            text="You're verified as a promoter. Enjoy full access without trial prompts!",
+            font=("Arial", 12),
+            bg="white",
+            fg="#333",
+            wraplength=420,
+            justify="center",
+        ).pack(pady=10)
+
+        tk.Button(
+            content,
+            text="Thanks",
+            command=lambda: self.complete_promoter_flow(activation_key),
+            font=("Arial", 12, "bold"),
+            bg="#4CAF50",
+            fg="white",
+            width=18,
+            height=2,
+            cursor="hand2",
+        ).pack(pady=15)
+
+    def complete_promoter_flow(self, activation_key):
+        """Persist promoter state and continue without trial/licensing prompts."""
+        profile = self.load_user_profile()
+        profile['referral_prompt_shown'] = True
+        profile['referral_checked'] = True
+        profile['promoter_verified'] = True
+        profile['promoter_activation_key'] = activation_key
+        self.save_user_profile(profile)
+
+        if self.promoter_manager:
+            # Promoter just verified -> mark as active in local cache
+            self.promoter_manager.save_promoter_status(activation_key, True)
+
+        if self.validation_window and self.validation_window.winfo_exists():
+            self.validation_window.destroy()
+
+        if hasattr(self.main_app, 'on_promoter_verified'):
+            self.main_app.on_promoter_verified(activation_key)
+        else:
+            self.main_app.after(500, self.main_app._check_license_and_payment)
     
     def show_success(self, referral_code, referrer_name):
         """Show success message"""
@@ -5119,7 +5225,8 @@ class UnifiedLicenseManager:
         self.ws = None
         self._connect_unified_gsheet()
         self.gspread_client = get_encrypted_gspread_client()
-        
+
+
     def get_location_diagnostics(self, user_profile):
         """
         Return a list of per-location diagnostics dictionaries.
@@ -6293,7 +6400,281 @@ class UnifiedLicenseManager:
             return True
         except:
             return False
-            
+
+class PromoterStatusManager:
+    """Manage promoter verification and offline status files.
+
+    Spreadsheet layout (promoter worksheet):
+      Col A: activation_key
+      Col B: machine_fingerprint
+      Col C: email_id        (optional, not used here)
+      Col D: upi_id          (optional, not used here)
+      Col E: Referral_ID     (optional, handled elsewhere)
+      Col F: Status (TRUE/FALSE)
+    """
+
+    def __init__(self, license_manager=None):
+        self.license_manager = license_manager
+        self.promoter_sheet_id = (
+            get_secret("PROMOTER_SHEET_ID")
+            or get_secret("REFERRAL_SHEET_ID")
+            or get_secret("LB_SHEET_ID")
+        )
+        self.promoter_worksheet = get_secret("PROMOTER_WORKSHEET") or "promoters"
+        # Tie promoter to same machine id as license, or fallback to our own fingerprint
+        self.machine_fingerprint = (
+            getattr(license_manager, "machine_id", None)
+            or self._generate_machine_fingerprint()
+        )
+        self.storage_locations = self._resolve_storage_locations()
+
+    # ------------------------------------------------------------------
+    # Storage locations (reuse license folders)
+    # ------------------------------------------------------------------
+    def _resolve_storage_locations(self):
+        """Reuse license storage locations to persist promoter status."""
+        if self.license_manager and getattr(
+            self.license_manager, "storage_locations", None
+        ):
+            return list(self.license_manager.storage_locations)[:3]
+
+        # Fallback to simple hidden locations if license manager is unavailable
+        fallback_locations = []
+        try:
+            import tempfile
+
+            fallback_locations.append(
+                os.path.join(tempfile.gettempdir(), ".studytimer_cache")
+            )
+            fallback_locations.append(
+                os.path.join(os.path.expanduser("~"), ".studytimer_data")
+            )
+            fallback_locations.append(os.path.join("/var/tmp", ".studytimer"))
+            for loc in fallback_locations:
+                try:
+                    os.makedirs(loc, exist_ok=True)
+                except Exception:
+                    pass
+            return fallback_locations
+        except Exception:
+            return fallback_locations
+
+    def _generate_machine_fingerprint(self):
+        try:
+            system_info = f"{platform.system()}-{platform.machine()}-{platform.processor()}"
+            hostname = platform.node()
+            fingerprint_data = f"{system_info}-{hostname}"
+            return hashlib.md5(fingerprint_data.encode()).hexdigest()[:16]
+        except Exception:
+            return str(uuid.uuid4())[:16]
+
+    def _has_internet(self):
+        try:
+            resp = requests.get("https://www.google.com", timeout=5)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def _status_file_paths(self):
+        paths = []
+        for location in self.storage_locations[:3]:
+            try:
+                os.makedirs(location, exist_ok=True)
+                paths.append(os.path.join(location, "promoter_status.json"))
+            except Exception:
+                continue
+        return paths
+
+    def _normalize_bool(self, value):
+        return str(value).strip().lower() in {"true", "1", "yes", "y", "on"}
+
+    # ------------------------------------------------------------------
+    # ONLINE CHECK (sheet is the boss when internet is there)
+    # ------------------------------------------------------------------
+    def lookup_promoter_online(self, activation_key: str):
+        """Check Google Sheet for this activation key & THIS machine.
+
+        Returns:
+            True  -> key is active for THIS machine.
+            False -> key invalid / revoked / bound to another machine.
+            None  -> could not contact sheet (network/auth error).
+        """
+        try:
+            client = get_encrypted_gspread_client()
+            if not client or not self.promoter_sheet_id:
+                print("[PROMOTER] No sheets client / sheet id; cannot check online")
+                return None
+
+            sheet = client.open_by_key(self.promoter_sheet_id)
+            worksheet = sheet.worksheet(self.promoter_worksheet)
+
+            # Column A = activation_key
+            keys = worksheet.col_values(1)
+            if activation_key not in keys:
+                print(f"[PROMOTER] Activation key {activation_key} not found in sheet")
+                return False
+
+            row_index = keys.index(activation_key) + 1
+            row_data = worksheet.row_values(row_index)
+
+            # Column B = machine_fingerprint
+            sheet_machine = ""
+            if len(row_data) > 1 and row_data[1]:
+                sheet_machine = row_data[1].strip()
+
+            # Column F = Status
+            status_value = row_data[5] if len(row_data) > 5 else ""
+            status_bool = self._normalize_bool(status_value)
+
+            current_fp = (self.machine_fingerprint or "").strip()
+            if not current_fp:
+                print("[PROMOTER] No local machine fingerprint; treating as invalid")
+                return False
+
+            # If sheet Status is TRUE and no machine is stored yet, bind this device
+            if status_bool and not sheet_machine:
+                try:
+                    worksheet.update_cell(row_index, 2, current_fp)  # Col B
+                    sheet_machine = current_fp
+                    print(
+                        f"[PROMOTER] Bound activation key {activation_key} to fingerprint {current_fp}"
+                    )
+                except Exception as e:
+                    print(
+                        f"[PROMOTER] Failed to write fingerprint for key {activation_key}: {e}"
+                    )
+
+            # If sheet already has fingerprint and it does not match this machine -> invalid
+            if sheet_machine and sheet_machine != current_fp:
+                print(
+                    f"[PROMOTER] Fingerprint mismatch for key {activation_key}: "
+                    f"sheet={sheet_machine}, local={current_fp}"
+                )
+                return False
+
+            # Finally honour the Status column
+            if status_bool:
+                return True
+
+            print(
+                f"[PROMOTER] Status is not TRUE for key {activation_key} (value={status_value!r})"
+            )
+            return False
+
+        except Exception as e:
+            print(f"[PROMOTER] Online lookup failed: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # LOCAL CACHE (for offline use)
+    # ------------------------------------------------------------------
+    def save_promoter_status(self, activation_key: str, is_active: bool):
+        """Persist promoter status locally for offline use.
+
+        is_active = True  -> promoter currently active
+        is_active = False -> promoter known but currently inactive
+        """
+        data = {
+            "activation_key": activation_key,
+            "fingerprint": self.machine_fingerprint,
+            "status": bool(is_active),
+            "updated_at": time.time(),
+        }
+        success = 0
+        paths = self._status_file_paths()
+        for path in paths:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                success += 1
+            except Exception as e:
+                print(f"[PROMOTER] Failed to write status to {path}: {e}")
+        print(
+            f"[PROMOTER] Saved promoter status (active={is_active}) to {success}/{len(paths)} locations"
+        )
+
+    def load_promoter_status(self):
+        """Read cached promoter info for this machine (even if inactive)."""
+        for path in self._status_file_paths():
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    # Only check fingerprint & key; status can be True or False
+                    if (
+                        data.get("activation_key")
+                        and data.get("fingerprint") == self.machine_fingerprint
+                    ):
+                        return data
+                except Exception as e:
+                    print(f"[PROMOTER] Failed to read status from {path}: {e}")
+        return None
+
+    def clear_promoter_status(self):
+        """Delete all local promoter status cache files."""
+        for path in self._status_file_paths():
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception as e:
+                print(f"[PROMOTER] Failed to remove status file {path}: {e}")
+
+    # ------------------------------------------------------------------
+    # PUBLIC API
+    # ------------------------------------------------------------------
+    def verify_and_save_promoter(self, activation_key: str):
+        """Used when user enters an activation key for the first time."""
+        online_status = self.lookup_promoter_online(activation_key)
+        if online_status is True:
+            # Valid promoter for this machine
+            self.save_promoter_status(activation_key, True)
+            return True
+        if online_status is False:
+            # Key exists but not valid for this machine / status FALSE
+            self.save_promoter_status(activation_key, False)
+            return False
+        # None -> could not reach sheet; show "try again" in UI
+        return None
+
+
+    def is_promoter_active(self):
+        """Check if this machine is currently an active promoter.
+
+        Behaviour:
+        - Always keep local file; never auto-delete it.
+        - If we have internet:
+            * Ask sheet: TRUE/FALSE for this activation_key + fingerprint.
+            * Save that result to local file.
+        - If we have no internet:
+            * Use local 'status' (True/False) from file.
+        """
+        saved = self.load_promoter_status()
+        if not saved:
+            # No promoter key stored at all
+            return False
+
+        activation_key = saved.get("activation_key")
+        local_status = bool(saved.get("status"))
+        if not activation_key:
+            return False
+
+        # 🔹 If we have internet, sheet decides
+        if self._has_internet():
+            online_status = self.lookup_promoter_online(activation_key)
+            if online_status is True:
+                # Update cache -> active
+                self.save_promoter_status(activation_key, True)
+                return True
+            if online_status is False:
+                # Update cache -> inactive, but keep key for future re-activation
+                self.save_promoter_status(activation_key, False)
+                return False
+            # online_status is None (error) -> fall back to local
+
+        # 🔹 Offline OR sheet error -> trust local status
+        return local_status
+
+
 class PaymentWizard(tk.Toplevel):
     """Enhanced payment wizard with professional UI"""
 
@@ -6657,9 +7038,45 @@ class PaymentWizard(tk.Toplevel):
                 fg=self.text_secondary, bg=self.bg_color).pack()
         
     def _later_clicked(self):
-        """Close payment popup without exiting app"""
-        self.skip_trial_exit = True
-        self.destroy()
+        """Handle the 'Skip for now' button in the payment wizard.
+
+        • If the user has already started a trial earlier (trial_ever_started=True),
+          we behave like before and simply close the payment window, letting them
+          continue in limited free mode.
+
+        • If the user never started a trial (no 'trial_ever_started' flag in profile),
+          treat this as a first-time user and redirect them back to the trial / plan
+          choice popup instead of silently skipping both trial and payment.
+        """
+        from tkinter import messagebox
+
+        try:
+            user_profile = _load_profile() or {}
+        except Exception as e:
+            print(f"[PAYMENT] Failed to load profile in _later_clicked: {e}")
+            user_profile = {}
+
+        if user_profile.get("trial_ever_started"):
+            # Trial was started (or finished) at least once → allow skip as before
+            self.skip_trial_exit = True
+            self.destroy()
+        else:
+            # First-time user: force them to pick Trial or Premium
+            print("[PAYMENT] Skip-for-now blocked because trial never started.")
+            messagebox.showinfo(
+                "Trial Required",
+                "You must start the 7-day free trial or purchase a license to continue.\n\n"
+                "We'll show the plan selection again.",
+            )
+
+            # Close this payment window and re-open the trial choice popup
+            self.destroy()
+            try:
+                if hasattr(self.app, "show_trial_choice_popup_again"):
+                    # Schedule on the main Tk loop so it runs after this window is gone
+                    self.app.after(100, self.app.show_trial_choice_popup_again)
+            except Exception as e:
+                print(f"[PAYMENT] Could not reopen trial choice popup: {e}")
             
     def _skip_payment_popup(self):
         """Allow skipping without triggering the exit logic."""
@@ -14227,6 +14644,7 @@ def load_last_active_plan():
 class StudyTimerApp(tk.Tk):
     def __init__(self):
         super().__init__()
+        self._promoter_device = False
         self.bind_all('<Control-Shift-D>', self._on_dev_shortcut)
         print("[DEV] Ctrl+Shift+D global shortcut bound")
         # 🔹 NEW: diagnostics shortcut
@@ -14263,7 +14681,26 @@ class StudyTimerApp(tk.Tk):
         except Exception as e:
             print(f"[INIT] Trial manager initialization error: {e}")
             self.trial_manager = None
-            
+
+        try:
+            print("[INIT] Initializing promoter manager...")
+            self.promoter_manager = PromoterStatusManager(self.license_manager)
+            print("[INIT] Promoter manager initialized")
+        except Exception as e:
+            print(f"[INIT] Promoter manager initialization error: {e}")
+            self.promoter_manager = None
+
+        # 🔹 Check if this machine is already an active promoter
+        try:
+            if self.promoter_manager:
+                if self.promoter_manager.is_promoter_active():
+                    print("[PROMOTER] Active promoter device detected – skipping license/trial checks")
+                    self._promoter_device = True
+                else:
+                    print("[PROMOTER] Not a promoter device")
+        except Exception as e:
+            print(f"[PROMOTER] Error while checking promoter status: {e}")
+
         # Continue with migration and other initialization
         try:
             migrated = app_paths.migrate_existing_data()
@@ -14496,9 +14933,15 @@ class StudyTimerApp(tk.Tk):
         # ✅ Add validation state tracking
         self._validation_in_progress = False
         self._validation_completed = False
-        self.after(1000, self._check_initial_trial_status)
-        self.after(100000, integrity_check) 
-        self.after(900000, self._check_license_and_payment) 
+
+        # If NOT a promoter device, run normal trial / license flow
+        if not getattr(self, "_promoter_device", False):
+            self.after(1000, self._check_initial_trial_status)
+            self.after(100000, integrity_check)
+            self.after(900000, self._check_license_and_payment)
+        else:
+            print("[PROMOTER] Skipping trial + license checks for promoter device")
+
         # Start periodic write (30s) and read (60s) heartbeats
         self.after(3_000, self._gsync_write_tick)
         self.after(5_000, self._gsync_read_tick)
@@ -15015,7 +15458,12 @@ class StudyTimerApp(tk.Tk):
         if hasattr(self, 'license_manager') and self.license_manager:
             self.license_manager.main_app_instance = self
         self._check_day_change_on_startup()
-        self.after(100, self._check_initial_tampered_state)
+
+        # Don’t hide features for promoter devices, even if trial was tampered
+        if not getattr(self, "_promoter_device", False):
+            self.after(100, self._check_initial_tampered_state)
+        else:
+            print("[PROMOTER] Skipping tampered-state startup check (promoter device)")
         
         # --- End
         
@@ -18852,7 +19300,35 @@ class StudyTimerApp(tk.Tk):
             self.show_referral_validation()
         except Exception as e:
             print(f"Error in manual referral trigger: {e}")
-    
+
+    def on_promoter_verified(self, activation_key):
+        """Handle successful promoter verification and bypass trial/licensing flows."""
+        print("[PROMOTER] Promoter verified - enabling full access")
+        try:
+            profile = _load_profile()
+            profile['promoter_verified'] = True
+            profile['promoter_activation_key'] = activation_key
+            profile['referral_prompt_shown'] = True
+            profile['referral_checked'] = True
+            _save_profile(profile)
+        except Exception as e:
+            print(f"[PROMOTER] Failed to update profile for promoter: {e}")
+
+        if hasattr(self, 'promoter_manager') and self.promoter_manager:
+            try:
+                # Again, this path is only hit after successful promoter verification
+                self.promoter_manager.save_promoter_status(activation_key, True)
+            except Exception as e:
+                print(f"[PROMOTER] Failed to persist promoter status: {e}")
+
+        # Stop any pending validation loops and continue into the app without trial popups
+        self._validation_completed = True
+        self._validation_in_progress = False
+        try:
+            self.after_referral_check()
+        except Exception as e:
+            print(f"[PROMOTER] After referral hook failed: {e}")
+
     def reset_referral_for_testing(self):
         """Reset referral status for testing (keeps onboarding_done=True)"""
         try:
@@ -22030,9 +22506,9 @@ class StudyTimerApp(tk.Tk):
             # ✅ STEP 0: Check if already marked as tampered
             if user_profile.get('trial_tampered'):
                 print("[VALIDATION] User was previously flagged for tampering")
-                
+
                 license_valid, _ = self.license_manager.comprehensive_validation(user_profile)
-                
+
                 if not license_valid:
                     print("[VALIDATION] Still tampered and not paid - blocking access")
                     
@@ -22054,7 +22530,22 @@ class StudyTimerApp(tk.Tk):
                     self._validation_completed = True
                     self._start_periodic_validation()
                     return
-            
+
+            promoter_manager = getattr(self, 'promoter_manager', None)
+            if promoter_manager:
+                if promoter_manager.is_promoter_active():
+                    print("[VALIDATION] Promoter access detected - bypassing license and trial checks")
+                    user_profile['promoter_verified'] = True
+                    _save_profile(user_profile)
+                    self._validation_completed = True
+                    self._validation_in_progress = False
+                    return
+                elif user_profile.get('promoter_verified'):
+                    print("[VALIDATION] Promoter status revoked - returning to standard flow")
+                    user_profile['promoter_verified'] = False
+                    user_profile.pop('promoter_activation_key', None)
+                    _save_profile(user_profile)
+
             # Check referral prompt
             if not user_profile.get('referral_prompt_shown') and not user_profile.get('referral_code'):
                 print("[VALIDATION] Showing referral prompt first...")
@@ -22416,6 +22907,335 @@ class StudyTimerApp(tk.Tk):
         
         finally:
             self._validation_in_progress = False
+            
+    def show_trial_choice_popup_again(self):
+        """
+        Show the 'Choose Your Plan' trial / premium popup again.
+
+        This is used when a first-time user clicks 'Skip for now' in the payment
+        wizard before starting any trial, so they can't bypass both trial and
+        payment on the very first run.
+        """
+        try:
+            user_profile = _load_profile() or {}
+        except Exception as e:
+            print(f"[TRIAL] Failed to load profile for repeat trial popup: {e}")
+            user_profile = {}
+
+        # If profile is completely missing, create a minimal default so the
+        # TrialManager has a UID to work with.
+        if not user_profile:
+            try:
+                user_profile = _create_default_profile()
+                _save_profile(user_profile)
+            except Exception as e:
+                print(f"[TRIAL] Could not create default profile for repeat trial popup: {e}")
+                user_profile = {}
+
+        # Safety guard: if trial_ever_started is already True, fall back to normal
+        # payment wizard instead of showing this popup again.
+        if user_profile.get("trial_ever_started"):
+            print("[TRIAL] trial_ever_started already True in show_trial_choice_popup_again; showing payment wizard.")
+            self._show_payment_wizard()
+            return
+
+        import tkinter as tk
+        from tkinter import font, messagebox
+
+        popup = tk.Toplevel(self)
+        popup.title("Choose Your Plan")
+        popup.geometry("750x700")
+        popup.resizable(False, False)
+
+        response_var = tk.BooleanVar(value=False)
+
+        popup.transient(self)
+        popup.grab_set()
+
+        popup.update_idletasks()
+        x = (popup.winfo_screenwidth() // 2) - 375
+        y = (popup.winfo_screenheight() // 2) - 350
+        popup.geometry(f"750x700+{x}+{y}")
+
+        popup.lift()
+        popup.attributes("-topmost", True)
+        popup.after(100, lambda: popup.attributes("-topmost", False))
+
+        # Styles
+        bg_color = "#f8f9fa"
+        header_color = "#2c3e50"
+        free_color = "#95a5a6"
+        premium_color = "#27ae60"
+
+        popup.configure(bg=bg_color)
+
+        # Fonts
+        title_font = font.Font(family="Arial", size=20, weight="bold")
+        subtitle_font = font.Font(family="Arial", size=10)
+        plan_title_font = font.Font(family="Arial", size=14, weight="bold")
+        feature_font = font.Font(family="Arial", size=9)
+        button_font = font.Font(family="Arial", size=11, weight="bold")
+
+        # Check referral for pricing
+        referral_applied = user_profile.get("referral_code") is not None
+        price_text = "₹199" if referral_applied else "₹349"
+
+        # Header
+        header_frame = tk.Frame(popup, bg=header_color, height=80)
+        header_frame.pack(fill=tk.X)
+        header_frame.pack_propagate(False)
+
+        tk.Label(
+            header_frame,
+            text="Choose Your Plan",
+            font=title_font,
+            fg="white",
+            bg=header_color,
+        ).pack(pady=15)
+
+        if referral_applied:
+            subtitle_text = f"Start with a 7-day free trial or get Premium for {price_text} (Referral applied!)"
+        else:
+            subtitle_text = f"Start with a 7-day free trial or upgrade to Premium for {price_text}"
+
+        tk.Label(
+            header_frame,
+            text=subtitle_text,
+            font=subtitle_font,
+            fg="#ecf0f1",
+            bg=header_color,
+        ).pack()
+
+        # Content frame
+        content_frame = tk.Frame(popup, bg=bg_color)
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=30, pady=20)
+
+        # Two columns
+        left_frame = tk.Frame(content_frame, bg="white", relief=tk.RAISED, borderwidth=2)
+        left_frame.grid(row=0, column=0, sticky="nsew", padx=10)
+
+        right_frame = tk.Frame(content_frame, bg="white", relief=tk.RAISED, borderwidth=2)
+        right_frame.grid(row=0, column=1, sticky="nsew", padx=10)
+
+        content_frame.grid_columnconfigure(0, weight=1)
+        content_frame.grid_columnconfigure(1, weight=1)
+
+        # FREE PLAN
+        free_header = tk.Frame(left_frame, bg=free_color, height=60)
+        free_header.pack(fill=tk.X)
+        free_header.pack_propagate(False)
+
+        tk.Label(
+            free_header,
+            text="FREE PLAN",
+            font=plan_title_font,
+            fg="white",
+            bg=free_color,
+        ).pack(pady=8)
+        tk.Label(
+            free_header,
+            text="Basic Features",
+            font=subtitle_font,
+            fg="#ecf0f1",
+            bg=free_color,
+        ).pack()
+
+        free_features_frame = tk.Frame(left_frame, bg="white")
+        free_features_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
+
+        tk.Label(
+            free_features_frame,
+            text=(
+                "✓ Basic daily timer & tracking\n"
+                "✓ Access to Plan, Live & Wastage tabs\n"
+                "✗ Cloud sync & Telegram reports\n"
+                "✗ Priority support"
+            ),
+            justify="left",
+            anchor="w",
+            font=feature_font,
+            bg="white",
+            fg="#2c3e50",
+        ).pack(anchor="w")
+
+        free_footer = tk.Frame(left_frame, bg="white")
+        free_footer.pack(fill=tk.X, pady=10)
+        tk.Label(
+            free_footer,
+            text="Free forever with limited features",
+            font=("Arial", 9, "italic"),
+            fg="#7f8c8d",
+            bg="white",
+        ).pack()
+
+        # PREMIUM PLAN
+        premium_header = tk.Frame(right_frame, bg=premium_color, height=60)
+        premium_header.pack(fill=tk.X)
+        premium_header.pack_propagate(False)
+
+        badge_frame = tk.Frame(premium_header, bg=premium_color)
+        badge_frame.pack(pady=3)
+        tk.Label(
+            badge_frame,
+            text="RECOMMENDED",
+            font=("Arial", 9, "bold"),
+            fg="white",
+            bg="#f39c12",
+        ).pack()
+
+        tk.Label(
+            premium_header,
+            text="PREMIUM",
+            font=plan_title_font,
+            fg="white",
+            bg=premium_color,
+        ).pack()
+        tk.Label(
+            premium_header,
+            text=f"Lifetime Access - {price_text}",
+            font=subtitle_font,
+            fg="#ecf0f1",
+            bg=premium_color,
+        ).pack()
+
+        premium_features_frame = tk.Frame(right_frame, bg="white")
+        premium_features_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
+
+        all_features = [
+            ("All features unlocked", True),
+            ("Cloud backups & sync", True),
+            ("Telegram daily reports", True),
+            ("Priority support", True),
+        ]
+
+        for feature, _ in all_features:
+            feature_frame = tk.Frame(premium_features_frame, bg="white")
+            feature_frame.pack(fill=tk.X, pady=2)
+
+            tk.Label(
+                feature_frame,
+                text="✓",
+                font=("Arial", 10, "bold"),
+                fg="#27ae60",
+                bg="white",
+                width=3,
+            ).pack(side=tk.LEFT)
+            tk.Label(
+                feature_frame,
+                text=feature,
+                font=feature_font,
+                fg="#2c3e50",
+                bg="white",
+                anchor="w",
+            ).pack(side=tk.LEFT, fill=tk.X)
+
+        # Buttons
+        button_frame = tk.Frame(popup, bg=bg_color)
+        button_frame.pack(fill=tk.X, padx=30, pady=15)
+
+        def on_trial_click():
+            response_var.set(True)
+            popup.destroy()
+
+        def on_premium_click():
+            response_var.set(False)
+            popup.destroy()
+
+        trial_button = tk.Button(
+            button_frame,
+            text="Start 7-Day Free Trial",
+            font=button_font,
+            bg=free_color,
+            fg="white",
+            activebackground="#7f8c8d",
+            activeforeground="white",
+            relief=tk.RAISED,
+            bd=2,
+            padx=20,
+            pady=10,
+            cursor="hand2",
+            command=on_trial_click,
+        )
+        trial_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=10)
+
+        premium_button = tk.Button(
+            button_frame,
+            text=f"Get Premium ({price_text})",
+            font=button_font,
+            bg=premium_color,
+            fg="white",
+            activebackground="#229954",
+            activeforeground="white",
+            relief=tk.RAISED,
+            bd=2,
+            padx=20,
+            pady=10,
+            cursor="hand2",
+            command=on_premium_click,
+        )
+        premium_button.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=10)
+
+        # Note
+        if referral_applied:
+            note_text = "Note: Your referral code is applied! You'll save ₹150 on Premium!"
+        else:
+            note_text = "Note: During the 7-day trial, you'll have access to ALL Premium features!"
+
+        note_label = tk.Label(
+            popup,
+            text=note_text,
+            font=("Arial", 9, "italic"),
+            fg="#7f8c8d",
+            bg=bg_color,
+        )
+        note_label.pack(pady=3)
+
+        # Don't allow closing this window with X (user must choose)
+        popup.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        popup.wait_window()
+
+        response = response_var.get()
+
+        if response:
+            # User chose trial
+            if not user_profile.get("uid"):
+                user_profile = _create_default_profile()
+
+            print("[TRIAL] Starting trial from repeat popup - please wait.")
+            success, message = self.trial_manager.start_trial(user_profile)
+
+            if success:
+                print("[TRIAL] Trial started successfully (repeat popup)")
+                import time
+
+                time.sleep(1)
+
+                messagebox.showinfo("Trial Started", message)
+
+                self._validation_completed = True
+                self._start_trial_validation()
+                return
+            else:
+                # ✅ Trial start failed - check if it was due to tampering
+                if user_profile.get("trial_tampered"):
+                    # Tampered - show payment without skip
+                    messagebox.showerror("Trial Not Available", message)
+
+                    self.hide_title_bar_for_non_premium()
+                    self.disable_communication_features_for_non_premium()
+                    self.hide_live_tab_elements_for_non_premium()
+
+                    self._show_payment_wizard_no_skip()
+                else:
+                    # Other error - show payment with skip
+                    messagebox.showerror("Trial Error", message)
+                    self._show_payment_wizard()
+                return
+        else:
+            # User chose premium
+            self._show_payment_wizard()
+            return
     
     def _show_payment_wizard_with_license_ready(self):
         """Show payment wizard with license activation button already enabled"""
