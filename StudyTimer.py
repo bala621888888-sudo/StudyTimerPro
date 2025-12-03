@@ -30226,21 +30226,10 @@ class StudyTimerApp(tk.Tk):
 
             new_schedule = self.schedule.copy()
 
-            # Shift previous session's end time if start changed
-            if idx > 0 and new_start_time != old_start_time:
-                shift = datetime.combine(date.today(), new_start_time) - datetime.combine(date.today(), old_start_time)
+            # 🔕 Adjust-previous-session popup & logic removed.
+            # We no longer change any previous session when editing this one.
 
-                confirm = messagebox.askyesno(
-                    "Adjust Previous Session?",
-                    f"You changed the start time of session {idx + 1}.\nDo you want to adjust end time of session {idx} by same difference?"
-                )
-                if confirm:
-                    prev_name, prev_start, prev_end, prev_break = new_schedule[idx - 1]
-                    prev_end_dt = datetime.combine(date.today(), parse_time(prev_end)) + shift
-                    prev_end_str = prev_end_dt.strftime("%H:%M")
-                    new_schedule[idx - 1] = (prev_name, prev_start, prev_end_str, prev_break)
-
-            # Shift future sessions if end changed
+            # Shift future sessions if end changed (currently disabled)
             if new_end_time != old_end_time:
                 pass
 
@@ -30255,10 +30244,7 @@ class StudyTimerApp(tk.Tk):
 
         self.session_popup(idx, on_save=after_edit_callback)
         self.auto_save_plan()
-
     
-
-
     def show_session_history(self):
         # Load history data
         history = []
@@ -32288,6 +32274,44 @@ class StudyTimerApp(tk.Tk):
                     tree.focus('')
 
         self.plan_tab.bind("<Button-1>", parent_click_handler, add="+")
+
+        # ===============================
+        # Right-click context menu on sessions
+        # ===============================
+        def show_plan_tree_menu(event):
+            # Only open menu if right-clicked on a row/cell
+            region = self.plan_tree.identify("region", event.x, event.y)
+            if region not in ("tree", "cell"):
+                return
+
+            row_id = self.plan_tree.identify_row(event.y)
+            if row_id:
+                # Select the row under cursor before action
+                self.plan_tree.selection_set(row_id)
+                self.plan_tree.focus(row_id)
+
+            try:
+                self.plan_tree_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.plan_tree_menu.grab_release()
+
+        # Create context menu only once
+        self.plan_tree_menu = tk.Menu(self.plan_tree, tearoff=0)
+        self.plan_tree_menu.add_command(
+            label="Add Session",
+            command=self.add_session
+        )
+        self.plan_tree_menu.add_command(
+            label="Edit Session",
+            command=self.edit_session
+        )
+        self.plan_tree_menu.add_command(
+            label="Delete Session",
+            command=self.delete_session
+        )
+
+        # Bind right-click (Button-3) to open menu
+        self.plan_tree.bind("<Button-3>", show_plan_tree_menu)
 
         self.selection_overlay = None
 
