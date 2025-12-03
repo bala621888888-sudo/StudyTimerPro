@@ -16826,17 +16826,92 @@ class StudyTimerApp(tk.Tk):
             menu.grab_release()
 
 
+    def _prompt_material_inclusion(self):
+        """Ask whether to include study materials during export.
+
+        Returns True/False if confirmed, or None if the user cancelled.
+        """
+        dialog = tk.Toplevel(self)
+        dialog.title("Export Options")
+        dialog.geometry("360x180")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        dialog.configure(bg="#f8f9fa")
+
+        tk.Label(dialog,
+                 text="Include study materials?",
+                 font=("Segoe UI", 12, "bold"),
+                 bg="#f8f9fa", fg="#2c3e50").pack(pady=(15, 5))
+
+        include_var = tk.BooleanVar(value=True)
+        chk = tk.Checkbutton(dialog,
+                             text="Export study materials (second column)",
+                             variable=include_var,
+                             font=("Segoe UI", 10),
+                             bg="#f8f9fa")
+        chk.pack(pady=(0, 10))
+
+        result = {"value": None}
+
+        def on_confirm():
+            result["value"] = include_var.get()
+            dialog.grab_release()
+            dialog.destroy()
+
+        def on_cancel():
+            result["value"] = None
+            dialog.grab_release()
+            dialog.destroy()
+
+        btn_frame = tk.Frame(dialog, bg="#f8f9fa")
+        btn_frame.pack(pady=(5, 15))
+
+        tk.Button(btn_frame, text="Cancel", command=on_cancel,
+                  font=("Segoe UI", 10), bg="#ecf0f1", fg="#2c3e50",
+                  relief="flat", padx=16, pady=6, cursor="hand2").pack(side="left", padx=6)
+
+        tk.Button(btn_frame, text="Export", command=on_confirm,
+                  font=("Segoe UI", 10, "bold"), bg="#27ae60", fg="white",
+                  relief="flat", padx=20, pady=6, cursor="hand2").pack(side="left", padx=6)
+
+        dialog.bind('<Escape>', lambda e: on_cancel())
+        dialog.wait_window()
+        return result["value"]
+
+    def _collect_plan_materials(self, plan_name: str):
+        """Return study materials for the given plan from session_materials.json."""
+        from config_paths import app_paths
+
+        materials_file = Path(app_paths.appdata_dir) / "session_materials.json"
+        if not materials_file.exists():
+            return {}
+
+        try:
+            materials = json.loads(materials_file.read_text(encoding="utf-8"))
+            prefix = f"{plan_name}_"
+            return {k: v for k, v in materials.items() if k.startswith(prefix)}
+        except Exception as e:
+            print(f"⚠ Failed to collect study materials: {e}")
+            return {}
+
+
     # 🆕 EXPORT PLAN - SAVE LOCALLY
     def export_plan_local(self, plan_name):
         """Export a plan to a JSON file on the local system."""
         from tkinter import filedialog, messagebox
         import json
         from datetime import datetime
-        
+
         if plan_name not in self.plans:
             messagebox.showerror("Export Error", f"Plan '{plan_name}' not found.")
             return
-        
+
+        include_materials = self._prompt_material_inclusion()
+        if include_materials is None:
+            return
+
         # Ask user where to save
         default_filename = f"{plan_name}_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         
@@ -16851,12 +16926,16 @@ class StudyTimerApp(tk.Tk):
             return  # User cancelled
         
         try:
+            materials = self._collect_plan_materials(plan_name) if include_materials else {}
+            
             # Create export data
             export_data = {
                 "plan_name": plan_name,
                 "exported_at": datetime.now().isoformat(),
                 "sessions": self.plans[plan_name],
-                "version": "1.0"
+                "version": "1.1",
+                "study_materials": materials,
+                "materials_included": include_materials
             }
             
             # Save to file
@@ -16867,9 +16946,10 @@ class StudyTimerApp(tk.Tk):
                 "Export Successful",
                 f"✅ Plan '{plan_name}' exported successfully!\n\n"
                 f"📁 Location: {filepath}\n"
-                f"📊 Sessions: {len(self.plans[plan_name])}"
+                f"📊 Sessions: {len(self.plans[plan_name])}\n"
+                f"📚 Study Materials: {'Included' if materials else 'Not Included'}"
             )
-            
+
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export plan:\n{e}")
 
@@ -16888,7 +16968,11 @@ class StudyTimerApp(tk.Tk):
         if plan_name not in self.plans:
             messagebox.showerror("Export Error", f"Plan '{plan_name}' not found.")
             return
-        
+
+        include_materials = self._prompt_material_inclusion()
+        if include_materials is None:
+            return
+
         try:
             # 🔐 Get credentials from secrets and profile
             from secrets_util import get_secret
@@ -16951,7 +17035,9 @@ class StudyTimerApp(tk.Tk):
                 "exported_at": datetime.now().isoformat(),
                 "sessions": self.plans[plan_name],
                 "session_count": len(self.plans[plan_name]),
-                "version": "1.0"
+                "version": "1.1",
+                "study_materials": self._collect_plan_materials(plan_name) if include_materials else {},
+                "materials_included": include_materials,
             }
             
             # Create temporary JSON file
@@ -16981,6 +17067,7 @@ class StudyTimerApp(tk.Tk):
                                 f"📚 Study Plan Backup\n\n"
                                 f"📋 Plan: {plan_name}\n"
                                 f"📊 Sessions: {len(self.plans[plan_name])}\n"
+                                f"📚 Materials: {'Included' if include_materials else 'Not Included'}\n"
                                 f"📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                             )
                         }
@@ -17003,6 +17090,7 @@ class StudyTimerApp(tk.Tk):
                             "Success",
                             f"✅ Plan '{plan_name}' sent to Telegram!\n\n"
                             f"📊 Sessions: {len(self.plans[plan_name])}\n"
+                            f"📚 Materials: {'Included' if include_materials else 'Not Included'}\n"
                             f"📱 Check your Telegram for the backup file."
                         ))
                     else:
@@ -17073,6 +17161,8 @@ class StudyTimerApp(tk.Tk):
             
             plan_name = import_data["plan_name"]
             sessions = import_data["sessions"]
+            original_plan_name = plan_name
+            imported_materials = import_data.get("study_materials", {}) or {}
             
             # Check if plan already exists
             if plan_name in self.plans:
@@ -17105,7 +17195,34 @@ class StudyTimerApp(tk.Tk):
                     while plan_name in self.plans:
                         plan_name = f"{original_name}_{counter}"
                         counter += 1
-            
+
+            # Merge study materials with updated plan name
+            materials_imported = 0
+            if imported_materials:
+                try:
+                    from config_paths import app_paths
+
+                    adjusted_materials = {}
+                    for key, value in imported_materials.items():
+                        if plan_name != original_plan_name and key.startswith(f"{original_plan_name}_"):
+                            new_key = f"{plan_name}_{key[len(original_plan_name)+1:]}"
+                        else:
+                            new_key = key if key.startswith(f"{plan_name}_") else f"{plan_name}_{key}"
+                        adjusted_materials[new_key] = value
+
+                    materials_file = Path(app_paths.appdata_dir) / "session_materials.json"
+                    if materials_file.exists():
+                        materials = json.loads(materials_file.read_text(encoding="utf-8"))
+                    else:
+                        materials = {}
+
+                    materials.update(adjusted_materials)
+                    materials_file.parent.mkdir(parents=True, exist_ok=True)
+                    materials_file.write_text(json.dumps(materials, indent=2, ensure_ascii=False), encoding="utf-8")
+                    materials_imported = len(adjusted_materials)
+                except Exception as e:
+                    print(f"⚠ Failed to import study materials: {e}")
+
             # Import the plan
             self.plans[plan_name] = sessions
             save_all_plans(self.plans)
@@ -17131,9 +17248,10 @@ class StudyTimerApp(tk.Tk):
                 f"✅ Plan imported successfully!\n\n"
                 f"📚 Plan Name: {plan_name}\n"
                 f"📊 Sessions: {len(sessions)}\n"
+                f"📚 Study Materials: {materials_imported if imported_materials else 'Not included'}\n"
                 f"📅 Exported: {import_data.get('exported_at', 'Unknown')}"
             )
-            
+
         except json.JSONDecodeError:
             messagebox.showerror("Invalid File", "The selected file is not a valid JSON file.")
         except Exception as e:
