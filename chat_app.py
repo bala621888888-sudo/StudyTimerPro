@@ -1873,18 +1873,84 @@ class FirebaseDatabase:
             return False
 
     def add_member_to_group(self, group_id, user_id, username, is_admin=False):
-        """Add member to a specific group"""
-        url = f"{self.database_url}/groups/{group_id}/members/{user_id}.json?auth={self.auth_token}"
+        """Add member to a specific group, with debug + retry + fallback."""
         member_data = {
             "username": username,
             "joined_at": int(time.time() * 1000),
-            "is_admin": is_admin
+            "is_admin": is_admin,
         }
-        
+
+        def _make_member_url(token):
+            return f"{self.database_url}/groups/{group_id}/members/{user_id}.json?auth={token}"
+
         try:
-            response = requests.put(url, json=member_data)
-            return response.status_code == 200
-        except:
+            # --- 1) First attempt: direct PUT ---
+            url = _make_member_url(self.auth_token)
+            print(f"[DEBUG] add_member_to_group → PUT {url}")
+            try:
+                response = requests.put(url, json=member_data, timeout=10)
+                status = response.status_code
+                body_preview = (response.text or "")[:200]
+                print(f"[DEBUG] add_member_to_group status={status}, body={body_preview!r}")
+            except Exception as e:
+                print(f"[DEBUG] add_member_to_group PUT exception: {e}")
+                status = None
+
+            # --- 2) If unauthorized, try to refresh ID token and retry once ---
+            if status == 401:
+                try:
+                    print("[DEBUG] add_member_to_group: got 401, trying token refresh...")
+                    # use global auth object if available
+                    try:
+                        global auth  # type: ignore[name-defined]
+                    except Exception:
+                        auth = None  # just in case
+
+                    if auth is not None and hasattr(auth, "refresh_id_token"):
+                        if auth.refresh_id_token():
+                            self.auth_token = auth.id_token
+                            url = _make_member_url(self.auth_token)
+                            print(f"[DEBUG] add_member_to_group retry → PUT {url}")
+                            response = requests.put(url, json=member_data, timeout=10)
+                            status = response.status_code
+                            body_preview = (response.text or "")[:200]
+                            print(f"[DEBUG] retry status={status}, body={body_preview!r}")
+                        else:
+                            print("[DEBUG] add_member_to_group: token refresh failed (refresh_id_token returned False)")
+                    else:
+                        print("[DEBUG] add_member_to_group: no auth object to refresh token")
+                except Exception as e:
+                    print(f"[DEBUG] token refresh failed in add_member_to_group: {e}")
+
+            # --- 3) Fallback: PATCH members node if status is not 200 ---
+            if status != 200:
+                try:
+                    fallback_url = f"{self.database_url}/groups/{group_id}/members.json?auth={self.auth_token}"
+                    print(f"[DEBUG] add_member_to_group fallback → PATCH {fallback_url}")
+                    patch_payload = {user_id: member_data}
+                    response2 = requests.patch(fallback_url, json=patch_payload, timeout=10)
+                    status2 = response2.status_code
+                    body_preview2 = (response2.text or "")[:200]
+                    print(f"[DEBUG] fallback status={status2}, body={body_preview2!r}")
+                    status = status2
+                except Exception as e:
+                    print(f"[DEBUG] add_member_to_group fallback PATCH exception: {e}")
+
+            # --- 4) Final verification: read members and check if we are inside ---
+            try:
+                members = self.get_group_members_by_id(group_id) or []
+                is_member = any(m.get("id") == user_id for m in members)
+                print(f"[DEBUG] add_member_to_group final membership check → is_member={is_member}")
+                if is_member:
+                    return True
+            except Exception as e:
+                print(f"[DEBUG] add_member_to_group membership check failed: {e}")
+
+            # If we reach here, we didn't become member
+            return False
+
+        except Exception as e:
+            print(f"[DEBUG] add_member_to_group outer exception: {e}")
             return False
 
     def remove_member_from_group(self, group_id, user_id):
@@ -3893,7 +3959,7 @@ def main(page: ft.Page):
             if current_tab > 0 and activate_tab_ref.get("fn"):
                 # Go back to first tab (Promoter)
                 print(f"[BACK] On tab {current_tab}, going to tab 0")
-                activate_tab_ref["fn"](0)
+                activate_tab_ref
                 return True
         except Exception as tab_ex:
             print(f"[BACK] Tab check error: {tab_ex}")
@@ -3924,6 +3990,28 @@ def main(page: ft.Page):
         lambda e: handle_back_navigation(e) if e.key == "Escape" else None
     )
 
+    # 🔴 NEW: Intercept Android hardware back via root View
+    try:
+        if page.views and len(page.views) > 0:
+            root_view = page.views[0]
+
+            # Prevent automatic pop of root view on back
+            root_view.can_pop = False
+
+            def on_root_confirm_pop(e):
+                print("[BACK] root_view.on_confirm_pop called")
+                handled = handle_back_navigation(None)
+
+                # If we handled navigation (went back / showed snackbar),
+                # don't close the app. If we didn't handle (second back),
+                # allow the root view to be popped (app closes).
+                root_view.confirm_pop(not handled)
+
+            root_view.on_confirm_pop = on_root_confirm_pop
+            print("[BACK] Root view back handler registered")
+    except Exception as ex:
+        print(f"[BACK] Root view back setup error: {ex}")
+
     # Android hardware back button support
     try:
         page.window_prevent_close = True
@@ -3939,7 +4027,7 @@ def main(page: ft.Page):
         
         page.on_window_event = on_window_event
         
-        # ✅ NEW: Handle Android back button specifically
+        # ✅ Optional: Android-specific back handler (may or may not fire)
         if hasattr(page, 'on_back_button'):
             def on_android_back(e):
                 print("[BACK] Android back button pressed")
@@ -5664,7 +5752,7 @@ def main(page: ft.Page):
 
                 if not messages:
                     group_messages_list.controls.append(
-                        ft.Container(content=ft.Text("No messages yet. Start the conversation!"), padding=20)
+                        ft.Container(content=ft.Text(""), padding=20)
                     )
                 else:
                     for msg in messages:
@@ -7284,22 +7372,43 @@ def main(page: ft.Page):
                                 category = (group.get("category") or "").strip()
                                 group_name = group.get("name", gid or "Group")
 
-                                print(f"   Checking group: {group_name}, category: {category}")
+                                # 🟤 Treat group as Bronze if EITHER category OR name contains "bronze"
+                                cat_lower = category.lower()
+                                name_lower = str(group_name).lower()
+                                is_bronze_group = ("bronze" in cat_lower) or ("bronze" in name_lower)
 
-                                if gid and "bronze" in category.lower():
+                                print(
+                                    f"   Checking group: {group_name}, "
+                                    f"category: {category}, is_bronze={is_bronze_group}"
+                                )
+
+                                if gid and is_bronze_group:
+                                    # Normalize members structure safely
                                     members = group.get("members", {}) or {}
-                                    member_info = members.get(auth.user_id, {}) if members else {}
 
-                                    # Add missing joined_at for existing members to hide old messages
-                                    needs_join = auth.user_id not in members
-                                    needs_joined_at = not needs_join and not member_info.get("joined_at")
+                                    if isinstance(members, dict):
+                                        raw_member_info = members.get(auth.user_id)
+                                        member_info = raw_member_info if isinstance(raw_member_info, dict) else {}
+                                        needs_join = auth.user_id not in members
+                                    else:
+                                        # Unexpected structure, just treat as not joined
+                                        member_info = {}
+                                        needs_join = True
+
+                                    # Need a fresh joined_at to hide OLD messages
+                                    if not needs_join and isinstance(member_info, dict):
+                                        needs_joined_at = not bool(member_info.get("joined_at"))
+                                    else:
+                                        needs_joined_at = False
 
                                     if needs_join or needs_joined_at:
                                         joined = db.add_member_to_group(
                                             gid,
                                             auth.user_id,
                                             current_username,
-                                            is_admin=member_info.get("is_admin", False),
+                                            is_admin=member_info.get("is_admin", False)
+                                            if isinstance(member_info, dict)
+                                            else False,
                                         )
                                         print(f"   Join attempt for {group_name}: status {joined}")
 
@@ -7318,6 +7427,15 @@ def main(page: ft.Page):
                             show_snackbar(f"🎉 Joined {joined_count} Bronze group(s)!")
                         else:
                             print("ℹ️ No Bronze category groups found to join")
+                            
+                        # 🔁 Refresh groups cache so lock icon updates correctly
+                        try:
+                            updated_groups = db.get_all_groups() or []
+                            CacheManager.save_to_cache("groups", updated_groups)
+                            print("🔁 Refreshed groups cache after Bronze auto-join")
+                        except Exception as cache_err:
+                            print(f"⚠ Could not refresh groups cache: {cache_err}")    
+                            
                     except Exception as e:
                         print(f"⚠️ Error auto-joining Bronze groups: {e}")
                         import traceback
@@ -10443,7 +10561,7 @@ def main(page: ft.Page):
                 if not messages:
                     if chat_status != "pending" or chat_requester == auth.user_id:
                         messages_list.controls.append(
-                            ft.Container(content=ft.Text("No messages yet. Start the conversation!"), padding=20)
+                            ft.Container(content=ft.Text(""), padding=20)
                         )
                 else:
                     for msg in messages:
