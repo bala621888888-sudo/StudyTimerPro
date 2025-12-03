@@ -1,4 +1,4 @@
-# secrets_util.py - OPTIMIZED FOR FAST APP STARTUP
+# secrets_util.py - OPTIMIZED FOR FAST APP STARTUP + APP_CONFIG_ALL BUNDLE
 import json
 import os
 import sys
@@ -37,6 +37,10 @@ _gspread_client_cache = None
 _secret_client = None
 _secret_cache = {}
 
+# ✅ New: bundle secret config
+BUNDLE_SECRET_ID = "APP_CONFIG_ALL"
+_config_bundle = None
+
 # ✅ FAST internet check - non-blocking
 def internet_available():
     """Quick check without blocking"""
@@ -51,7 +55,7 @@ def internet_available():
 # ⚡ Check only when needed, not at import time
 def _is_online():
     """Lazy online check"""
-    if not hasattr(_is_online, '_cached'):
+    if not hasattr(_is_online, "_cached"):
         _is_online._cached = internet_available()
     return _is_online._cached
 
@@ -62,60 +66,115 @@ def _get_secret_client():
         secretmanager_v1, Retry = _get_secretmanager()
         _secret_client = secretmanager_v1.SecretManagerServiceClient(
             transport="rest",
-            client_options={"api_endpoint": "https://secretmanager.googleapis.com"}
+            client_options={"api_endpoint": "https://secretmanager.googleapis.com"},
         )
     return _secret_client
 
-# ✅ Fetch secret (Safe: works offline too) - OPTIMIZED
+# ✅ Load APP_CONFIG_ALL once and cache it
+def _load_config_bundle():
+    """Load APP_CONFIG_ALL (JSON) once and cache it."""
+    global _config_bundle
+
+    if _config_bundle is not None:
+        return _config_bundle
+
+    # 1) Try environment variable first (for local dev / overrides)
+    raw = os.getenv(BUNDLE_SECRET_ID)
+    if raw:
+        try:
+            _config_bundle = json.loads(raw)
+            return _config_bundle
+        except Exception as e:
+            # If broken JSON in env, just ignore and fall back to GCP
+            print(f"⚠ Failed to parse {BUNDLE_SECRET_ID} from env: {e}")
+
+    # 2) If offline, we can't pull bundle from Secret Manager
+    if not _is_online():
+        return None
+
+    try:
+        secretmanager_v1, Retry = _get_secretmanager()
+        _NO_RETRY = Retry(
+            initial=0.1,
+            maximum=0.1,
+            multiplier=1.0,
+            deadline=1.0,
+            predicate=lambda exc: False,
+        )
+
+        client = _get_secret_client()
+        name = f"projects/{PROJECT_ID}/secrets/{BUNDLE_SECRET_ID}/versions/latest"
+        response = client.access_secret_version(
+            request={"name": name},
+            timeout=1.0,
+            retry=_NO_RETRY,
+        )
+        value = response.payload.data.decode("utf-8")
+        _config_bundle = json.loads(value)
+        return _config_bundle
+    except Exception as e:
+        print(f"⚠ Failed to load bundle secret {BUNDLE_SECRET_ID}: {e}")
+        return None
+
+# ✅ Fetch secret (Safe: works offline too) - OPTIMIZED + BUNDLE SUPPORT
 def get_secret(secret_id: str):
-    """Get secret with caching - FAST when cached"""
+    """Get secret with caching - FAST when cached and bundle-based."""
     # 1. Check memory cache FIRST (instant!)
     if secret_id in _secret_cache:
         return _secret_cache[secret_id]
-    
+
     # 2. Check local env (also instant!)
     if secret_id in os.environ:
-        _secret_cache[secret_id] = os.environ[secret_id]  # Cache it
-        return os.environ[secret_id]
+        value = os.environ[secret_id]
+        _secret_cache[secret_id] = value
+        return value
 
-    # 3. Only try Secret Manager if online AND not cached
+    # 3. Try APP_CONFIG_ALL bundle (for most keys)
+    bundle = _load_config_bundle()
+    if bundle and secret_id in bundle:
+        value = str(bundle[secret_id])
+        _secret_cache[secret_id] = value
+        os.environ[secret_id] = value  # cache through restarts if same process
+        return value
+
+    # 4. Only try individual Secret Manager secret if online
     if not _is_online():
         return os.getenv(secret_id)
 
     try:
         secretmanager_v1, Retry = _get_secretmanager()
-        
-        # ⚡ No retry and very short timeout
         _NO_RETRY = Retry(
-            initial=0.1, maximum=0.1, multiplier=1.0,
-            deadline=1.0,  # Reduced from 2.0 to 1.0 second
-            predicate=lambda exc: False
+            initial=0.1,
+            maximum=0.1,
+            multiplier=1.0,
+            deadline=1.0,  # Only wait 1 second
+            predicate=lambda exc: False,
         )
-        
+
         client = _get_secret_client()
         name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
         response = client.access_secret_version(
             request={"name": name},
             timeout=1.0,  # Only wait 1 second
-            retry=_NO_RETRY
+            retry=_NO_RETRY,
         )
         value = response.payload.data.decode("utf-8").strip()
-        
+
         # Save for future (instant next time!)
         _secret_cache[secret_id] = value
         os.environ[secret_id] = value
-        
+
         return value
 
-    except Exception as e:
-        # Silently fail and use environment variable
+    except Exception:
+        # Silently fail and use environment variable as last resort
         return os.getenv(secret_id)
 
 # ✅ GSpread init - OPTIMIZED
 def get_encrypted_gspread_client():
     """Get gspread client from GCP_GSHEET_CREDS or fallback (cached)."""
     global _gspread_client_cache
-    
+
     # Return cached immediately!
     if _gspread_client_cache:
         return _gspread_client_cache
@@ -123,27 +182,29 @@ def get_encrypted_gspread_client():
     try:
         # 1. Try environment variable FIRST (instant!)
         raw = os.getenv("GCP_GSHEET_CREDS")
-        
+
         # 2. Only try Secret Manager if env var not found AND online
         if not raw and _is_online():
             raw = get_secret("GCP_GSHEET_CREDS")
-        
+
         if raw:
             info = json.loads(raw)
             scope = [
                 "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive"
+                "https://www.googleapis.com/auth/drive",
             ]
             creds = Credentials.from_service_account_info(info, scopes=scope)
             _gspread_client_cache = gspread.authorize(creds)
             return _gspread_client_cache
 
         # 3. Old encrypted creds fallback
-        encryption_key = os.getenv('ENCRYPTION_KEY')
-        encrypted_creds = os.getenv('ENCRYPTED_CREDENTIALS')
+        encryption_key = os.getenv("ENCRYPTION_KEY")
+        encrypted_creds = os.getenv("ENCRYPTED_CREDENTIALS")
         if encryption_key and encrypted_creds:
             f = Fernet(encryption_key.encode())
-            creds_dict = json.loads(f.decrypt(encrypted_creds.encode()).decode())
+            creds_dict = json.loads(
+                f.decrypt(encrypted_creds.encode()).decode()
+            )
             _gspread_client_cache = gspread.service_account_from_dict(creds_dict)
             return _gspread_client_cache
 
@@ -155,5 +216,5 @@ def get_encrypted_gspread_client():
 
         return None
 
-    except Exception as e:
+    except Exception:
         return None

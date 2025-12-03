@@ -30,6 +30,79 @@ _gspread_client_cache = None
 _secret_client = None
 _secret_cache = {}
 
+BUNDLE_SECRET_ID = "APP_CONFIG_ALL"
+_config_bundle = None
+
+def _load_config_bundle():
+    global _config_bundle
+    if _config_bundle is not None:
+        return _config_bundle
+
+    raw = os.getenv(BUNDLE_SECRET_ID)
+    if raw:
+        try:
+            _config_bundle = json.loads(raw)
+            return _config_bundle
+        except Exception as e:
+            print(f"⚠ Failed to parse {BUNDLE_SECRET_ID} from env: {e}")
+
+    if not ONLINE:
+        return None
+
+    try:
+        client = _get_secret_client()
+        name = f"projects/{PROJECT_ID}/secrets/{BUNDLE_SECRET_ID}/versions/latest"
+        response = client.access_secret_version(
+            request={"name": name},
+            timeout=2.0,
+            retry=_NO_RETRY,
+        )
+        value = response.payload.data.decode("utf-8")
+        _config_bundle = json.loads(value)
+        return _config_bundle
+    except Exception as e:
+        print(f"⚠ Failed to load bundle secret {BUNDLE_SECRET_ID}: {e}")
+        return None
+
+
+def get_secret(secret_id: str):
+    # 1) Env var
+    if secret_id in os.environ:
+        return os.environ[secret_id]
+
+    # 2) In-memory cache
+    if secret_id in _secret_cache:
+        return _secret_cache[secret_id]
+
+    # 3) Try APP_CONFIG_ALL bundle
+    bundle = _load_config_bundle()
+    if bundle and secret_id in bundle:
+        value = str(bundle[secret_id])
+        _secret_cache[secret_id] = value
+        os.environ[secret_id] = value
+        return value
+
+    # 4) Fallback – individual Secret Manager secret
+    if not ONLINE:
+        return os.getenv(secret_id)
+
+    try:
+        client = _get_secret_client()
+        name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
+        response = client.access_secret_version(
+            request={"name": name},
+            timeout=2.0,
+            retry=_NO_RETRY,
+        )
+        value = response.payload.data.decode("utf-8").strip()
+        _secret_cache[secret_id] = value
+        os.environ[secret_id] = value
+        return value
+
+    except Exception as e:
+        print(f"⚠ Failed to fetch secret {secret_id}: {type(e)._name_}: {e}")
+        return os.getenv(secret_id)
+
 # ✅ Check internet once globally
 def internet_available():
     try:
@@ -56,39 +129,6 @@ def _get_secret_client():
             client_options={"api_endpoint": "https://secretmanager.googleapis.com"}
         )
     return _secret_client
-
-# ✅ Fetch secret (Safe: works offline too)
-def get_secret(secret_id: str):
-    # 1. Check local env first (survives restarts)
-    if secret_id in os.environ:
-        return os.environ[secret_id]
-
-    # 2. Check memory cache (within same session)
-    if secret_id in _secret_cache:
-        return _secret_cache[secret_id]
-
-    if not ONLINE:
-        return os.getenv(secret_id)
-
-    try:
-        client = _get_secret_client()
-        name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
-        response = client.access_secret_version(
-            request={"name": name},
-            timeout=2.0,
-            retry=_NO_RETRY
-        )
-        value = response.payload.data.decode("utf-8").strip()
-        
-        # Save for future
-        _secret_cache[secret_id] = value
-        os.environ[secret_id] = value  # 🔥 PERSIST CACHE THROUGH RESTARTS
-        
-        return value
-
-    except Exception as e:
-        print(f"⚠ Failed to fetch secret {secret_id}: {type(e).__name__}: {e}")
-        return os.getenv(secret_id)
 
 # ✅ GSpread init (already existed)
 def get_encrypted_gspread_client():
