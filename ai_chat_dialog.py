@@ -43,13 +43,21 @@ def _pick_emoji_font(size: int):
                 continue
     return None
 
-def render_emoji_photoimage(emoji_text: str, size: int = 20) -> ImageTk.PhotoImage:
-    pad_x = int(size * 0.25)
-    pad_y = int(size * 0.35)
+# PATCH: Fix emoji vertical alignment in render_emoji_photoimage
+
+def render_emoji_photoimage(emoji_text: str, size: int = 16) -> ImageTk.PhotoImage:
+    """Render emoji with proper baseline alignment"""
+    # Increase height to prevent cutoff
+    pad_x = int(size * 0.2)
+    pad_y = int(size * 0.5)  # More bottom padding
+    
     img = Image.new("RGBA", (size + pad_x, size + pad_y), (255, 255, 255, 0))
     draw = ImageDraw.Draw(img)
-    font = _pick_emoji_font(int(size * 0.95)) or ImageFont.load_default()
-    draw.text((pad_x // 2, pad_y // 4), emoji_text, font=font, embedded_color=True)
+    font = _pick_emoji_font(int(size * 0.85)) or ImageFont.load_default()
+    
+    # Move emoji DOWN to align with text baseline
+    draw.text((pad_x // 2, pad_y // 2), emoji_text, font=font, embedded_color=True)
+    
     return ImageTk.PhotoImage(img)
 
 def _iter_emoji_spans(text: str):
@@ -199,6 +207,147 @@ class AIChatDialog(tk.Toplevel):
 
         self._build_modern_ui()
         self._ensure_files_exist()
+        
+    def _show_plan_created_splash(self, plan_count, plan_names):
+        """
+        Show success splash inside the plan tab after plans are created.
+        Offers: Return to Plans Tab OR Continue Creating
+        """
+        # ✅ Create overlay frame on top of plan tab
+        self.splash_overlay = tk.Frame(self.plan_tab, bg="#f8f9fa")
+        self.splash_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        
+        # Center content frame
+        center_frame = tk.Frame(self.splash_overlay, bg="#f8f9fa")
+        center_frame.place(relx=0.5, rely=0.45, anchor="center")
+        
+        # ✅ Success checkmark
+        success_icon = tk.Label(
+            center_frame,
+            text="✅",
+            font=("Segoe UI Emoji", 64),
+            bg="#f8f9fa"
+        )
+        success_icon.pack(pady=(0, 20))
+        
+        # ✅ Success title
+        title_label = tk.Label(
+            center_frame,
+            text="Plans Created Successfully!",
+            font=("Segoe UI", 22, "bold"),
+            bg="#f8f9fa",
+            fg="#2e7d32"
+        )
+        title_label.pack(pady=(0, 10))
+        
+        # ✅ Plan details
+        plans_text = "\n".join([f"  📋 {name}" for name in plan_names[:5]])
+        if len(plan_names) > 5:
+            plans_text += f"\n  ... and {len(plan_names) - 5} more"
+        
+        details_label = tk.Label(
+            center_frame,
+            text=f"Created {plan_count} plan(s):\n{plans_text}",
+            font=("Segoe UI", 11),
+            bg="#f8f9fa",
+            fg="#555",
+            justify="left"
+        )
+        details_label.pack(pady=(0, 30))
+        
+        # ✅ Buttons container
+        btn_frame = tk.Frame(center_frame, bg="#f8f9fa")
+        btn_frame.pack(pady=(0, 20))
+        
+        def on_return_to_plans():
+            """Close dialog and return to Plans Tab in main app"""
+            self.splash_overlay.destroy()
+            
+            # Close the dialog
+            self.destroy()
+            
+            # Switch to Plans tab in main app
+            if hasattr(self, 'master') and self.master:
+                try:
+                    if hasattr(self.master, 'notebook'):
+                        self.master.notebook.select(0)  # Today's Plan tab
+                except Exception as e:
+                    print(f"⚠ Could not switch tab: {e}")
+        
+        def on_continue():
+            """Stay in dialog to create more plans"""
+            self.splash_overlay.destroy()
+            
+            # Reset for new plan creation
+            self.plan_chat_history = []
+            self.started = False
+            self._waiting_for_hours = False
+            self._study_hours = None
+            self._study_time = None
+            
+            # Clear chat box
+            self.plan_chat_box.config(state=tk.NORMAL)
+            self.plan_chat_box.delete("1.0", tk.END)
+            self.plan_chat_box.config(state=tk.DISABLED)
+            
+            # Start fresh conversation
+            self.after(100, self._auto_start_plan_chat)
+        
+        # ✅ "Return to Plans Tab" button
+        return_btn = tk.Button(
+            btn_frame,
+            text="📋 Return to Plans Tab",
+            font=("Segoe UI", 12, "bold"),
+            bg="#4CAF50",
+            fg="white",
+            relief="flat",
+            bd=0,
+            padx=30,
+            pady=14,
+            cursor="hand2",
+            command=on_return_to_plans
+        )
+        return_btn.pack(side="left", padx=(0, 15))
+        
+        def on_return_enter(e):
+            return_btn.config(bg="#43A047")
+        def on_return_leave(e):
+            return_btn.config(bg="#4CAF50")
+        return_btn.bind("<Enter>", on_return_enter)
+        return_btn.bind("<Leave>", on_return_leave)
+        
+        # ✅ "Continue Creating" button
+        continue_btn = tk.Button(
+            btn_frame,
+            text="➕ Continue Creating",
+            font=("Segoe UI", 12),
+            bg="#2196F3",
+            fg="white",
+            relief="flat",
+            bd=0,
+            padx=30,
+            pady=14,
+            cursor="hand2",
+            command=on_continue
+        )
+        continue_btn.pack(side="left")
+        
+        def on_continue_enter(e):
+            continue_btn.config(bg="#1976D2")
+        def on_continue_leave(e):
+            continue_btn.config(bg="#2196F3")
+        continue_btn.bind("<Enter>", on_continue_enter)
+        continue_btn.bind("<Leave>", on_continue_leave)
+        
+        # ✅ Tip text
+        tip_label = tk.Label(
+            center_frame,
+            text="💡 Your plans are saved and ready to use in the Plans Tab!",
+            font=("Segoe UI", 9),
+            bg="#f8f9fa",
+            fg="#888"
+        )
+        tip_label.pack(pady=(10, 0))
 
     def _ensure_files_exist(self):
         """Ensure all JSON files exist"""
@@ -940,6 +1089,50 @@ class AIChatDialog(tk.Toplevel):
     def _get_exam_name(self, profile):
         return profile.get("exam_name", "Unknown Exam").strip()
 
+    def _is_generic_exam_name(self, exam_name):
+        """Check if exam name is too generic and needs specification."""
+        generic_exams = {
+            "ssc": ["SSC JE", "SSC CHSL", "SSC CGL", "SSC MTS", "SSC CPO", "SSC Stenographer"],
+            "upsc": ["UPSC CSE", "UPSC IAS", "UPSC IPS", "UPSC CDS", "UPSC CAPF", "UPSC NDA"],
+            "bank": ["IBPS PO", "IBPS Clerk", "SBI PO", "SBI Clerk", "RBI Grade B", "NABARD"],
+            "railway": ["RRB NTPC", "RRB JE", "RRB ALP", "RRB Group D", "RRB SSE"],
+            "state": ["TNPSC Group 1", "TNPSC Group 2", "MPSC", "KPSC", "UPPSC"],
+        }
+        
+        exam_lower = exam_name.lower().strip()
+        
+        for category, specific_exams in generic_exams.items():
+            if exam_lower == category or exam_lower == f"{category} exam":
+                return True, category, specific_exams
+        
+        return False, None, None
+
+    def _extract_duration_from_message(self, message):
+        """Extract study duration from user's message if present."""
+        import re
+        
+        message_lower = message.lower()
+        
+        # Pattern 1: "X hours" with timing
+        pattern1 = r'(\d+)\s*(?:hours?|hrs?).*?(\d{1,2})\s*(?:am|pm).*?(?:to|-).*?(\d{1,2})\s*(?:am|pm)'
+        match1 = re.search(pattern1, message_lower)
+        if match1:
+            return match1.group(1), "timing_found"
+        
+        # Pattern 2: Just hours
+        pattern2 = r'(\d+)\s*(?:hours?|hrs?)'
+        match2 = re.search(pattern2, message_lower)
+        if match2:
+            return match2.group(1), None
+        
+        # Pattern 3: Time range only
+        pattern3 = r'(\d{1,2})\s*(?:am|pm).*?(?:to|-).*?(\d{1,2})\s*(?:am|pm)'
+        match3 = re.search(pattern3, message_lower)
+        if match3:
+            return None, "timing_found"
+        
+        return None, None
+
     def _build_exam_syllabus(self, exam_name: str):
         """Return instruction to search for syllabus online"""
         return (
@@ -959,6 +1152,7 @@ class AIChatDialog(tk.Toplevel):
         if lang == "hindi":
             return "Reminder: Always reply in Hinglish (Hindi + English mix) with friendly tone and emojis."
         return f"Reminder: Always reply in {lang}+English mixed style with friendly tone and emojis."
+
 
     def _append_plan_chat(self, who, text):
         """Append message to plan chat box"""
@@ -1094,11 +1288,11 @@ class AIChatDialog(tk.Toplevel):
                 exam_name = self._get_exam_name(profile)
 
                 if language == "tamil":
-                    greeting = "Vanakkam! 👋 Ena doubt iruku? Kelu bro! 🤔📚"
+                    greeting = "Vanakkam! 👋 Ena doubt iruku? Kelu bro! 😎🔥📚"
                 elif language == "hindi":
-                    greeting = "Namaste! 👋 Kya doubt hai? Pucho yaar! 🤔📚"
+                    greeting = "Namaste! 👋 Kya doubt hai? Pucho yaar! 😎🔥📚"
                 else:
-                    greeting = "Hello! 👋 What can I help you with today? 🤔📚"
+                    greeting = "Hello! 👋 What can I help you with today? 😎🔥📚"
 
                 system_prompt = (
                     f"You are an AI study assistant. Help with exam tips, doubt clearing, and problem solving. "
@@ -1132,27 +1326,128 @@ class AIChatDialog(tk.Toplevel):
         return any(word in text for word in confirm_words)
 
     def _ask_study_details(self):
+        """Ask for study details only if not already provided."""
+        duration_found = self._check_duration_in_history()
+        if duration_found:
+            profile = self._load_profile()
+            lang = self._get_language(profile)
+            
+            msg = "✅ Perfect! Plan create panren... ⚡" if lang == "tamil" else "✅ Perfect! Creating your plan... ⚡"
+            
+            self._append_plan_chat("assistant", msg)
+            self._auto_generate_plan()
+            return
+        
         profile = self._load_profile()
         lang = self._get_language(profile)
         
         if lang == "tamil":
-            msg = "Seri bro! 💪 Evlo hours padika mudiyum and enna time la? (Example: 4 hours 6am to 10am) 📚⏰"
+            msg = "Seri bro! 💪 Evlo hours padika mudiyum and enna time la?\n\n📝 Example formats:\n  • 4 hours 6am to 10am\n  • 6am to 10am\n  • 3 hours\n\nType pannu! 📚⏰"
         elif lang == "hindi":
-            msg = "Thik hai! 💪 Kitne hours aur kab? (Example: 4 hours 6am se 10pm) 📚⏰"
+            msg = "Thik hai! 💪 Kitne hours aur kab?\n\n📝 Example formats:\n  • 4 hours 6am se 10am\n  • 6am se 10am\n  • 3 hours\n\nBatao! 📚⏰"
         else:
-            msg = "Great! 💪 How many hours and when? (e.g., 4 hours 6am to 10pm) 📚⏰"
+            msg = "Great! 💪 How many hours and when?\n\n📝 Example formats:\n  • 4 hours 6am to 10am\n  • 6am to 10am\n  • 3 hours\n\nTell me! 📚⏰"
         
         self._append_plan_chat("assistant", msg)
         self._waiting_for_hours = True
+        
+    def _ask_specific_exam_type(self, category, options):
+        """Ask user to specify exact exam type."""
+        profile = self._load_profile()
+        lang = self._get_language(profile)
+        
+        options_text = "\n".join([f"  • {opt}" for opt in options])
+        
+        if lang == "tamil":
+            msg = f"😎 '{category.upper()}' la evalo types iruku bro!\n\nExact ah enna exam ku prepare panringa?\n\n{options_text}\n\nType pannu! 👇"
+        elif lang == "hindi":
+            msg = f"😎 '{category.upper()}' mein bahut types hain bhai!\n\nExactly kaunsa exam ke liye prepare kar rahe ho?\n\n{options_text}\n\nBatao! 👇"
+        else:
+            msg = f"😎 I see you're preparing for {category.upper()}, but which specific exam?\n\nPlease choose:\n{options_text}\n\nType the exact exam name! 👇"
+        
+        self._append_plan_chat("assistant", msg)
+        self._waiting_for_exam_type = True
+        self._exam_category = category
+        self._exam_options = options
+
+    def _handle_exam_type_selection(self, user_msg):
+        """Process user's exam type selection."""
+        profile = self._load_profile()
+        lang = self._get_language(profile)
+        
+        user_lower = user_msg.lower().strip()
+        best_match = None
+        
+        for option in self._exam_options:
+            if user_lower in option.lower() or option.lower() in user_lower:
+                best_match = option
+                break
+        
+        if not best_match:
+            for option in self._exam_options:
+                option_words = option.lower().split()
+                if any(word in user_lower for word in option_words if len(word) > 2):
+                    best_match = option
+                    break
+        
+        if best_match:
+            profile['exam_name'] = best_match
+            PROFILE_PATH.write_text(json.dumps(profile, indent=2, ensure_ascii=False), encoding='utf-8')
+            
+            confirm_msg = f"✅ Super! {best_match} exam ku plan create panrom! 💪" if lang == "tamil" else f"✅ Perfect! Creating plan for {best_match}! 💪"
+            
+            self._append_plan_chat("assistant", confirm_msg)
+            self._waiting_for_exam_type = False
+            
+            duration_found = self._check_duration_in_history()
+            if duration_found:
+                self._append_plan_chat("assistant", "Creating your plan now... ⚡")
+                self._auto_generate_plan()
+            else:
+                self._ask_study_details()
+        else:
+            retry_msg = "🤔 Puriyala bro. List la irunthu select pannu please!" if lang == "tamil" else "🤔 I didn't catch that. Please choose from the list above!"
+            self._append_plan_chat("assistant", retry_msg)
+
+    def _check_duration_in_history(self):
+        """Check if user already mentioned duration in chat history."""
+        user_messages = [msg['content'] for msg in self.plan_chat_history if msg['role'] == 'user']
+        
+        for msg in user_messages[-3:]:
+            hours, timing = self._extract_duration_from_message(msg)
+            if hours or timing:
+                self._parse_and_set_duration(msg)
+                return True
+        
+        return False
+
+    def _parse_and_set_duration(self, message):
+        """Parse and set duration from message."""
+        hours, timing = self._parse_study_info_with_ai(message)
+        
+        if hours and timing:
+            self._study_hours = hours
+            self._study_time = timing
+        elif hours and not timing:
+            profile = self._load_profile()
+            lang = self._get_language(profile)
+            
+            time_msg = f"👍 {hours} hours... seri! Enna time la padikanum? (Example: 6am to 10am)" if lang == "tamil" else f"👍 Got the {hours} hours! When will you study? (e.g., 6am to 10am)"
+            
+            self._append_plan_chat("assistant", time_msg)
+            self._waiting_for_hours = True
+            self._study_hours = hours
 
     def _parse_study_info_with_ai(self, user_msg):
+        """Enhanced parser with better handling of various formats."""
         parse_prompt = (
-            f"Extract study hours and timing from: '{user_msg}'\n"
-            "Return ONLY JSON: " + '{"hours": "4", "timing": "06:00-22:00"}\n'
+            f"Extract study hours and timing from: '{user_msg}'\n\n"
+            "Return ONLY JSON: " + '{"hours": "4", "timing": "06:00-22:00"}\n\n'
             "Examples:\n"
-            '- "1pm to 5pm" → {"hours": "4", "timing": "13:00-17:00"}\n'
-            '- "4 hours 6am to 10pm" → {"hours": "4", "timing": "06:00-22:00"}\n'
-            "Return ONLY JSON, no text."
+            '- "4 hours 6am to 10am" → {"hours": "4", "timing": "06:00-22:00"}\n'
+            '- "6am to 10am" → calculate hours → {"hours": "16", "timing": "06:00-22:00"}\n'
+            '- "3 hours" → {"hours": "3", "timing": "not_specified"}\n\n'
+            "Return ONLY JSON."
         )
         
         try:
@@ -1171,8 +1466,14 @@ class AIChatDialog(tk.Toplevel):
             hours = str(parsed.get("hours", ""))
             timing = parsed.get("timing", "")
             
+            if timing == "not_specified" or not timing or "-" not in timing:
+                if hours:
+                    return hours, None
+                return None, None
+            
             if hours and timing and "-" in timing:
                 return hours, timing
+            
             return None, None
                 
         except Exception as e:
@@ -1421,9 +1722,10 @@ NOW CREATE THE PLANS!
                         purpose="explanation"
                     )
                     
-                    self._append_plan_chat("assistant", f"✅ {len(parsed)} plans saved! 📝🔥\n\n{explanation}")
-
-                    # Refresh UI
+                    # ✅ Show explanation in chat
+                    self._append_plan_chat("assistant", f"✅ {len(parsed)} plans created!\n\n{explanation}")
+                    
+                    # ✅ Refresh main app data
                     def refresh():
                         try:
                             if callable(self._on_plans_updated):
@@ -1437,6 +1739,10 @@ NOW CREATE THE PLANS!
                         self.master.after(200, refresh)
                     else:
                         self.after(200, refresh)
+                    
+                    # ✅ Show success splash with options (after short delay)
+                    plan_names = list(parsed.keys())
+                    self.after(800, lambda: self._show_plan_created_splash(len(parsed), plan_names))
 
                 except Exception as e:
                     RAW_FALLBACK.write_text(plan_reply, encoding="utf-8")
@@ -1510,22 +1816,24 @@ NOW CREATE THE PLANS!
             traceback.print_exc()
 
     def _send_plan_message(self):
-        """Handle plan tab messages"""
+        """Handle plan tab messages with exam specificity and smart duration"""
         msg = self.plan_entry.get().strip()
         if not msg or not self.client:
             return
         self.plan_entry.delete(0, tk.END)
         self._append_plan_chat("user", msg)
 
+        # Handle exam type selection
+        if hasattr(self, '_waiting_for_exam_type') and self._waiting_for_exam_type:
+            self._handle_exam_type_selection(msg)
+            return
+
+        # Handle study hours/timing
         if self._waiting_for_hours:
             profile = self._load_profile()
             lang = self._get_language(profile)
             
-            if lang == "tamil":
-                parse_msg = "Wait pannu... ⚡"
-            else:
-                parse_msg = "Processing... ⚡"
-            
+            parse_msg = "Wait pannu... ⚡" if lang == "tamil" else "Processing... ⚡"
             self._append_plan_chat("assistant", parse_msg)
             
             def parse_worker():
@@ -1535,11 +1843,10 @@ NOW CREATE THE PLANS!
                     self._waiting_for_hours = False
                     self._study_hours = hours
                     self._study_time = timing
-                    
                     self._append_plan_chat("assistant", f"✅ {hours}h, {timing}! Creating...")
                     self._auto_generate_plan()
                 else:
-                    self._append_plan_chat("assistant", "Please clarify: like 4 hours 6am to 10pm 😊")
+                    self._append_plan_chat("assistant", "Please clarify: like 4 hours 6am to 10am 😊")
             
             self._with_thread(parse_worker)
             return
@@ -1548,16 +1855,28 @@ NOW CREATE THE PLANS!
             try:
                 self.plan_chat_history.append({"role": "user", "content": msg})
                 profile = self._load_profile()
-                reply = self._chat_complete(
+                reply = self._chat_complete_stream(
                     self.plan_chat_history + [{"role":"system","content": self._get_language_reminder(profile)}],
+                    self.plan_chat_box,
                     session_name="plan_chat",
                     purpose="conversation"
                 )
                 self.plan_chat_history.append({"role": "assistant", "content": reply})
-                self._append_plan_chat("assistant", reply)
 
+                # ✅ NEW: Check exam specificity when user confirms
                 if self._user_confirmed(msg) and not self._waiting_for_hours:
-                    self._ask_study_details()
+                    exam_name = self._get_exam_name(profile)
+                    is_generic, category, options = self._is_generic_exam_name(exam_name)
+                    
+                    if is_generic:
+                        self._ask_specific_exam_type(category, options)
+                    else:
+                        duration_found = self._check_duration_in_history()
+                        if duration_found:
+                            self._append_plan_chat("assistant", "Got it! Creating your plan now... ⚡")
+                            self._auto_generate_plan()
+                        else:
+                            self._ask_study_details()
 
             except Exception as e:
                 self._append_plan_chat("assistant", f"Error: {e}")
@@ -1609,15 +1928,15 @@ NOW CREATE THE PLANS!
                 # Use vision model if image present
                 model = "gpt-4o-mini"
                 
-                reply = self._chat_complete(
+                reply = self._chat_complete_stream(
                     self.query_chat_history,
+                    self.query_chat_box,
                     session_name="query_chat",
                     purpose="query_resolution",
                     model=model
                 )
                 
                 self.query_chat_history.append({"role": "assistant", "content": reply})
-                self._append_query_chat("assistant", reply)
                 
                 # Auto-save after each exchange
                 self._save_current_topic()
@@ -1631,6 +1950,127 @@ NOW CREATE THE PLANS!
                 print(f"Query error: {e}")
                 
         self._with_thread(worker)
+        
+    def _chat_complete_stream(self, messages, chat_box, temperature=0.7, session_name="", purpose="chat", model="gpt-4o-mini"):
+        """Stream chat completion with letter-by-letter display + formatting"""
+        try:
+            # Start streaming response
+            stream = self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                stream=True
+            )
+            
+            full_response = ""
+            buffer = ""
+            
+            # Add "AI Coach" header first
+            self.after(0, lambda: self._start_streaming_message(chat_box))
+            
+            import time
+            
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    token = chunk.choices[0].delta.content
+                    full_response += token
+                    buffer += token
+                    
+                    # Process buffer when we have enough characters or newlines
+                    if len(buffer) >= 3 or '\n' in buffer:  # Changed from 5 to 3
+                        self.after(0, lambda b=buffer: self._append_streaming_text(chat_box, b))
+                        buffer = ""
+                        time.sleep(0.015)
+            
+            # Flush remaining buffer
+            if buffer:
+                self.after(0, lambda b=buffer: self._append_streaming_text(chat_box, b))
+            
+            # Finalize the message
+            self.after(0, lambda: self._finalize_streaming_message(chat_box))
+            
+            # Track tokens (approximate for streaming)
+            from token_tracker import track_completion
+            track_completion(
+                model=model,
+                prompt_tokens=sum(len(str(m.get('content', '')).split()) for m in messages),
+                completion_tokens=len(full_response.split()),
+                session_name=session_name,
+                purpose=purpose
+            )
+            
+            return full_response
+            
+        except Exception as e:
+            print(f"Streaming error: {e}")
+            # Fallback to non-streaming
+            return self._chat_complete(messages, temperature, session_name, purpose, model)
+
+    def _start_streaming_message(self, chat_box):
+        """Start a new streaming message with AI header"""
+        chat_box.config(state=tk.NORMAL)
+        chat_box.insert("end", "\n")
+        chat_box.insert("end", "AI Coach", "ai_tag")
+        chat_box.insert("end", "\n")
+        
+        # Create streaming buffer attribute
+        if not hasattr(self, '_stream_buffer'):
+            self._stream_buffer = {
+                'text': '',
+                'in_bold': False,
+                'bold_buffer': ''
+            }
+        
+        chat_box.config(state=tk.DISABLED)
+
+    def _append_streaming_text(self, chat_box, text):
+        """Append text chunk with emoji/bold detection during streaming"""
+        chat_box.config(state=tk.NORMAL)
+        
+        # Process text character by character for formatting
+        i = 0
+        while i < len(text):
+            char = text[i]
+            
+            # Check for emoji
+            if ord(char) >= 0x1F300:
+                img = render_emoji_photoimage(char, size=16)
+                self._emoji_images.append(img)
+                chat_box.image_create("end", image=img)
+                i += 1
+                continue
+            
+            # Check for bold markers (**)
+            if text[i:i+2] == '**':
+                self._stream_buffer['in_bold'] = not self._stream_buffer['in_bold']
+                i += 2
+                continue
+            
+            # Insert character
+            if self._stream_buffer['in_bold']:
+                chat_box.insert("end", char, "bold")
+            else:
+                chat_box.insert("end", char)
+            
+            i += 1
+        
+        chat_box.see("end")
+        chat_box.config(state=tk.DISABLED)
+        chat_box.update_idletasks()
+
+    def _finalize_streaming_message(self, chat_box):
+        """Finalize streaming message"""
+        chat_box.config(state=tk.NORMAL)
+        chat_box.insert("end", "\n")
+        chat_box.config(state=tk.DISABLED)
+        
+        # Reset buffer
+        if hasattr(self, '_stream_buffer'):
+            self._stream_buffer = {
+                'text': '',
+                'in_bold': False,
+                'bold_buffer': ''
+            }
 
     def _chat_complete(self, messages, temperature=0.7, session_name="", purpose="chat", model="gpt-4o-mini"):
         """Wrapper for chat completion with tracking"""

@@ -62,6 +62,11 @@ load_dotenv()
 print(f"ENCRYPTION_KEY exists: {bool(get_secret('ENCRYPTION_KEY'))}")
 print(f"ENCRYPTED_CREDENTIALS exists: {bool(get_secret('ENCRYPTED_CREDENTIALS'))}")
 print(f"LB_SHEET_ID: {get_secret('LB_SHEET_ID')}")
+# ===== Subscription pricing (in rupees) =====
+SUBSCRIPTION_PRICE_NORMAL_RUPEES   = 349  # Standard price
+SUBSCRIPTION_PRICE_REFERRAL_RUPEES = 1  # Discounted price when referral code applied
+# Razorpay PUBLIC key (same as in Cloud Function)
+RAZORPAY_KEY_ID = "rzp_live_RCiAvkzn29q7AQ" 
 import os
 os.environ["GRPC_VERBOSITY"] = "ERROR"
 os.environ["GRPC_TRACE"] = ""
@@ -90,7 +95,6 @@ from token_tracker import (
 
 # 👇 This line replaces your old hardcoded TELEGRAM_BOT_TOKEN
 TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN")
-
 
 
 LB_CREDENTIALS = None
@@ -209,7 +213,7 @@ CURRENT_VERSION = "version 00.04.10.25"
 
 # === Razorpay key bootstrap (final) ===
 RAZORPAY_KEY_ID = "rzp_live_RCiAvkzn29q7AQ"  # your real Razorpay Key ID (public)
-RAZORPAY_KEY_SECRET = None  # never expose secret on client
+RAZORPAY_KEY_SECRET = get_secret("RAZORPAY_KEY_SECRET")  # Load from secret manager
 # === end bootstrap ===
 
 APP_INSTANCE = None
@@ -683,12 +687,12 @@ class ReferralSystem:
                 user_records = sheet.worksheet("UserRecords")
             except:
                 print("[SUBSCRIPTION] UserRecords sheet not found")
-                return True
+                return False  # Don't allow access if sheet is missing
 
             all_records = user_records.get_all_values()
             if not all_records or len(all_records) < 2:
                 print("[SUBSCRIPTION] No data in UserRecords")
-                return True
+                return False  # Don't allow access if sheet is empty
 
             status_col_index = 3
             user_uid = None
@@ -1069,9 +1073,9 @@ StudyTimer Team
                 font=("Arial", 12, "bold"), bg="#f8f9fa").pack(anchor="w", pady=5)
         
         rewards = [
-            ("📱 Per Install:", "₹10", "When someone installs using your code"),
-            ("💎 Per Subscription:", "₹50", "When they subscribe to Pro"),
-            ("💰 Total per User:", "₹60", "Maximum earnings per referral")
+            ("📱 Get referral ID:", "   ", "Register and get your referral id"),
+            ("💎 Share it:", "   ", "Let them use it on referral prompt"),
+            ("💎 Per Subscription:", "₹50", "Get paid when they do subscribe")
         ]
         
         for title, amount, desc in rewards:
@@ -1270,10 +1274,10 @@ StudyTimer Team
     The Program is open only to active paid subscribers of StudyTimerPro. Participants must be at least 18 years of age and have a valid UPI ID in India for reward payments. Accounts found to be in violation of StudyTimerPro's general Terms of Use may be disqualified.
 
     2. HOW THE PROGRAM WORKS
-    Each subscriber will receive a unique referral link or code. A referral is considered valid only when: (1) A new user installs StudyTimerPro using your referral link/code (reward: ₹10), and (2) A referred user purchases a valid subscription (reward: ₹50). Rewards are credited after successful verification by our team. Only genuine referrals are eligible. Fraudulent or duplicate installs/subscriptions will not qualify.
+    Each subscriber will receive a unique referral link or code. A referral is considered valid only when: (1) A new user installs StudyTimerPro using your referral link/code, and (2) A referred user purchases a valid subscription (reward: ₹50). Rewards are credited after successful verification by our team. Only genuine referrals are eligible. Fraudulent or duplicate installs/subscriptions will not qualify.
 
-    3. REWARDS & PAYOUTS
-    Rewards: ₹10 per valid install and ₹50 per valid subscription. Payments will be made through UPI to the participant's provided UPI ID. Rewards are non-transferable, non-refundable, and cannot be exchanged for other benefits.
+    3. PAYOUTS
+    Payments will be made through UPI to the participant's provided UPI ID. Rewards are non-transferable, non-refundable, and cannot be exchanged for other benefits.
 
     4. RESTRICTIONS
     Participants may not: refer themselves, use multiple fake accounts, or attempt fraudulent installs/subscriptions; share referral codes through spam, misleading promotions, or paid ads; sell or trade referral codes outside of this Program. StudyTimerPro reserves the right to withhold or cancel rewards for suspected misuse.
@@ -1387,7 +1391,7 @@ StudyTimer Team
         tk.Label(earnings_frame, text="Continue sharing your referral link to earn:", 
                 font=("Arial", 10), bg="#e8f5e9").pack()
         
-        tk.Label(earnings_frame, text="₹10 per install + ₹50 per subscription", 
+        tk.Label(earnings_frame, text="₹50 per subscription", 
                 font=("Arial", 11, "bold"), bg="#e8f5e9", fg="#4CAF50").pack(pady=5)
         
         # Share message
@@ -1620,12 +1624,6 @@ StudyTimer Team
     Referral ID: {referral_details.get('referral_id')}
     Referral Link: {referral_details.get('referral_link')}
     UPI ID: {referral_details.get('upi_id')}
-
-    How to Earn:
-    ------------
-    • ₹10 for each install using your referral code
-    • ₹50 when they subscribe to Pro
-    • Total potential: ₹60 per referral
 
     Payment Details:
     ---------------
@@ -2271,13 +2269,16 @@ class ReferralValidator:
             while len(current_data) < 18:
                 current_data.append("")
             
-            # Extract fingerprint from user_info if it contains uid_fingerprint format
-            if "_" in user_info:
-                # Extract only fingerprint part (after underscore)
-                fingerprint = user_info.split("_")[-1]
+            # user_info now contains "username(fingerprint)" format
+            # Extract both username and fingerprint
+            if '(' in user_info and user_info.endswith(')'):
+                # Format: "bala(2a2a342)"
+                username = user_info.split('(')[0].strip()
+                fingerprint = user_info.split('(')[1].rstrip(')').strip()
             else:
-                # Already fingerprint only
-                fingerprint = user_info
+                # Fallback for old format - just fingerprint
+                username = user_info.strip()
+                fingerprint = user_info.strip()
             
             # GET ENTIRE COLUMNS FOR DUPLICATE CHECK
             try:
@@ -2290,24 +2291,29 @@ class ReferralValidator:
                 installed_users_column = []
                 subscribed_users_column = []
             
-            # Helper function to extract all fingerprints from column data
+            # Helper function to extract all fingerprints from column data for duplicate check
             def extract_all_fingerprints(column_data):
                 all_fingerprints = set()
                 for cell_data in column_data:
                     if cell_data and cell_data.strip():
-                        # Split by comma and clean each fingerprint
-                        fingerprints_in_cell = [fp.strip() for fp in cell_data.split(",") if fp.strip()]
-                        for fp in fingerprints_in_cell:
-                            # Handle both fingerprint-only and uid_fingerprint formats
-                            if "_" in fp:
-                                # Extract fingerprint part after underscore
-                                clean_fp = fp.split("_")[-1]
+                        # Split by comma and extract fingerprints
+                        entries = [entry.strip() for entry in cell_data.split(",") if entry.strip()]
+                        for entry in entries:
+                            # Handle "username(fingerprint)" format
+                            if '(' in entry and entry.endswith(')'):
+                                fp = entry.split('(')[1].rstrip(')').strip()
+                                all_fingerprints.add(fp)
+                            # Handle old fingerprint-only or uid_fingerprint format
+                            elif "_" in entry and len(entry) > 15:
+                                fp = entry.split("_")[-1]
+                                all_fingerprints.add(fp)
                             else:
-                                clean_fp = fp
-                            all_fingerprints.add(clean_fp)
+                                # Just fingerprint
+                                all_fingerprints.add(entry)
                 return all_fingerprints
             
-            # Extract all existing fingerprints from both columns
+            # Extract all existing usernames from both columns
+
             existing_installed_fingerprints = extract_all_fingerprints(installed_users_column)
             existing_subscribed_fingerprints = extract_all_fingerprints(subscribed_users_column)
             
@@ -2322,9 +2328,9 @@ class ReferralValidator:
                 install_count = int(current_data[12]) if current_data[12].isdigit() else 0
                 worksheet.update_cell(row_index, 13, str(install_count + 1))
                 
-                # Add fingerprint to installed users list (column N - index 13)
+                # Add username(fingerprint) to installed users list (column N - index 13)
                 current_installed = current_data[13] if len(current_data) > 13 else ""
-                new_installed = f"{current_installed}, {fingerprint}" if current_installed else fingerprint
+                new_installed = f"{current_installed}, {user_info}" if current_installed else user_info
                 worksheet.update_cell(row_index, 14, new_installed)
                 
             elif install_type == "subscription":
@@ -2342,18 +2348,45 @@ class ReferralValidator:
                 sub_count = int(current_data[14]) if len(current_data) > 14 and current_data[14].isdigit() else 0
                 worksheet.update_cell(row_index, 15, str(sub_count + 1))
                 
-                # Add fingerprint to subscribed users list (column P - index 15)
+                # Add username(fingerprint) to subscribed users list (column P - index 15)
                 current_subscribed = current_data[15] if len(current_data) > 15 else ""
-                new_subscribed = f"{current_subscribed}, {fingerprint}" if current_subscribed else fingerprint
+                # Use full user_info with fingerprint
+                entry_value = user_info
+                new_subscribed = f"{current_subscribed}, {entry_value}" if current_subscribed else entry_value
                 worksheet.update_cell(row_index, 16, new_subscribed)
+                # ✅ Update total earnings (column Q - index 16)
+                # Read current earnings from column Q (can be blank)
+                current_earnings = 0.0
+                if len(current_data) > 16 and current_data[16]:
+                    try:
+                        current_earnings = float(str(current_data[16]).strip())
+                    except ValueError:
+                        current_earnings = 0.0
+
+                # How much to add for THIS subscription:
+                # use the current referral subscription price constant,
+                # so if you change SUBSCRIPTION_PRICE_REFERRAL_RUPEES later,
+                # new subscriptions will automatically use the new value.
+                try:
+                    subscription_amount = float(SUBSCRIPTION_PRICE_REFERRAL_RUPEES)
+                except NameError:
+                    # Fallback in case constant not defined for some reason
+                    subscription_amount = 199.0
+
+                new_total_earnings = current_earnings + subscription_amount
+
+                # Write back to column Q (17th column)
+                worksheet.update_cell(row_index, 17, str(int(new_total_earnings)))
+                print(f"✓ Updated Total_Earnings (Q) to {new_total_earnings} for {referral_id}")
+
             
             # Always update total referral count (column H - index 7)
             current_count = int(current_data[7]) if len(current_data) > 7 and current_data[7].isdigit() else 0
             worksheet.update_cell(row_index, 8, str(current_count + 1))
             
-            # Update referred users list with fingerprint only (column I - index 8)
+            # Update referred users list with username(fingerprint) (column I - index 8)
             referred_users = current_data[8] if len(current_data) > 8 else ""
-            new_referred = f"{referred_users}, {fingerprint}" if referred_users else fingerprint
+            new_referred = f"{referred_users}, {user_info}" if referred_users else user_info
             worksheet.update_cell(row_index, 9, new_referred)
             
             print(f"✓ Updated referral stats for {referral_id} - {install_type}")
@@ -2372,7 +2405,6 @@ class ReferralValidator:
             if notification_type == "install":
                 subject = "New Referral Install!"
                 emoji = "🎉"
-                reward = "₹10"
                 message_body = f"""Great news! Someone just installed StudyTimer using your referral code.
 
     Referred User: {user_info}
@@ -2388,7 +2420,6 @@ class ReferralValidator:
     Subscribed User: {user_info}
     Reward: {reward} (will be processed within 24 hours)
 
-    Total earnings from this referral: ₹60
     Keep up the great work!"""
             
             # Send notifications
@@ -2561,8 +2592,11 @@ StudyTimer Team"""
             
             for update in pending:
                 try:
-                    # Send only fingerprint (first 8 chars)
-                    user_info = update['user_fingerprint'][:8]
+                    # Load profile to get username
+                    profile = self.load_user_profile()
+                    raw_username = profile.get('user_name', '') or profile.get('username', '') or 'User'
+                    machine_fp = profile.get('machine_fingerprint', '')[:8] or 'xxxxxxxx'
+                    user_info = f"{raw_username}({machine_fp})"  # Add fingerprint in brackets
                     print(f"[DEBUG] Processing update for referral: {update['referral_id']}")
                     
                     success = self.update_referral_stats_online(
@@ -2675,21 +2709,25 @@ StudyTimer Team"""
             profile = self.load_user_profile()
             
             # Get referral info from profile (matching your JSON structure)
-            used_referral = profile.get('used_referral', False)
-            referral_code = profile.get('referral_code')  # This will get "BAL507550"
+            used_referral = profile.get('used_referral')
+            referral_code = profile.get('referral_code')  # e.g. "BAL507550"
             
             print(f"[DEBUG] used_referral: {used_referral}")
             print(f"[DEBUG] referral_code: {referral_code}")
             
-            # Check if user used a referral
-            if not used_referral or not referral_code:
-                print(f"[DEBUG] No referral used - used_referral: {used_referral}, referral_code: {referral_code}")
+            # ✅ Only require a referral code. Even if used_referral flag is False/missing,
+            #    as long as referral_code exists we will credit the referrer.
+            if not referral_code:
+                print("[DEBUG] No referral code in profile – skipping subscription referral update")
                 return False
             
             # Create user info from profile data
             uid = profile.get('uid', 'unknown')
             machine_fingerprint = profile.get('machine_fingerprint', 'unknown')
-            user_info = f"{uid}_{machine_fingerprint[:8]}"
+            # Use username for display in Subscribed_Users
+            raw_username = profile.get('user_name', '') or profile.get('username', '') or 'User'
+            machine_fp = profile.get('machine_fingerprint', '')[:8] or 'xxxxxxxx'
+            user_info = f"{raw_username}({machine_fp})"  # Add fingerprint in brackets
             
             print(f"[DEBUG] user_info: {user_info}")
             print(f"[DEBUG] Calling update_referral_stats_online with:")
@@ -2776,35 +2814,69 @@ StudyTimer Team"""
         content_frame = tk.Frame(main_frame, bg="white", padx=25, pady=20)
         content_frame.pack(fill="both", expand=True)
         
-        # Pricing comparison section - UPDATED PRICES
+        # Pricing comparison section - uses global constants
         pricing_frame = tk.Frame(content_frame, bg="#f8f9fa", relief="ridge", bd=1, pady=15)
         pricing_frame.pack(fill="x", pady=15)
+        
+        with_price = SUBSCRIPTION_PRICE_REFERRAL_RUPEES
+        without_price = SUBSCRIPTION_PRICE_NORMAL_RUPEES
+        savings = max(0, without_price - with_price)
         
         # With referral code pricing
         with_code_frame = tk.Frame(pricing_frame, bg="#f8f9fa")
         with_code_frame.pack(pady=5)
         
-        tk.Label(with_code_frame, text="✅ WITH Referral Code: ", 
-                font=("Arial", 11, "bold"), bg="#f8f9fa", fg="#4CAF50").pack(side="left")
+        tk.Label(
+            with_code_frame,
+            text="✅ WITH Referral Code: ",
+            font=("Arial", 11, "bold"),
+            bg="#f8f9fa",
+            fg="#4CAF50",
+        ).pack(side="left")
         
-        tk.Label(with_code_frame, text="₹199", 
-                font=("Arial", 14, "bold"), bg="#f8f9fa", fg="#4CAF50").pack(side="left")
+        tk.Label(
+            with_code_frame,
+            text=f"₹{with_price}",
+            font=("Arial", 14, "bold"),
+            bg="#f8f9fa",
+            fg="#4CAF50",
+        ).pack(side="left")
         
-        tk.Label(with_code_frame, text=" (Save ₹150!)", 
-                font=("Arial", 10), bg="#f8f9fa", fg="#FF5722").pack(side="left")
+        tk.Label(
+            with_code_frame,
+            text=f" (Save ₹{savings}!)" if savings > 0 else "",
+            font=("Arial", 10),
+            bg="#f8f9fa",
+            fg="#FF5722",
+        ).pack(side="left")
         
         # Without referral code pricing
         without_code_frame = tk.Frame(pricing_frame, bg="#f8f9fa")
         without_code_frame.pack(pady=5)
         
-        tk.Label(without_code_frame, text="❌ WITHOUT Code: ", 
-                font=("Arial", 11), bg="#f8f9fa", fg="#666").pack(side="left")
+        tk.Label(
+            without_code_frame,
+            text="❌ WITHOUT Code: ",
+            font=("Arial", 11),
+            bg="#f8f9fa",
+            fg="#666",
+        ).pack(side="left")
         
-        tk.Label(without_code_frame, text="₹349", 
-                font=("Arial", 14), bg="#f8f9fa", fg="#666").pack(side="left")
+        tk.Label(
+            without_code_frame,
+            text=f"₹{without_price}",
+            font=("Arial", 14),
+            bg="#f8f9fa",
+            fg="#666",
+        ).pack(side="left")
         
-        tk.Label(without_code_frame, text=" (Standard price)", 
-                font=("Arial", 10), bg="#f8f9fa", fg="#999").pack(side="left")
+        tk.Label(
+            without_code_frame,
+            text=" (Standard price)",
+            font=("Arial", 10),
+            bg="#f8f9fa",
+            fg="#999",
+        ).pack(side="left")
         
         # Benefits info
         tk.Label(content_frame, text="Enter referral code to unlock:", 
@@ -3052,8 +3124,10 @@ StudyTimer Team"""
         
         # Get user profile
         profile = self.load_user_profile()
-        # Send only fingerprint (first 8 chars)
-        user_info = profile.get('machine_fingerprint', '')[:8]
+        # Extract username and strip any fingerprint suffix
+        raw_username = profile.get('user_name', '') or profile.get('username', '') or 'User'
+        machine_fp = profile.get('machine_fingerprint', '')[:8] or 'xxxxxxxx'
+        user_info = f"{raw_username}({machine_fp})"  # Add fingerprint in brackets
         
         # Update online stats (install type)
         success = self.update_referral_stats_online(referral_code, user_info, "install")
@@ -6910,7 +6984,11 @@ class PaymentWizard(tk.Toplevel):
         main_row.pack(fill="x", pady=(0, 8))
 
         # Payment button - Update text to show price, fix height
-        price_text = "₹199" if referral_applied else "₹349"
+        price_rupees = (
+            SUBSCRIPTION_PRICE_REFERRAL_RUPEES if referral_applied
+            else SUBSCRIPTION_PRICE_NORMAL_RUPEES
+        )
+        price_text = f"₹{price_rupees}"
         button_text = f"💳 Complete Payment ({price_text})"
         
         self.payment_btn = tk.Button(main_row, text=button_text,
@@ -7164,10 +7242,19 @@ class PaymentWizard(tk.Toplevel):
 
             # ✅ Check referral discount
             referral_applied = bool(user_profile.get('referral_code'))
-            payment_amount = 199 if referral_applied else 349
-            print(f"[PAYMENT] Payment amount: ₹{payment_amount} (referral: {referral_applied})")
 
-            # ✅ Create payment order via backend API
+            # Amount in rupees for UI
+            payment_amount_rupees = (
+                SUBSCRIPTION_PRICE_REFERRAL_RUPEES if referral_applied
+                else SUBSCRIPTION_PRICE_NORMAL_RUPEES
+            )
+
+            # Convert to paise for backend / Razorpay
+            payment_amount = payment_amount_rupees * 100
+
+            print(f"[PAYMENT] Payment amount: ₹{payment_amount_rupees} (referral: {referral_applied})")
+
+            # ✅ Create payment order via backend API (expects paise)
             print("[PAYMENT] Calling create_payment...")
             order_response = api.create_payment(amount=payment_amount, currency='INR')
             print(f"[PAYMENT] Order response: {order_response}")
@@ -7181,10 +7268,9 @@ class PaymentWizard(tk.Toplevel):
 
             print(f"[PAYMENT] ✅ Order created: {order_response.get('order_id')}")
 
-            # ✅ Start local payment server & browser checkout
             self._start_payment_server(order_response, user_profile)
             self.payment_btn.config(text="⏳ Complete payment...")
-            self.status_var.set(f"💳 Complete payment in browser (₹{payment_amount})")
+            self.status_var.set(f"💳 Complete payment in browser (₹{payment_amount_rupees})")
 
             # ✅ Check payment completion
             self._check_payment_completion()
@@ -7374,7 +7460,7 @@ class PaymentWizard(tk.Toplevel):
         
         <div class="price-section">
             <div class="price-label">Payment</div>
-            <div class="price">₹349</div>
+            <div class="price">₹{{ referral_price_rupees if has_referral else normal_price_rupees }}</div>
             <div class="price-description">Enjoy your studies! • Stay connected for further updates!!</div>
         </div>
         
@@ -7390,7 +7476,7 @@ class PaymentWizard(tk.Toplevel):
         </div>
         
         <button class="pay-button" onclick="startPayment()" id="payButton">
-            Pay ₹349 & Activate License
+            Pay ₹{{ referral_price_rupees if has_referral else normal_price_rupees }} & Activate License
         </button>
         
         <div class="security-badges">
@@ -7417,7 +7503,7 @@ class PaymentWizard(tk.Toplevel):
         // Initialize options with default amount
         var options = {
             "key": "{{ razorpay_key }}",
-            "amount": 34900, // Default amount, will be updated by updatePriceDisplay()
+            "amount": {{ amount }}, // amount from backend in paise
             "currency": "INR",
             "name": "Study Timer Pro",
             "description": "Premium License Activation",
@@ -7457,22 +7543,25 @@ class PaymentWizard(tk.Toplevel):
 
         // Function to update price based on referral status
         function updatePriceDisplay() {
-            const referral_applied = user_profile?.referral_code !== null;
+            // Use server-side flag instead of user_profile JS object
+            const referral_applied = {{ 'true' if has_referral else 'false' }};
             const priceElement = document.querySelector('.price');
             const payButton = document.querySelector('.pay-button');
-            
+
             if (referral_applied) {
-                priceElement.textContent = "₹199";
-                payButton.textContent = "Pay ₹199 & Activate License";
-                // Update the amount for Razorpay (199 * 100 = 19900 paise)
-                options.amount = 19900;
+                priceElement.textContent = "₹{{ referral_price_rupees }}";
+                payButton.textContent = "Pay ₹{{ referral_price_rupees }} & Activate License";
+                options.amount = {{ referral_amount_paise }};
             } else {
-                priceElement.textContent = "₹349";
-                payButton.textContent = "Pay ₹349 & Activate License";
-                // Update the amount for Razorpay (349 * 100 = 34900 paise)
-                options.amount = 34900;
+                priceElement.textContent = "₹{{ normal_price_rupees }}";
+                payButton.textContent = "Pay ₹{{ normal_price_rupees }} & Activate License";
+                options.amount = {{ normal_amount_paise }};
             }
         }
+
+        // Run once after page load to sync UI + amount
+        document.addEventListener("DOMContentLoaded", updatePriceDisplay);
+
 
         function startPayment() {
             var rzp = new Razorpay(options);
@@ -7522,27 +7611,46 @@ class PaymentWizard(tk.Toplevel):
                 )
                 return message, 400
 
-            # Decide amount based on referral
-            payment_amount = 199 if referral_applied else 349
+            # Decide amount based on referral (rupees for UI)
+            payment_amount_rupees = (
+                SUBSCRIPTION_PRICE_REFERRAL_RUPEES if referral_applied
+                else SUBSCRIPTION_PRICE_NORMAL_RUPEES
+            )
 
-            # ✅ Create payment order via backend
+            # Convert to paise for backend
+            payment_amount = payment_amount_rupees * 100
+
+            # ✅ Create payment order via backend (expects paise)
             order_response = api.create_payment(amount=payment_amount, currency='INR')
 
             if not order_response.get('success'):
-                return f"❌ Failed to create payment order: {order_response.get('error', 'Unknown error')}", 500
+                return (
+                    f"❌ Failed to create payment order: "
+                    f"{order_response.get('error', 'Unknown error')}",
+                    500,
+                )
 
             # Extract order info for Razorpay Checkout
             order_id = order_response['order_id']
-            amount_in_paise = order_response['amount'] * 100 if order_response['amount'] < 1000 else order_response['amount']
-            razorpay_key = order_response['key_id']  # returned by backend
+            amount_in_paise = order_response['amount']  # already paise from backend
 
-            # ✅ Render the payment page with new backend order data
+            # Precompute values for template (for JS)
+            normal_price_rupees = SUBSCRIPTION_PRICE_NORMAL_RUPEES
+            referral_price_rupees = SUBSCRIPTION_PRICE_REFERRAL_RUPEES
+            normal_amount_paise = normal_price_rupees * 100
+            referral_amount_paise = referral_price_rupees * 100
+
+            # ✅ Render the payment page with backend order data
             return render_template_string(
                 payment_html,
-                razorpay_key=razorpay_key,  # frontend uses this
-                amount=amount_in_paise,
+                razorpay_key=RAZORPAY_KEY_ID,          # Razorpay PUBLIC key
+                amount=amount_in_paise,                # order amount in paise
                 order_id=order_id,
-                has_referral=referral_applied
+                has_referral=referral_applied,
+                normal_price_rupees=normal_price_rupees,
+                referral_price_rupees=referral_price_rupees,
+                normal_amount_paise=normal_amount_paise,
+                referral_amount_paise=referral_amount_paise,
             )
 
         
@@ -9579,11 +9687,13 @@ class AutoDropdown(tk.Frame):
         self.after(100, lambda: self._hide()
                    if self.entry.focus_get() != self.listbox else None)
 
-
-
 class OnboardingWizard(tk.Toplevel):
     def __init__(self, app):
         super().__init__(app)
+        # ✅ ADD: Exam verification caching
+        self._exam_verification_pending = False
+        self._exam_verification_result = None
+        self._last_verified_exam = None
         self.app = app
         self.title("Welcome to StudyTimer")
         self.configure(bg="#f5f7fa")
@@ -9652,13 +9762,17 @@ class OnboardingWizard(tk.Toplevel):
         container.pack(fill="both", expand=True, padx=20, pady=5)
 
         # ==========================
-        # Top row: Name + Language
+        # Top row: Name + Language (using grid for equal columns)
         top_row = tk.Frame(container, bg="white")
         top_row.pack(fill="x", pady=(0, 10))
+        
+        # Configure grid columns to be equal width
+        top_row.grid_columnconfigure(0, weight=1, uniform="equal")
+        top_row.grid_columnconfigure(1, weight=1, uniform="equal")
 
         # Name field
         name_frame = tk.Frame(top_row, bg="white")
-        name_frame.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        name_frame.grid(row=0, column=0, sticky="ew", padx=(0, 5))
 
         tk.Label(name_frame, text="Your Name", bg="white", fg="#333",
                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
@@ -9674,7 +9788,7 @@ class OnboardingWizard(tk.Toplevel):
 
         # Language field
         lang_frame = tk.Frame(top_row, bg="white")
-        lang_frame.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        lang_frame.grid(row=0, column=1, sticky="ew", padx=(5, 0))
 
         tk.Label(
             lang_frame, text="Language", bg="white", fg="#333",
@@ -9691,8 +9805,8 @@ class OnboardingWizard(tk.Toplevel):
         default_lang = prof.get("language", "English") or "English"
         self.language_var = tk.StringVar(value=default_lang)
 
-        # ✅ Replace Combobox with custom dropdown
-        lang_dropdown = AutoDropdown(lang_frame, languages, textvariable=self.language_var, width=18, font=("Segoe UI", 11))
+        lang_dropdown = AutoDropdown(lang_frame, languages, textvariable=self.language_var, 
+                                     width=25, font=("Segoe UI", 11))
         lang_dropdown.pack(fill="x", pady=(5, 0))
 
         # ==========================
@@ -9715,13 +9829,17 @@ class OnboardingWizard(tk.Toplevel):
             default_exam = date.today() + timedelta(days=30)
 
         # ==========================
-        # Row 2: Exam Name + Target Exam Date
+        # Row 2: Exam Name + Target Exam Date (using grid for equal columns)
         row2 = tk.Frame(container, bg="white")
         row2.pack(fill="x", pady=(0, 10))
+        
+        # Configure grid columns to be equal width
+        row2.grid_columnconfigure(0, weight=1, uniform="equal")
+        row2.grid_columnconfigure(1, weight=1, uniform="equal")
 
         # Left: Exam Name
         exam_name_frame = tk.Frame(row2, bg="white")
-        exam_name_frame.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        exam_name_frame.grid(row=0, column=0, sticky="ew", padx=(0, 5))
 
         tk.Label(exam_name_frame, text="Exam Name", bg="white", fg="#333",
                  font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 2))
@@ -9733,6 +9851,10 @@ class OnboardingWizard(tk.Toplevel):
         )
         exam_name_entry.pack(fill="x", pady=(0, 0), ipady=5)
         exam_name_entry.configure(highlightbackground="#ddd", highlightcolor="#4285f4")
+        
+        # ✅ ADD: Verify when user leaves field
+        exam_name_entry.bind('<FocusOut>', lambda e: self._start_exam_verification_async())
+        exam_name_entry.bind('<Return>', lambda e: self._start_exam_verification_async())
         
         # Remember original exam name to detect change
         self._original_exam_name = (prof.get("exam_name") or "").strip()
@@ -9757,7 +9879,7 @@ class OnboardingWizard(tk.Toplevel):
 
         # Right: Target Exam Date
         date_frame = tk.Frame(row2, bg="white")
-        date_frame.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        date_frame.grid(row=0, column=1, sticky="ew", padx=(5, 0))
 
         tk.Label(date_frame, text="Target Exam Date", bg="white", fg="#333",
                  font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 2))
@@ -9772,7 +9894,6 @@ class OnboardingWizard(tk.Toplevel):
 
         tk.Label(date_frame, text="Format: YYYY-MM-DD", bg="white", fg="#999",
                  font=("Segoe UI", 8)).pack(anchor="w", pady=(2, 0))
-
 
         # Avatar selection with title
         avatar_frame = tk.Frame(container, bg="white")
@@ -10765,7 +10886,51 @@ class OnboardingWizard(tk.Toplevel):
         old_exam_name = (prof.get("exam_name") or "").strip()
         new_exam_name = (self.exam_name_var.get() or "").strip()
         exam_name_changed = bool(old_exam_name and new_exam_name and old_exam_name != new_exam_name)
+        
+        # ✅ Use cached verification (INSTANT!)
+        if new_exam_name:
+            is_specific, category_name, exam_options = self._get_cached_verification_or_wait(new_exam_name)
+            
+            if not is_specific and exam_options:
+                selected_exam, should_save_directly = self._show_exam_selection_popup_with_save(
+                    category_name, exam_options
+                )
+                
+                if selected_exam:
+                    new_exam_name = selected_exam
+                    self.exam_name_var.set(selected_exam)
+                    print(f"[EXAM] Selected: '{selected_exam}'")
+                    
+                    if not should_save_directly:
+                        return
+                else:
+                    self.lift()
+                    self.bell()
+                    messagebox.showwarning(
+                        "Exam Selection Required", 
+                        f"Please specify which {category_name} exam you're preparing for.",
+                        parent=self
+                    )
+                    return
 
+            # ❗ NEW: AI says it's a category but no list available
+            elif not is_specific:
+                from tkinter import messagebox
+                self.lift()
+                self.bell()
+                messagebox.showinfo(
+                    "Specify Exact Exam",
+                    (
+                        f"'{new_exam_name}' looks like an organisation or exam category "
+                        f"(for example HPCL has multiple posts like Engineer, Technician, Apprentice).\n\n"
+                        "Please type your exact exam name in the Exam Name box –\n"
+                        "e.g. 'HPCL Mechanical Engineer' – and click Save again.\n\n"
+                        "This helps StudyTimer show the right syllabus and materials."
+                    ),
+                    parent=self
+                )
+                return
+                    
         prof["user_name"] = nm
         prof["exam_name"] = new_exam_name
         prof["language"] = (self.language_var.get() or "").strip()
@@ -10921,7 +11086,815 @@ class OnboardingWizard(tk.Toplevel):
         self.attributes('-topmost', False)
         self.grab_release()
         self.destroy()
+        
+    def _get_static_exam_category(self, exam_name):
+        """
+        Very common Indian exam categories handled without AI.
+        Returns: (category_name, [exam_list]) or (None, []) if not matched.
+        """
+        import re
 
+        key = re.sub(r'[^a-z]', '', (exam_name or '').lower())
+
+        # Banking / IBPS
+        if key in ("ibps", "bank", "bankexam", "banking", "bankpo"):
+            return "Banking / IBPS", [
+                "IBPS PO",
+                "IBPS Clerk",
+                "IBPS RRB Officer Scale I",
+                "IBPS RRB Office Assistant",
+                "SBI PO",
+                "SBI Clerk",
+            ]
+        
+        # ✅ NEET / Medical Exams
+        if key in ("neet", "neetexam", "medical", "mbbs", "aiims"):
+            return "Medical Entrance Exams (NEET)", [
+                "NEET-UG (Undergraduate - MBBS/BDS)",
+                "NEET-PG (Postgraduate - MD/MS)",
+                "NEET-SS (Super Speciality)",
+                "NEET MDS (Dental PG)",
+                "AIIMS PG",
+                "JIPMER PG",
+                "INI-CET (AIIMS/JIPMER/PGIMER/NIMHANS)",
+                "FMGE (Foreign Medical Graduate Exam)",
+            ]
+        
+        # ✅ JEE / Engineering
+        if key in ("jee", "jeemain", "jeeadvanced", "iit", "engineering"):
+            return "Engineering Entrance (JEE)", [
+                "JEE Main",
+                "JEE Advanced",
+                "BITSAT",
+                "VITEEE",
+                "SRMJEEE",
+                "WBJEE",
+                "MHT-CET",
+                "KCET",
+            ]
+        
+        # ✅ UPSC
+        if key in ("upsc", "civilservices", "ias", "ips"):
+            return "UPSC Civil Services", [
+                "UPSC CSE (IAS/IPS/IFS)",
+                "UPSC CDS (Combined Defence Services)",
+                "UPSC NDA (National Defence Academy)",
+                "UPSC CAPF (Central Armed Police Forces)",
+                "UPSC IES/ESE (Engineering Services)",
+                "UPSC EPFO (Enforcement Officer)",
+                "UPSC CMS (Combined Medical Services)",
+            ]
+        
+        # ✅ RRB / Railway
+        if key in ("rrb", "railway", "railways", "indianrailway"):
+            return "Railway Recruitment Board (RRB)", [
+                "RRB NTPC",
+                "RRB Group D",
+                "RRB JE (Junior Engineer)",
+                "RRB ALP (Assistant Loco Pilot)",
+                "RRB Technician",
+                "RRB Paramedical",
+                "RRB Ministerial & Isolated",
+            ]
+        
+        # ✅ State PSC
+        if key in ("psc", "statepsc", "bpsc", "uppsc", "mppsc", "rpsc", "appsc", "tnpsc", "kpsc", "wbpsc"):
+            return "State Public Service Commission (PSC)", [
+                "BPSC (Bihar)",
+                "UPPSC (Uttar Pradesh)",
+                "MPPSC (Madhya Pradesh)",
+                "RPSC (Rajasthan)",
+                "APPSC (Andhra Pradesh)",
+                "TSPSC (Telangana)",
+                "TNPSC (Tamil Nadu)",
+                "KPSC (Karnataka)",
+                "WBPSC (West Bengal)",
+                "GPSC (Gujarat)",
+            ]
+        
+        # ✅ GATE
+        if key in ("gate", "gateexam"):
+            return "GATE (Graduate Aptitude Test)", [
+                "GATE Civil Engineering (CE)",
+                "GATE Mechanical Engineering (ME)",
+                "GATE Electrical Engineering (EE)",
+                "GATE Electronics & Communication (EC)",
+                "GATE Computer Science (CS)",
+                "GATE Instrumentation (IN)",
+                "GATE Chemical Engineering (CH)",
+                "GATE Biotechnology (BT)",
+            ]
+        
+        # ✅ CAT / MBA
+        if key in ("cat", "mba", "management", "iim"):
+            return "MBA Entrance Exams", [
+                "CAT (Common Admission Test)",
+                "XAT (Xavier Aptitude Test)",
+                "SNAP (Symbiosis)",
+                "NMAT (NMIMS)",
+                "MAT (Management Aptitude Test)",
+                "CMAT (Common Management Admission Test)",
+                "IIFT (Indian Institute of Foreign Trade)",
+            ]
+        
+        # ✅ Defence
+        if key in ("defence", "defense", "army", "navy", "airforce", "cds", "nda", "afcat"):
+            return "Defence Exams", [
+                "NDA (National Defence Academy)",
+                "CDS (Combined Defence Services)",
+                "AFCAT (Air Force Common Admission Test)",
+                "Indian Navy SSR/AA",
+                "Indian Army Technical Entry",
+                "Territorial Army Officer",
+                "Coast Guard",
+            ]
+        
+        # ✅ Teaching
+        if key in ("teaching", "teacher", "tet", "ctet", "net", "set"):
+            return "Teaching & Academic Exams", [
+                "CTET (Central Teacher Eligibility Test)",
+                "State TET",
+                "UGC NET (National Eligibility Test)",
+                "CSIR NET",
+                "SET (State Eligibility Test)",
+                "KVS PGT/TGT/PRT",
+                "NVS PGT/TGT",
+            ]
+
+        return None, []
+        
+    def _verify_exam_with_ai(self, exam_name):
+        """
+        Decide if an exam name is:
+        - a specific exam (e.g. 'SSC JE', 'HAL Design Trainee'), or
+        - a category / organisation with multiple exam types (e.g. 'SSC', 'HAL', 'HPCL').
+
+        Uses GPT directly. No DuckDuckGo / Google scraping.
+        Returns: (is_specific: bool, category_name: str | None, exam_list: list[str])
+        """
+        print("\n" + "=" * 70)
+        print(f"[EXAM-DEBUG] Starting verification for: '{exam_name}'")
+        print("=" * 70)
+
+        exam_name = (exam_name or "").strip()
+        if not exam_name:
+            print("[EXAM-DEBUG] ❌ Empty exam_name, treating as specific")
+            print("=" * 70 + "\n")
+            return True, None, []
+
+        # 1) Static map for very common broad categories (no API cost)
+        category_name, static_exams = self._get_static_exam_category(exam_name)
+        if static_exams:
+            print("[EXAM-DEBUG] ✅ Using built-in exam list (no API call)")
+            print(f"[EXAM-DEBUG]   Category: {category_name}")
+            print(f"[EXAM-DEBUG]   Exams: {static_exams}")
+            print("=" * 70 + "\n")
+            return False, category_name, static_exams
+
+        # 2) Ask GPT directly
+        try:
+            from openai import OpenAI
+            from secrets_util import get_secret
+            import json
+
+            api_key = get_secret("AI_API")
+            if not api_key:
+                print("[EXAM-DEBUG] ❌ FAILED: No OpenAI API key found!")
+                print("=" * 70 + "\n")
+                # No AI → just treat as specific
+                return True, None, []
+
+            client = OpenAI(api_key=api_key)
+
+            # Optional: allow configuring model via secret; default to gpt-5.1
+            model_name = get_secret("AI_MODEL") or "gpt-5.1"
+
+            print(f"[EXAM-DEBUG] 📤 Sending to OpenAI model '{model_name}' (no web_search_options)...")
+
+            system_msg = (
+                "You are an Indian exam classification assistant for a study planner app. "
+                "The user types exam names like 'SSC JE', 'HPCL', 'HAL Design Trainee', etc. "
+                "Your job is ONLY to decide if that text is a SINGLE SPECIFIC exam, or a broader "
+                "CATEGORY / organisation that has many different exams or posts. "
+                "Always think in terms of *Indian recruitment/entrance exams*. "
+                "Ignore meanings like STM32 HAL libraries, programming concepts, etc."
+            )
+
+            user_prompt = f"""
+Decide if this exam name is specific or a category:
+
+exam_name = "{exam_name}"
+
+Rules:
+
+1. If it is an organisation / PSU / exam series with many variants (examples: SSC, RRB, UPSC, IBPS, NEET, JEE, GATE, HPCL, HAL, DRDO, ISRO, BARC),
+   and the user has NOT specified post/variant, treat it as a CATEGORY.
+   
+   CRITICAL - These exams have VARIANTS (treat as CATEGORY):
+   - "NEET" → NEET-UG, NEET-PG, NEET-SS, NEET MDS, FMGE
+   - "JEE" → JEE Main, JEE Advanced  
+   - "GATE" → GATE CE, GATE ME, GATE EE, GATE CS, etc.
+   - "CAT" → CAT, XAT, SNAP, NMAT, etc.
+
+2. For these acronyms, assume the Indian PSU/organisation and NOT programming libraries:
+   - "HPCL" → Hindustan Petroleum Corporation Limited recruitment in India.
+   - "HAL"  → Hindustan Aeronautics Limited recruitment in India.
+
+3. If it is a CATEGORY:
+   - Set "is_specific": false
+   - Set "category" to a nice full name like "Hindustan Aeronautics Limited (HAL)"
+   - Fill "exams" with realistic major exam types / posts, for example:
+     - HAL → "HAL Design Trainee", "HAL Management Trainee (Technical)",
+              "HAL Diploma Technician", "HAL Graduate Apprentice", etc.
+     - HPCL → "HPCL Mechanical Engineer", "HPCL Electrical Engineer",
+               "HPCL Instrumentation Engineer", "HPCL Technician",
+               "HPCL Apprentice", etc.
+
+4. If the name already looks like ONE concrete exam, set:
+   - "is_specific": true
+   - "category": "" (empty string)
+   - "exams": [] (empty list)
+   Examples of SPECIFIC exams (is_specific = true):
+   - "SSC JE", "SSC CGL", "SSC CHSL"
+   - "NEET-UG", "NEET-PG", "NEET-SS"
+   - "JEE Main", "JEE Advanced"
+   - "GATE EC", "GATE CS", "GATE ME"
+   - "UPSC CSE", "UPSC CDS"
+   - "HAL Design Trainee"
+   - "HPCL Mechanical Engineer"
+   
+   Examples of CATEGORIES (is_specific = false):
+   - "NEET" alone → show NEET-UG, NEET-PG, NEET-SS options
+   - "JEE" alone → show JEE Main, JEE Advanced options
+   - "SSC" alone → show SSC CGL, CHSL, JE, etc.
+   - "GATE" alone → show GATE CE, ME, EE, CS, etc.
+
+5. Do NOT mix both worlds. Either it is:
+   - one specific exam (is_specific = true, exams = []), OR
+   - a category with many exam types (is_specific = false, exams = [...])
+
+Return ONLY valid JSON with this exact structure:
+
+{{
+  "is_specific": true or false,
+  "category": "string (can be empty if is_specific is true)",
+  "exams": ["list", "of", "exam", "names"]
+}}
+"""
+
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+                max_completion_tokens=400,  # ⬅️ IMPORTANT: not max_tokens
+                response_format={"type": "json_object"},
+            )
+
+            result_text = response.choices[0].message.content or ""
+            print(f"[EXAM-DEBUG] 📥 OpenAI response ({len(result_text)} chars):")
+            print(f"[EXAM-DEBUG] Full response: {result_text}")
+
+            # response_format=json_object *should* already give pure JSON, but keep brace-guard
+            if "{" in result_text:
+                start = result_text.find("{")
+                end = result_text.rfind("}") + 1
+                json_text = result_text[start:end]
+            else:
+                json_text = result_text
+
+            print(f"[EXAM-DEBUG] 📝 Extracted JSON: {json_text}")
+            result = json.loads(json_text)
+            print(f"[EXAM-DEBUG] ✅ Parsed JSON successfully")
+
+            is_specific = bool(result.get("is_specific", True))
+            exams = [
+                e.strip()
+                for e in result.get("exams", [])
+                if isinstance(e, str) and e.strip()
+            ]
+            category_from_ai = (result.get("category") or "").strip()
+            if not category_from_ai and not is_specific:
+                # If AI forgot a name, at least use raw input as category label.
+                category_from_ai = exam_name
+
+            print("[EXAM-DEBUG] 📊 Results:")
+            print(f"[EXAM-DEBUG]   - is_specific: {is_specific}")
+            print(f"[EXAM-DEBUG]   - category: {category_from_ai}")
+            print(f"[EXAM-DEBUG]   - exams found: {len(exams)}")
+            if exams:
+                print(f"[EXAM-DEBUG]   - first 3 exams: {exams[:3]}")
+
+            # If AI says category but gave no list, still keep it as CATEGORY with empty exams
+            if not is_specific and not exams:
+                print("[EXAM-DEBUG] ⚠️ CATEGORY with empty exams list (AI did not enumerate).")
+                print("=" * 70 + "\n")
+                return False, category_from_ai, []
+
+            if not is_specific:
+                print(f"[EXAM-DEBUG] ✅ RETURNING: Category with {len(exams)} exam types")
+                print("=" * 70 + "\n")
+                return False, category_from_ai, exams
+            else:
+                print("[EXAM-DEBUG] ✅ RETURNING: Specific exam")
+                print("=" * 70 + "\n")
+                return True, None, []
+
+        except Exception as e:
+            print(f"[EXAM-DEBUG] ❌ EXCEPTION while calling GPT: {e}")
+            import traceback
+            traceback.print_exc()
+            print("=" * 70 + "\n")
+            # On any failure, just treat as specific so user is not blocked
+            return True, None, []
+
+    def _search_web_for_exams(self, exam_name):
+        """Better search query for Indian exams (SSC, RRB, UPSC, Banking)."""
+        print(f"[SEARCH-DEBUG] Attempting DuckDuckGo search...")
+
+        try:
+            from duckduckgo_search import DDGS
+            print(f"[SEARCH-DEBUG] ✅ DuckDuckGo module imported")
+
+            name = (exam_name or "").strip()
+            low = name.lower()
+
+            # Build smarter query based on exam_name
+            if "ssc" in low or "staff selection" in low:
+                query = f"{name} exam list site:ssc.nic.in"
+            elif "rrb" in low or "railway" in low:
+                query = f"{name} exam list JE NTPC Group D ALP"
+            elif "upsc" in low:
+                query = f"{name} exam list prelims mains India"
+            elif "ibps" in low or "bank" in low or "banking" in low:
+                query = f"{name} exam list PO clerk RRB"
+
+            # ✅ HPCL: match even if user types "HPCL exam"
+            elif "hpcl" in low:
+                query = (
+                    "Hindustan Petroleum Corporation Limited HPCL recruitment "
+                    "engineer officer technician exam"
+                )
+
+            # ✅ HAL: match "hal", "hal exam", or if they type full name
+            elif low == "hal" or low.startswith("hal ") or "hindustan aeronautics" in low:
+                query = (
+                    "Hindustan Aeronautics Limited HAL recruitment "
+                    "design trainee management trainee engineer exam"
+                )
+
+            else:
+                query = f"{name} exam types list India"
+
+            print(f"[SEARCH-DEBUG] Query: '{query}'")
+
+            results = []
+            with DDGS() as ddgs:
+                search_results = list(ddgs.text(query, region="in-en", max_results=5))
+                print(f"[SEARCH-DEBUG] Got {len(search_results)} results from DuckDuckGo")
+
+                for i, r in enumerate(search_results):
+                    title = r.get("title", "")
+                    body = r.get("body", "")
+                    print(f"[SEARCH-DEBUG] Result {i+1}: {title[:50]}...")
+                    results.append(f"Title: {title}\n{body}\n")
+
+            if not results:
+                print("[SEARCH-DEBUG] ⚠️ No DDG results, trying fallback scrape...")
+                fallback = self._search_web_fallback(exam_name)
+                return fallback
+
+            combined = "\n---\n".join(results[:3])
+            print(
+                f"[SEARCH-DEBUG] ✅ Returning {len(results)} results ({len(combined)} chars)"
+            )
+            return combined
+
+        except Exception as e:
+            print(f"[SEARCH-DEBUG] ❌ DuckDuckGo search failed: {e}")
+            print("[SEARCH-DEBUG] Trying fallback Google scrape...")
+            fallback = self._search_web_fallback(exam_name)
+            if fallback:
+                return fallback
+
+            print("[SEARCH-DEBUG] Using minimal text fallback...")
+            # Last-resort fallback: still give *something* to the AI
+            return f"Information about {exam_name} exam in India (no web search results)."
+
+    def _search_web_fallback(self, exam_name):
+        """DEBUG VERSION - Shows Google scraping process"""
+        print(f"[FALLBACK-DEBUG] Starting Google scrape...")
+        
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+            print(f"[FALLBACK-DEBUG] ✅ Modules imported (requests, BeautifulSoup)")
+            
+            query = f"{exam_name}+exam+types+India"
+            url = f"https://www.google.com/search?q={query}"
+            print(f"[FALLBACK-DEBUG] URL: {url}")
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            print(f"[FALLBACK-DEBUG] Sending request to Google...")
+            response = requests.get(url, headers=headers, timeout=5)
+            print(f"[FALLBACK-DEBUG] Response status: {response.status_code}")
+            print(f"[FALLBACK-DEBUG] Response length: {len(response.text)} chars")
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            print(f"[FALLBACK-DEBUG] BeautifulSoup parsed HTML")
+            
+            # Extract snippets
+            snippets = []
+            for div in soup.find_all('div', class_='BNeawe'):
+                text = div.get_text()
+                if len(text) > 20 and exam_name.lower() in text.lower():
+                    snippets.append(text)
+                    print(f"[FALLBACK-DEBUG] Found snippet {len(snippets)}: {text[:60]}...")
+                    if len(snippets) >= 5:
+                        break
+            
+            if snippets:
+                result = "\n".join(snippets[:3])
+                print(f"[FALLBACK-DEBUG] ✅ Returning {len(snippets)} snippets ({len(result)} chars)")
+                return result
+            else:
+                print(f"[FALLBACK-DEBUG] ⚠️ No snippets found with class 'BNeawe'")
+                print(f"[FALLBACK-DEBUG] Trying alternative parsing...")
+                
+                # Try alternative classes
+                for div in soup.find_all(['div', 'span'], class_=['aCOpRe', 'VwiC3b', 'yXK7lf']):
+                    text = div.get_text()
+                    if len(text) > 20:
+                        snippets.append(text)
+                        print(f"[FALLBACK-DEBUG] Alt snippet {len(snippets)}: {text[:60]}...")
+                        if len(snippets) >= 5:
+                            break
+                
+                if snippets:
+                    result = "\n".join(snippets[:3])
+                    print(f"[FALLBACK-DEBUG] ✅ Found {len(snippets)} snippets using alt classes")
+                    return result
+                else:
+                    print(f"[FALLBACK-DEBUG] ❌ No snippets found at all")
+                    return None
+            
+        except ImportError as ie:
+            print(f"[FALLBACK-DEBUG] ❌ Missing module: {ie}")
+            print(f"[FALLBACK-DEBUG] You need to install: pip install beautifulsoup4 requests")
+            return None
+        except Exception as e:
+            print(f"[FALLBACK-DEBUG] ❌ Failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _show_exam_selection_popup_with_save(self, category_name, exam_options):
+        """
+        Show popup with exam options and Save & Continue button.
+        Returns: (selected_exam, should_save_now)
+        """
+        import tkinter as tk
+        from tkinter import ttk
+        
+        dialog = tk.Toplevel(self)
+        dialog.title("Select Specific Exam")
+        dialog.geometry("480x650")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.configure(bg="white")
+        
+        # Center dialog
+        dialog.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - 480) // 2
+        y = self.winfo_y() + (self.winfo_height() - 600) // 2
+        dialog.geometry(f"480x650+{x}+{y}")
+        
+        result = {"exam": None, "should_save": False}
+        
+        # Header
+        header = tk.Frame(dialog, bg="#FF9800", height=80)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        
+        tk.Label(header, text="⚠️ Please Specify Exact Exam", 
+                bg="#FF9800", fg="white",
+                font=("Segoe UI", 14, "bold")).pack(pady=(18, 0))
+        
+        tk.Label(header, text=f"We found multiple {category_name} exam types",
+                bg="#FF9800", fg="#FFF3E0",
+                font=("Segoe UI", 9)).pack()
+        
+        # Content
+        content = tk.Frame(dialog, bg="white")
+        content.pack(fill="both", expand=True, padx=20, pady=15)
+        
+        # Info box
+        info_frame = tk.Frame(content, bg="#FFF3E0", relief="flat", bd=1)
+        info_frame.pack(fill="x", pady=(0, 15))
+        
+        tk.Label(info_frame, text="💡 Why we need this:",
+                bg="#FFF3E0", fg="#E65100",
+                font=("Segoe UI", 9, "bold"), anchor="w").pack(anchor="w", padx=10, pady=(8, 2))
+        
+        reasons = [
+            "✓ Generate exam-specific study content",
+            "✓ Show relevant PYQ (Previous Year Questions)",
+            "✓ Focus on topics that appear in YOUR exam",
+            "✓ Accurate syllabus coverage"
+        ]
+        
+        for reason in reasons:
+            tk.Label(info_frame, text=reason,
+                    bg="#FFF3E0", fg="#666",
+                    font=("Segoe UI", 8), anchor="w").pack(anchor="w", padx=20, pady=1)
+        
+        tk.Label(info_frame, text="", bg="#FFF3E0").pack(pady=2)
+        
+        # Options header
+        header_row = tk.Frame(content, bg="white")
+        header_row.pack(fill="x", pady=(0, 8))
+        
+        tk.Label(header_row, text="Select your exam:",
+                bg="white", fg="#333",
+                font=("Segoe UI", 10, "bold")).pack(side="left")
+        
+        tk.Label(header_row, text=f"({len(exam_options)} found)",
+                bg="white", fg="#999",
+                font=("Segoe UI", 8)).pack(side="left", padx=(5, 0))
+        
+        # Scrollable options — wrapped so buttons appear BELOW, not beside
+        list_wrapper = tk.Frame(content, bg="white")
+        list_wrapper.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(list_wrapper, bg="white", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(list_wrapper, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg="white")
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        selected_var = tk.StringVar()
+        custom_exam_var = tk.StringVar()  # ✅ For "Others" custom input
+
+        # Create radio buttons for exam options
+        for option in exam_options:
+            option_frame = tk.Frame(scrollable_frame, bg="white", relief="solid", bd=1)
+            option_frame.pack(fill="x", pady=3, padx=5)
+
+            rb = tk.Radiobutton(
+                option_frame,
+                text=option,
+                variable=selected_var,
+                value=option,
+                bg="white",
+                fg="#333",
+                font=("Segoe UI", 10),
+                activebackground="#f5f5f5",
+                cursor="hand2",
+                anchor="w",
+                wraplength=380,
+            )
+            rb.pack(fill="x", padx=12, pady=10)
+
+            # Hover effects
+            def on_enter(e, frame=option_frame, radio=rb):
+                frame.configure(bg="#f5f5f5", relief="solid", bd=2)
+                radio.configure(bg="#f5f5f5")
+
+            def on_leave(e, frame=option_frame, radio=rb):
+                frame.configure(bg="white", relief="solid", bd=1)
+                radio.configure(bg="white")
+
+            option_frame.bind("<Enter>", on_enter)
+            option_frame.bind("<Leave>", on_leave)
+            rb.bind("<Enter>", on_enter)
+            rb.bind("<Leave>", on_leave)
+
+        # ✅ ADD "Others" OPTION with custom input
+        others_frame = tk.Frame(scrollable_frame, bg="#FFF8E1", relief="solid", bd=1)
+        others_frame.pack(fill="x", pady=(10, 3), padx=5)
+        
+        others_inner = tk.Frame(others_frame, bg="#FFF8E1")
+        others_inner.pack(fill="x", padx=12, pady=10)
+        
+        others_rb = tk.Radiobutton(
+            others_inner,
+            text="🔧 Others (enter custom exam name)",
+            variable=selected_var,
+            value="__OTHERS__",
+            bg="#FFF8E1",
+            fg="#795548",
+            font=("Segoe UI", 10, "bold"),
+            activebackground="#FFF3E0",
+            cursor="hand2",
+            anchor="w",
+        )
+        others_rb.pack(anchor="w")
+        
+        # Custom exam entry (shown below the radio button)
+        custom_entry_frame = tk.Frame(others_inner, bg="#FFF8E1")
+        custom_entry_frame.pack(fill="x", pady=(8, 0))
+        
+        tk.Label(custom_entry_frame, text="Enter exam name:",
+                bg="#FFF8E1", fg="#666", font=("Segoe UI", 8)).pack(anchor="w")
+        
+        custom_entry = tk.Entry(custom_entry_frame, textvariable=custom_exam_var,
+                               font=("Segoe UI", 10), width=35, relief="solid", bd=1)
+        custom_entry.pack(fill="x", pady=(3, 0))
+        
+        # Enable/disable custom entry based on selection
+        def on_selection_change(*args):
+            if selected_var.get() == "__OTHERS__":
+                custom_entry.config(state="normal", bg="white")
+                custom_entry.focus_set()
+            else:
+                custom_entry.config(state="disabled", bg="#f0f0f0")
+        
+        selected_var.trace_add("write", on_selection_change)
+        custom_entry.config(state="disabled", bg="#f0f0f0")  # Initially disabled
+        
+        # Hover effects for Others
+        def on_others_enter(e):
+            others_frame.configure(bg="#FFF3E0", relief="solid", bd=2)
+            others_inner.configure(bg="#FFF3E0")
+            others_rb.configure(bg="#FFF3E0")
+            custom_entry_frame.configure(bg="#FFF3E0")
+            for child in custom_entry_frame.winfo_children():
+                if isinstance(child, tk.Label):
+                    child.configure(bg="#FFF3E0")
+
+        def on_others_leave(e):
+            others_frame.configure(bg="#FFF8E1", relief="solid", bd=1)
+            others_inner.configure(bg="#FFF8E1")
+            others_rb.configure(bg="#FFF8E1")
+            custom_entry_frame.configure(bg="#FFF8E1")
+            for child in custom_entry_frame.winfo_children():
+                if isinstance(child, tk.Label):
+                    child.configure(bg="#FFF8E1")
+
+        others_frame.bind("<Enter>", on_others_enter)
+        others_frame.bind("<Leave>", on_others_leave)
+        others_rb.bind("<Enter>", on_others_enter)
+        others_rb.bind("<Leave>", on_others_leave)
+
+        # Default selection
+        if exam_options:
+            selected_var.set(exam_options[0])
+
+        # Status label just above buttons
+        status_label = tk.Label(content, text="", bg="white", fg="#666",
+                               font=("Segoe UI", 8))
+        status_label.pack(pady=(5, 0), anchor="w")
+
+        # Buttons – bottom row, left-aligned
+        btn_frame = tk.Frame(content, bg="white")
+        btn_frame.pack(fill="x", pady=(10, 5))
+
+        def on_save_continue():
+            selected = selected_var.get()
+            if selected:
+                # ✅ Handle "Others" custom input
+                if selected == "__OTHERS__":
+                    custom_name = custom_exam_var.get().strip()
+                    if not custom_name:
+                        status_label.config(text="⚠ Please enter a custom exam name", fg="#E65100")
+                        custom_entry.focus_set()
+                        return
+                    result["exam"] = custom_name
+                else:
+                    result["exam"] = selected
+                result["should_save"] = True
+                status_label.config(text="✓ Saving profile...", fg="#4CAF50")
+                dialog.after(500, dialog.destroy)
+
+        def on_just_update():
+            selected = selected_var.get()
+            if selected:
+                # ✅ Handle "Others" custom input
+                if selected == "__OTHERS__":
+                    custom_name = custom_exam_var.get().strip()
+                    if not custom_name:
+                        status_label.config(text="⚠ Please enter a custom exam name", fg="#E65100")
+                        custom_entry.focus_set()
+                        return
+                    result["exam"] = custom_name
+                else:
+                    result["exam"] = selected
+                result["should_save"] = False
+                dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        tk.Button(
+            btn_frame, text="Cancel",
+            font=("Segoe UI", 9),
+            bg="#f0f0f0", fg="#666",
+            bd=0, padx=15, pady=7,
+            cursor="hand2",
+            command=on_cancel
+        ).pack(side="left", padx=(0, 8))
+
+        tk.Button(
+            btn_frame, text="Update Only",
+            font=("Segoe UI", 9),
+            bg="#2196F3", fg="white",
+            bd=0, padx=15, pady=7,
+            cursor="hand2",
+            command=on_just_update
+        ).pack(side="left", padx=(0, 8))
+
+        tk.Button(
+            btn_frame, text="✓ Save & Continue",
+            font=("Segoe UI", 10, "bold"),
+            bg="#4CAF50", fg="white",
+            bd=0, padx=20, pady=7,
+            cursor="hand2",
+            command=on_save_continue
+        ).pack(side="left")
+        
+        dialog.bind('<Return>', lambda e: on_save_continue())
+        dialog.wait_window()
+        
+        return result["exam"], result["should_save"]
+        
+    def _start_exam_verification_async(self):
+        """Start verification in background when user leaves exam field."""
+        exam_name = (self.exam_name_var.get() or "").strip()
+        
+        if not exam_name or exam_name == self._last_verified_exam:
+            return
+        
+        self._exam_verification_pending = True
+        self._exam_verification_result = None
+        
+        import threading
+        
+        def verify_in_background():
+            try:
+                print(f"[EXAM] 🔍 Background verification: '{exam_name}'")
+                
+                is_specific, category_name, exam_options = self._verify_exam_with_ai(exam_name)
+                
+                self._exam_verification_result = (is_specific, category_name, exam_options)
+                self._last_verified_exam = exam_name
+                self._exam_verification_pending = False
+                
+                if not is_specific:
+                    if exam_options:
+                        print(f"[EXAM] ✅ Category '{category_name}' with {len(exam_options)} types")
+                    else:
+                        print(f"[EXAM] ⚠ '{exam_name}' looks like a CATEGORY ('{category_name}') but no exam list found")
+                else:
+                    print(f"[EXAM] ✅ Specific exam")
+                    
+            except Exception as e:
+                print(f"[EXAM] ⚠️ Verification failed: {e}")
+                self._exam_verification_result = (True, None, [])
+                self._exam_verification_pending = False
+        
+        thread = threading.Thread(target=verify_in_background, daemon=True)
+        thread.start()
+
+    def _get_cached_verification_or_wait(self, exam_name, max_wait_seconds=5):
+        """Get cached result or wait for background verification."""
+        import time
+        
+        if exam_name != self._last_verified_exam and not self._exam_verification_pending:
+            print(f"[EXAM] Exam changed, verifying: '{exam_name}'")
+            return self._verify_exam_with_ai(exam_name)
+        
+        if self._exam_verification_pending:
+            print(f"[EXAM] ⏳ Waiting for verification...")
+            start_time = time.time()
+            
+            while self._exam_verification_pending:
+                if time.time() - start_time > max_wait_seconds:
+                    print(f"[EXAM] ⚠️ Timeout, assuming specific")
+                    return (True, None, [])
+                
+                time.sleep(0.1)
+                self.update()
+        
+        if self._exam_verification_result:
+            print(f"[EXAM] ✅ Using cached result")
+            return self._exam_verification_result
+        else:
+            print(f"[EXAM] Verifying now: '{exam_name}'")
+            return self._verify_exam_with_ai(exam_name)
     
 # ---------- realism display gaps ----------
 MIN_GAP_MINUTES = 5
@@ -15050,9 +16023,6 @@ class StudyTimerApp(tk.Tk):
             except Exception:
                 pass
 
-        self._profile_edit_btn = tk.Button(self._profile_badge, text="✎", width=2, height=1, relief="groove", cursor="hand2", command=_open_editor)
-        self._profile_edit_btn.pack(side="left", padx=(0, 6))
-
         def _load_avatar_circular(fp, size=24):
             if not fp or not _pil_ok:
                 return None
@@ -15130,8 +16100,16 @@ class StudyTimerApp(tk.Tk):
         self.add_hover_effect(self.theme_btn, hover_bg="#D3D3D3")
 
         # Alarm button
-        self.alarm_btn = tk.Button(right_buttons_frame, text="🔔", font=("Arial", 13), bd=0, relief="flat",
-                                   command=self.select_alarm_file, cursor="hand2")
+        alarm_icon = "🔔✅" if getattr(self, "alarm_file", None) else "🔔"
+        self.alarm_btn = tk.Button(
+            right_buttons_frame,
+            text=alarm_icon,
+            font=("Arial", 13),
+            bd=0,
+            relief="flat",
+            command=self.select_alarm_file,
+            cursor="hand2",
+        )
         self.alarm_btn.pack(side="right", padx=(0, 7), pady=2)
         self.add_hover_effect(self.alarm_btn, hover_bg="#D3D3D3")
 
@@ -16826,92 +17804,17 @@ class StudyTimerApp(tk.Tk):
             menu.grab_release()
 
 
-    def _prompt_material_inclusion(self):
-        """Ask whether to include study materials during export.
-
-        Returns True/False if confirmed, or None if the user cancelled.
-        """
-        dialog = tk.Toplevel(self)
-        dialog.title("Export Options")
-        dialog.geometry("360x180")
-        dialog.resizable(False, False)
-        dialog.transient(self)
-        dialog.grab_set()
-
-        dialog.configure(bg="#f8f9fa")
-
-        tk.Label(dialog,
-                 text="Include study materials?",
-                 font=("Segoe UI", 12, "bold"),
-                 bg="#f8f9fa", fg="#2c3e50").pack(pady=(15, 5))
-
-        include_var = tk.BooleanVar(value=True)
-        chk = tk.Checkbutton(dialog,
-                             text="Export study materials (second column)",
-                             variable=include_var,
-                             font=("Segoe UI", 10),
-                             bg="#f8f9fa")
-        chk.pack(pady=(0, 10))
-
-        result = {"value": None}
-
-        def on_confirm():
-            result["value"] = include_var.get()
-            dialog.grab_release()
-            dialog.destroy()
-
-        def on_cancel():
-            result["value"] = None
-            dialog.grab_release()
-            dialog.destroy()
-
-        btn_frame = tk.Frame(dialog, bg="#f8f9fa")
-        btn_frame.pack(pady=(5, 15))
-
-        tk.Button(btn_frame, text="Cancel", command=on_cancel,
-                  font=("Segoe UI", 10), bg="#ecf0f1", fg="#2c3e50",
-                  relief="flat", padx=16, pady=6, cursor="hand2").pack(side="left", padx=6)
-
-        tk.Button(btn_frame, text="Export", command=on_confirm,
-                  font=("Segoe UI", 10, "bold"), bg="#27ae60", fg="white",
-                  relief="flat", padx=20, pady=6, cursor="hand2").pack(side="left", padx=6)
-
-        dialog.bind('<Escape>', lambda e: on_cancel())
-        dialog.wait_window()
-        return result["value"]
-
-    def _collect_plan_materials(self, plan_name: str):
-        """Return study materials for the given plan from session_materials.json."""
-        from config_paths import app_paths
-
-        materials_file = Path(app_paths.appdata_dir) / "session_materials.json"
-        if not materials_file.exists():
-            return {}
-
-        try:
-            materials = json.loads(materials_file.read_text(encoding="utf-8"))
-            prefix = f"{plan_name}_"
-            return {k: v for k, v in materials.items() if k.startswith(prefix)}
-        except Exception as e:
-            print(f"⚠ Failed to collect study materials: {e}")
-            return {}
-
-
     # 🆕 EXPORT PLAN - SAVE LOCALLY
     def export_plan_local(self, plan_name):
         """Export a plan to a JSON file on the local system."""
         from tkinter import filedialog, messagebox
         import json
         from datetime import datetime
-
+        
         if plan_name not in self.plans:
             messagebox.showerror("Export Error", f"Plan '{plan_name}' not found.")
             return
-
-        include_materials = self._prompt_material_inclusion()
-        if include_materials is None:
-            return
-
+        
         # Ask user where to save
         default_filename = f"{plan_name}_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         
@@ -16926,16 +17829,12 @@ class StudyTimerApp(tk.Tk):
             return  # User cancelled
         
         try:
-            materials = self._collect_plan_materials(plan_name) if include_materials else {}
-            
             # Create export data
             export_data = {
                 "plan_name": plan_name,
                 "exported_at": datetime.now().isoformat(),
                 "sessions": self.plans[plan_name],
-                "version": "1.1",
-                "study_materials": materials,
-                "materials_included": include_materials
+                "version": "1.0"
             }
             
             # Save to file
@@ -16946,10 +17845,9 @@ class StudyTimerApp(tk.Tk):
                 "Export Successful",
                 f"✅ Plan '{plan_name}' exported successfully!\n\n"
                 f"📁 Location: {filepath}\n"
-                f"📊 Sessions: {len(self.plans[plan_name])}\n"
-                f"📚 Study Materials: {'Included' if materials else 'Not Included'}"
+                f"📊 Sessions: {len(self.plans[plan_name])}"
             )
-
+            
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export plan:\n{e}")
 
@@ -16968,11 +17866,7 @@ class StudyTimerApp(tk.Tk):
         if plan_name not in self.plans:
             messagebox.showerror("Export Error", f"Plan '{plan_name}' not found.")
             return
-
-        include_materials = self._prompt_material_inclusion()
-        if include_materials is None:
-            return
-
+        
         try:
             # 🔐 Get credentials from secrets and profile
             from secrets_util import get_secret
@@ -17035,9 +17929,7 @@ class StudyTimerApp(tk.Tk):
                 "exported_at": datetime.now().isoformat(),
                 "sessions": self.plans[plan_name],
                 "session_count": len(self.plans[plan_name]),
-                "version": "1.1",
-                "study_materials": self._collect_plan_materials(plan_name) if include_materials else {},
-                "materials_included": include_materials,
+                "version": "1.0"
             }
             
             # Create temporary JSON file
@@ -17067,7 +17959,6 @@ class StudyTimerApp(tk.Tk):
                                 f"📚 Study Plan Backup\n\n"
                                 f"📋 Plan: {plan_name}\n"
                                 f"📊 Sessions: {len(self.plans[plan_name])}\n"
-                                f"📚 Materials: {'Included' if include_materials else 'Not Included'}\n"
                                 f"📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                             )
                         }
@@ -17090,7 +17981,6 @@ class StudyTimerApp(tk.Tk):
                             "Success",
                             f"✅ Plan '{plan_name}' sent to Telegram!\n\n"
                             f"📊 Sessions: {len(self.plans[plan_name])}\n"
-                            f"📚 Materials: {'Included' if include_materials else 'Not Included'}\n"
                             f"📱 Check your Telegram for the backup file."
                         ))
                     else:
@@ -17161,8 +18051,6 @@ class StudyTimerApp(tk.Tk):
             
             plan_name = import_data["plan_name"]
             sessions = import_data["sessions"]
-            original_plan_name = plan_name
-            imported_materials = import_data.get("study_materials", {}) or {}
             
             # Check if plan already exists
             if plan_name in self.plans:
@@ -17195,34 +18083,7 @@ class StudyTimerApp(tk.Tk):
                     while plan_name in self.plans:
                         plan_name = f"{original_name}_{counter}"
                         counter += 1
-
-            # Merge study materials with updated plan name
-            materials_imported = 0
-            if imported_materials:
-                try:
-                    from config_paths import app_paths
-
-                    adjusted_materials = {}
-                    for key, value in imported_materials.items():
-                        if plan_name != original_plan_name and key.startswith(f"{original_plan_name}_"):
-                            new_key = f"{plan_name}_{key[len(original_plan_name)+1:]}"
-                        else:
-                            new_key = key if key.startswith(f"{plan_name}_") else f"{plan_name}_{key}"
-                        adjusted_materials[new_key] = value
-
-                    materials_file = Path(app_paths.appdata_dir) / "session_materials.json"
-                    if materials_file.exists():
-                        materials = json.loads(materials_file.read_text(encoding="utf-8"))
-                    else:
-                        materials = {}
-
-                    materials.update(adjusted_materials)
-                    materials_file.parent.mkdir(parents=True, exist_ok=True)
-                    materials_file.write_text(json.dumps(materials, indent=2, ensure_ascii=False), encoding="utf-8")
-                    materials_imported = len(adjusted_materials)
-                except Exception as e:
-                    print(f"⚠ Failed to import study materials: {e}")
-
+            
             # Import the plan
             self.plans[plan_name] = sessions
             save_all_plans(self.plans)
@@ -17248,10 +18109,9 @@ class StudyTimerApp(tk.Tk):
                 f"✅ Plan imported successfully!\n\n"
                 f"📚 Plan Name: {plan_name}\n"
                 f"📊 Sessions: {len(sessions)}\n"
-                f"📚 Study Materials: {materials_imported if imported_materials else 'Not included'}\n"
                 f"📅 Exported: {import_data.get('exported_at', 'Unknown')}"
             )
-
+            
         except json.JSONDecodeError:
             messagebox.showerror("Invalid File", "The selected file is not a valid JSON file.")
         except Exception as e:
@@ -22720,7 +23580,10 @@ class StudyTimerApp(tk.Tk):
                     print(f"[VALIDATION] Trial active: {trial_message}")
                     
                     referral_applied = user_profile.get('referral_code') is not None
-                    price_info = "₹199 (Referral applied!)" if referral_applied else "₹349"
+                    if referral_applied:
+                        price_info = f"₹{SUBSCRIPTION_PRICE_REFERRAL_RUPEES} (Referral applied!)"
+                    else:
+                        price_info = f"₹{SUBSCRIPTION_PRICE_NORMAL_RUPEES}"
                     
                     if not getattr(self, '_trial_info_shown', False):
                         from tkinter import messagebox
@@ -22802,8 +23665,12 @@ class StudyTimerApp(tk.Tk):
                         button_font = font.Font(family="Arial", size=11, weight="bold")
                         
                         # Check referral for pricing
-                        referral_applied = user_profile.get('referral_code') is not None
-                        price_text = "₹199" if referral_applied else "₹349"
+                        referral_applied = user_profile.get("referral_code") is not None
+                        price_rupees = (
+                            SUBSCRIPTION_PRICE_REFERRAL_RUPEES if referral_applied
+                            else SUBSCRIPTION_PRICE_NORMAL_RUPEES
+                        )
+                        price_text = f"₹{price_rupees}"
                         
                         # Header
                         header_frame = tk.Frame(popup, bg=header_color, height=80)
@@ -23096,7 +23963,11 @@ class StudyTimerApp(tk.Tk):
 
         # Check referral for pricing
         referral_applied = user_profile.get("referral_code") is not None
-        price_text = "₹199" if referral_applied else "₹349"
+        price_rupees = (
+            SUBSCRIPTION_PRICE_REFERRAL_RUPEES if referral_applied
+            else SUBSCRIPTION_PRICE_NORMAL_RUPEES
+        )
+        price_text = f"₹{price_rupees}"
 
         # Header
         header_frame = tk.Frame(popup, bg=header_color, height=80)
@@ -24353,7 +25224,7 @@ class StudyTimerApp(tk.Tk):
             
         except Exception as e:
             print(f"   ❌ Unexpected error: {e}")
-            print(f"   📝 Error type: {type(e)._name_}")
+            print(f"   📝 Error type: {type(e).__name__}")
             return False
 
     def send_debug_test_email(self):
@@ -27974,14 +28845,19 @@ class StudyTimerApp(tk.Tk):
             
             # Get current session day
             current_session_day = self._get_session_current_day(session_name)
-            days = self._get_days_until_exam()
             
-            if days:
-                key = f"{self.current_plan_name}_{session_name}_sessionday{current_session_day}_{days}daysRemaining"
-                if key in materials:
-                    return "✅ View"
+            # ✅ NEW: Check if material exists using the block_day format
+            # Use the helper method to find existing material
+            existing_material = self._find_existing_material_block(
+                session_name, 
+                current_session_day, 
+                materials_file
+            )
             
-            return "📄 Create"
+            if existing_material:
+                return "✅ View"
+            else:
+                return "📄 Create"
                 
         except Exception as e:
             print(f"⚠ Error reading materials: {e}")
@@ -28003,6 +28879,571 @@ class StudyTimerApp(tk.Tk):
         except:
             return "pending"
 
+    def _find_existing_material_block(self, session_name, current_day, materials_file):
+        """Find existing material block with SUBJECT VALIDATION to prevent mismatch."""
+        if not materials_file.exists():
+            return None
+        
+        try:
+            materials = json.loads(materials_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[MATERIAL] Failed to read materials: {e}")
+            return None
+        
+        plan_name = self.current_plan_name or "Default"
+        base_prefix = f"{plan_name}_{session_name}_block_day"
+        print(f"[MATERIAL] Looking for: {base_prefix}* (plan={plan_name})")
+        
+        # Subject keywords for content validation
+        subject_keywords = {
+            "polity": ["constitution", "article", "parliament", "president", "rights", "duties", "government", "amendment", "judiciary", "lok sabha", "rajya sabha", "supreme court"],
+            "geography": ["river", "dam", "mountain", "climate", "soil", "crop", "irrigation", "ocean", "forest", "mineral", "plateau", "water", "rainfall"],
+            "history": ["mughal", "british", "revolt", "movement", "freedom", "dynasty", "empire", "war", "ancient", "medieval", "maurya", "gupta", "1857"],
+            "economics": ["gdp", "inflation", "budget", "tax", "rbi", "fiscal", "monetary", "trade", "market", "finance", "bank"],
+            "science": ["physics", "chemistry", "biology", "cell", "atom", "energy", "force", "element", "compound", "reaction"]
+        }
+        
+        for start_day in range(max(1, current_day - 9), current_day + 1):
+            block_key = f"{base_prefix}{start_day}"
+            if block_key in materials:
+                material_json = materials[block_key]
+                try:
+                    data = json.loads(material_json)
+                    topics = data.get("topics", [])
+                    
+                    if topics:
+                        # ✅ SUBJECT VALIDATION
+                        all_topics_text = " ".join([t.get("topic", "").lower() for t in topics[:5]])
+                        plan_lower = plan_name.lower()
+                        
+                        # Detect what subject the cached content belongs to
+                        content_subject = None
+                        for subj, kws in subject_keywords.items():
+                            if any(kw in all_topics_text for kw in kws):
+                                content_subject = subj
+                                break
+                        
+                        # Detect expected subject from plan name
+                        expected_subject = None
+                        for subj in subject_keywords.keys():
+                            if subj in plan_lower:
+                                expected_subject = subj
+                                break
+                        
+                        # ✅ SKIP if subject mismatch!
+                        if content_subject and expected_subject and content_subject != expected_subject:
+                            print(f"⚠️ MISMATCH! Expected '{expected_subject}' but found '{content_subject}'")
+                            print(f"   Topics: {all_topics_text[:80]}...")
+                            print(f"   → Will regenerate correct content")
+                            continue
+                    
+                    for topic in topics:
+                        for day_info in topic.get("daily_breakdown", []):
+                            if day_info.get("day") == current_day:
+                                print(f"✅ Found VALID material (day {start_day}, plan={plan_name})")
+                                return material_json
+                except Exception as e:
+                    print(f"[MATERIAL] Parse error: {e}")
+                    continue
+        
+        print(f"ℹ️ No valid material for {plan_name}/{session_name} day {current_day}")
+        return None
+        
+    def _create_enhanced_material_prompt(self, session_name, exam_name, duration_minutes, 
+                                         days_until_exam, current_day, block_start_day, 
+                                         block_end_day, topics_count, plan_name=None):
+        """Create ENHANCED prompt with PYQ focus, exam-specific filtering, and time-based urgency."""
+        
+        # ✅ FIX: Get subject from plan_name for content filtering
+        subject_name = plan_name or self.current_plan_name or session_name
+        
+        # Determine urgency level
+        if days_until_exam <= 3:
+            urgency = "CRITICAL"
+            urgency_note = "ONLY most frequently asked topics (80%+ probability). Skip basics."
+        elif days_until_exam <= 7:
+            urgency = "HIGH"
+            urgency_note = "Prioritize high-weightage topics (60%+ probability)."
+        elif days_until_exam <= 15:
+            urgency = "MEDIUM"
+            urgency_note = "Balance coverage and depth. Focus on moderate to high weightage."
+        else:
+            urgency = "NORMAL"
+            urgency_note = "Comprehensive coverage with gradual progression."
+        
+        # Exam-specific filtering instructions
+        exam_filter = f"""
+EXAM-SPECIFIC FILTERING FOR {exam_name}:
+
+⚠️ CRITICAL: Filter topics based on ACTUAL exam pattern!
+
+- If "SSC JE": Engineering focus
+  * Geography: Dams, Rivers, Irrigation (most frequent in PYQs)
+  * Polity: Constitutional Bodies related to infrastructure
+  * Focus on technical applications
+  * Example: "Bhakra Dam - Height, Capacity, State"
+
+- If "SSC CHSL": General Awareness focus  
+  * Geography: Mountain Peaks, Crops, Climate (most frequent in PYQs)
+  * Polity: Fundamental Rights/Duties, Government Schemes
+  * Focus on factual questions
+  * Example: "Mt. Everest - Height 8,849m, Nepal-Tibet"
+
+- If "SSC CGL": Balanced quantitative + awareness
+  * Geography: Statistical data + concepts
+  * Polity: Complete Constitution coverage
+  * Focus on analytical questions
+  * Example: "River Ganga - Length 2,525km, Economic importance"
+
+- If "UPSC": Deep conceptual + current affairs
+  * All topics with WHY and HOW focus
+  * Interconnections and analysis
+  * Multi-dimensional understanding
+
+⚠️ Don't use generic topics - each exam has DIFFERENT focus areas!
+"""
+        
+        prompt = f"""Create a CONSISTENT, PYQ-FOCUSED study plan for Days {block_start_day}-{block_end_day}.
+
+SESSION: {session_name}
+SUBJECT: {subject_name}
+EXAM: {exam_name}
+DURATION: {duration_minutes} min/day
+DAYS LEFT: {days_until_exam}
+URGENCY: {urgency}
+
+⚠️ SUBJECT RESTRICTION - MANDATORY:
+Generate content ONLY for subject: **{subject_name}**
+- "Polity" → Constitution, Parliament, Rights, Duties, Articles, Government bodies
+- "Geography" → Rivers, Dams, Mountains, Climate, Soil, Crops, Minerals  
+- "History" → Events, Dynasties, Movements, Dates, Personalities
+- "Economics" → GDP, Budget, RBI, Trade, Fiscal/Monetary policy
+- "Science" → Physics, Chemistry, Biology concepts
+⛔ DO NOT MIX! A Polity session must NEVER contain Geography/History content!
+
+⚠️ CRITICAL REQUIREMENTS:
+
+1. CONSISTENCY:
+   - This plan covers Days {block_start_day}-{block_end_day} and will be REUSED
+   - Topics must follow LOGICAL PROGRESSION
+   - DO NOT generate random topics
+   - Content should be DETERMINISTIC (same every time)
+
+2. PYQ FOCUS (MANDATORY):
+   - ONLY topics appearing in 50%+ of previous year papers (2018-2024)
+   - Urgency level: {urgency_note}
+   - MUST cite years: "Asked in 2019, 2021, 2023 exams"
+   - Mark weightage based on actual frequency: "Very High (80%)", "High (60%)", "Medium (40%)"
+   - Include PYQ question types for each topic
+
+3. TIME-BASED PRIORITY:
+   Days left: {days_until_exam}
+   • ≤3 days: ONLY highest scoring topics (skip all basics/introductions)
+     Example: "Fundamental Rights Articles 12-35" NOT "Introduction to Constitution"
+   • ≤7 days: Skip theory, focus on formulas and PYQ patterns
+     Example: "Quick formulas + 20 PYQs" NOT "Concept explanation"
+   • ≤15 days: High-weightage topics with quick revision
+   • >15 days: Can include foundations + comprehensive coverage
+
+{exam_filter}
+
+4. TOMORROW'S PREVIEW:
+   - Topics for Day {current_day + 1} MUST appear in Day {current_day + 1} daily_breakdown
+   - Be SPECIFIC: "Rivers and Dams of India" not "Geography"
+   - Preview must be actionable: "Study 10 major dams with heights" not "Learn about dams"
+
+5. CONTENT DEPTH (per day):
+   - 200-400 words in content_brief
+   - Include: PYQ patterns, key formulas, common mistakes
+   - Add scoring tips: "This topic gives 4-6 marks every exam"
+   - Focus on SCORING ability, not just knowledge
+
+CREATE {topics_count} TOPICS in this exact JSON structure:
+
+{{
+  "strategy": {{
+    "total_content_scope": "Based on {exam_name} PYQ analysis 2018-2024",
+    "why_these_topics": "These appear in 70%+ of previous papers with high marks allocation",
+    "previous_year_analysis": "Specific PYQ patterns: [list actual years and frequency]",
+    "expected_topics": "High probability topics for upcoming exam based on 5-year trend",
+    "time_allocation": "Optimized for {days_until_exam} days remaining - {urgency} priority",
+    "urgency_note": "{urgency_note}"
+  }},
+  "topics": [
+    {{
+      "topic": "Specific topic name from PYQ analysis",
+      "importance": "High/Medium/Low",
+      "exam_frequency": "Very High (appeared in 80% of papers 2020-2024)",
+      "pyq_years": "2018, 2019, 2021, 2022, 2023, 2024",
+      "days_allocated": 2,
+      "daily_breakdown": [
+        {{
+          "day": {block_start_day},
+          "focus": "Specific focus for this day",
+          "content_brief": "200-400 words with PYQ patterns, formulas, examples, scoring tips",
+          "pyq_question_types": "Types: Direct recall (30%), Application (40%), Analysis (30%)",
+          "scoring_tips": "How to maximize marks in exam",
+          "common_mistakes": "What students typically get wrong"
+        }}
+      ]
+    }}
+  ],
+  "tomorrows_preview": {{
+    "day": {current_day + 1},
+    "topics_planned": ["Exact topic 1 from day {current_day + 1}", "Exact topic 2 from day {current_day + 1}"],
+    "time_breakdown": "20min: Topic 1 basics, 25min: Topic 2 with PYQs, 15min: Quick revision",
+    "preparation_needed": "Keep notes ready, solve 10 PYQs, revise key formulas"
+  }}
+}}
+
+VALIDATION CHECKLIST (AI must verify before responding):
+✓ All topics are from PYQ analysis 2018-2024 (not generic theory)
+✓ {exam_name}-specific filtering applied correctly
+✓ {days_until_exam} days urgency considered in topic selection
+✓ Content is CONSISTENT and will not change on reload
+✓ Tomorrow's preview topics match Day {current_day + 1} daily_breakdown exactly
+✓ Valid JSON (no trailing commas, proper quotes)
+✓ Each topic has pyq_years field with actual years
+✓ Frequency percentages are realistic (based on actual PYQ data)
+
+Return ONLY valid JSON with NO additional text, markdown, or explanations."""
+
+        return prompt
+        
+    def _get_enhanced_capsule_prompt(self, capsule_id, topic_name, session_name, 
+                                 exam_name, content_brief, current_day, days_until_exam, duration_minutes):
+        """Get ENHANCED prompts for deep dive capsules with PYQ focus and exam specificity."""
+        
+        context = f"""
+Topic: {topic_name} (Day {current_day})
+Exam: {exam_name}
+Session: {session_name}
+Days Left: {days_until_exam}
+Focus: {content_brief}
+
+⚠️ MANDATORY Requirements:
+1. Only content that appears in 50%+ of PYQs (2018-2024)
+2. Specific to {exam_name} exam pattern
+3. Helps score marks (not just theory)
+4. Cite actual years when topics appeared
+"""
+        
+        prompts = {
+            "objectives": context + """
+Create SCORING OBJECTIVES (not learning goals):
+
+Format: "After this, you can solve [SPECIFIC PYQ TYPE] (appeared 2019, 2021, 2023)"
+
+List 5-7 objectives, each with:
+- Exact PYQ question type you can solve
+- Years this appeared in exams
+- Marks allocation (e.g., "2-3 marks per question")
+- Expected solving time
+- Success rate target (e.g., "Aim for 80%+ accuracy")
+
+Example:
+✅ "Solve Article-based matching questions on Fundamental Rights (appeared 2019, 2021, 2022, 2023 - 2 marks each - 1 min per question)"
+✅ "Calculate numerical problems on dam capacity and power generation (appeared 2020, 2022, 2023 - 3 marks each - 2 min per question)"
+
+Focus ONLY on SCORING ability, not knowledge acquisition.""",
+
+            "concepts": context + f"""
+CORE CONCEPTS - PYQ Analysis Based:
+
+For {exam_name} specifically, structure content as:
+
+1. MOST ASKED CONCEPTS (with PYQ frequency)
+   For each concept:
+   - Appeared in: [list years]
+   - Frequency rating: "Very High (80%)", "High (60%)", etc.
+   - Typical marks: [marks range]
+   
+   Example: "Bhakra Dam specifications - Appeared 2019, 2021, 2022 - Very High (75% of SSC JE papers) - 2-3 marks"
+
+2. QUESTION PATTERNS
+   - How this concept is tested: "Direct recall", "Calculation", "Comparison"
+   - Common question formats
+   - Typical wrong options (help identify traps)
+   - Time allocation per question type
+
+3. QUICK REVISION POINTS
+   - Bullet points for last-minute revision
+   - Memory tricks used by toppers
+   - Must-remember facts (with numbers, dates, names)
+
+4. CONCEPT CONNECTIONS
+   - How this links to other frequently asked topics
+   - Combination questions possibility
+   - Cross-topic application
+
+IMPORTANT: Skip concepts that rarely appear in {exam_name}!
+NO generic theory - ONLY what appears in PYQs!""",
+
+            "formulas": context + f"""
+KEY FORMULAS - {exam_name} PYQ Analysis:
+
+List 10-15 formulas that appear MOST in PYQs:
+
+For each formula provide:
+📐 Formula: [plain text notation]
+📊 Frequency: "Appeared in 2019, 2021, 2022, 2023" (70% of thermodynamics questions)
+🎯 When asked: "Usually in questions about [specific pattern]"
+⚠️ Common mistakes: [What students get wrong]
+✅ Quick check: [How to verify if answer is reasonable]
+⏱ Solving time: [Expected time: 30 sec, 1 min, 2 min]
+💡 Shortcut: [Faster method if available]
+
+Format examples:
+η = W/Q_in (Efficiency formula)
+- Frequency: 80% of thermodynamics problems in SSC JE
+- When: Asked in heat engine, refrigerator questions
+- Mistake: Confusing Q_in with Q_out
+- Check: η must be < 1 (or < 100%)
+- Time: 30 seconds
+- Shortcut: η = 1 - (T_cold/T_hot) for Carnot
+
+R = ρL/A (Resistance formula)
+- Frequency: 90% of circuit problems
+- When: Wire resistance, heating calculations
+- Mistake: Forgetting unit conversions (mm to m)
+- Check: Higher length = higher R
+- Time: 1 minute
+
+Use symbols: η α β π Δ Σ √ × ÷ ≈ ≤ ≥ θ ω λ μ""",
+
+            "practice": context + """
+PRACTICE PROBLEMS - 100% PYQ Style:
+
+Structure:
+
+1. PYQ-BASED SOLVED EXAMPLES (5 problems)
+   For each:
+   - Mark year and exam: "[SSC JE 2022, Paper 1, Q.45]"
+   - Full question as asked
+   - Complete solution with all steps
+   - Highlight the SHORTCUT/TRICK method
+   - Explain why wrong options were wrong
+   - Time taken: "Should complete in 2 min"
+   
+2. PRACTICE SET (6 problems - Various difficulty)
+   - 2 Easy (similar to examples)
+   - 2 Medium (slight variations)
+   - 2 Hard (combination/tricky)
+   - All must match actual PYQ difficulty
+   - Solutions with time estimates
+   
+3. COMMON MISTAKES SECTION
+   - List top 5 errors students make
+   - Show: Wrong approach → Why it's wrong → Correct approach
+   - Mark each with ❌ (wrong) and ✅ (correct)
+
+4. SCORING STRATEGY
+   - Which questions to attempt first (easy marks)
+   - Which to skip if short on time
+   - Time management: "Allocate max 2 min per question"
+   - Elimination strategy for MCQs
+
+CRITICAL: NO made-up questions! All patterns must reflect ACTUAL exam questions!
+Include exact marks, negative marking info where applicable.""",
+
+            "strategy": context + f"""
+EXAM STRATEGY - {exam_name} Scoring Focus:
+
+Create a step-by-step exam strategy:
+
+1. QUESTION IDENTIFICATION (2 min reading strategy)
+   - How to spot this topic's questions quickly
+   - Key words/phrases to look for
+   - Question type indicators
+   - Difficulty assessment tricks
+
+2. SOLVING SEQUENCE (Optimized for marks)
+   - STEP 1: [First thing to do - with time]
+   - STEP 2: [Next step - with time]
+   - STEP 3: [Final step - with time]
+   - When to use shortcuts
+   - When to show all work (for partial marks)
+
+3. ELIMINATION TECHNIQUES (For MCQs)
+   - How to remove obviously wrong options
+   - Common traps in {exam_name} that look right
+   - Using dimensional analysis
+   - Order of magnitude checks
+
+4. TIME MANAGEMENT
+   - Expected time per question type
+   - When to skip and move on (1 min rule, 2 min rule, etc.)
+   - How to mark questions for review
+   - Last 5 minutes strategy
+
+5. MARK MAXIMIZATION
+   - Partial marking strategies (show work even if answer wrong)
+   - Negative marking considerations
+   - Risk vs reward for guessing
+   - How to write for maximum marks in descriptive answers
+
+6. LAST-MINUTE TIPS (5 min before exam)
+   - What formulas to revise
+   - Common mistakes checklist
+   - Confidence boosters
+   - Typical exam-day errors to avoid
+
+Focus SPECIFICALLY on {exam_name} patterns and marking scheme!""",
+
+            "materials": context + f"""
+STUDY MATERIALS GUIDE - Aspirant-Verified Resources ONLY:
+
+⚠️ STRICT RULE: Recommend ONLY resources that are:
+- Mentioned by successful {exam_name} aspirants in topper interviews
+- Have proven track record (topper testimonials available)
+- Freely accessible or commonly used by 70%+ aspirants
+
+Structure:
+
+📚 RECOMMENDED BOOKS (For {exam_name} specifically)
+List 3-5 books with:
+- Full book name and author
+- Used by: "Recommended by X% of {exam_name} toppers" (cite source if possible)
+- Chapters to focus: "Chapters 5, 7, 12 for this topic"
+- Why recommended: "Best for conceptual clarity / PYQ practice / quick revision"
+- Where to get: Online/Offline, Price range
+
+Example:
+"NCERT Geography Class 11 - Chapter 3 (Drainage Systems)
+- Used by: 90% of SSC aspirants (source: SSC Topper 2023 interviews)
+- Focus: Pages 34-48 for Indian rivers
+- Why: Official curriculum, exam questions directly from this
+- Available: Free PDF on NCERT website, ₹50 in bookstores"
+
+🌐 ONLINE RESOURCES (Verified URLs Only)
+For each resource:
+- Resource name
+- Full working URL: https://[exact link]
+- What's available: "Free PYQ solutions 2018-2024"
+- Best for: "Video lectures / Practice tests / Notes"
+- Updated: "Last updated [date]"
+- Cost: Free / ₹X per month
+
+Examples:
+"SSC Official Website - https://ssc.nic.in
+- Previous year papers (2015-2024)
+- Official notifications and syllabus
+- 100% Free"
+
+"ExamGoal SSC Portal - https://www.examgoal.com/ssc
+- Chapter-wise PYQ solutions
+- Free study notes
+- Topic-wise tests
+- Cost: Free (Ads supported)"
+
+📺 YOUTUBE CHANNELS (Popular & Verified)
+For each channel:
+- Channel name (must be well-known)
+- Good for: "{exam_name} specific topic coverage"
+- Best playlist for this topic
+- Average video quality/clarity rating
+- Language: English / Hindi / Regional
+
+📱 APPS & TOOLS
+- App name
+- Platform: Android / iOS / Web
+- Specific use: "Daily practice questions / Mock tests / Flashcards"
+- Features: [key features]
+- Cost: Free / Premium (₹X)
+- User rating: X/5 stars
+
+📄 FREE RESOURCES
+- Government websites with study material
+- Official syllabus documents (with links)
+- Free coaching material (if legally available)
+- College/University open courseware
+
+💡 EFFECTIVE USAGE TIPS
+- How to use these resources together
+- Recommended study sequence
+- Time allocation per resource
+- Integration with your study plan
+
+⚠️ CRITICAL:
+- ALL URLs must be REAL and WORKING (verify before listing)
+- Only suggest resources used by ACTUAL toppers
+- Prioritize FREE resources first
+- Be honest about what each resource is good for
+- No affiliate links or promotions""",
+
+            "preview": context + f"""
+TOMORROW'S PREVIEW for Day {current_day + 1}:
+
+Based on the study plan, create a SPECIFIC, ACTIONABLE preview:
+
+1. EXACT TOPICS (Must match tomorrow's plan!)
+   List 2-4 topics with:
+   • Topic name: [Exact name from study plan]
+   • What you'll do: [Concrete actions, not vague goals]
+   • PYQ coverage: [Which years, how many questions]
+   • Expected marks: [Marks potential from this topic]
+   
+   Example:
+   • Rivers and Tributaries of India
+     - What: Memorize 15 major rivers with lengths, tributaries, and states
+     - PYQ: Appeared in 2019, 2021, 2022, 2023 (avg 2-3 questions per exam)
+     - Marks: 4-6 marks expected
+
+2. TIME BREAKDOWN (Total {duration_minutes} minutes)
+   Create realistic time blocks:
+   • 00-15 min: [Specific activity with deliverable]
+   • 15-35 min: [Specific activity with deliverable]
+   • 35-50 min: [Specific activity with deliverable]
+   • 50-60 min: [Quick revision + self-test]
+   
+   Example:
+   • 00-15 min: Read and highlight key points in notes (15 rivers data)
+   • 15-35 min: Create flashcards for river-state-length (20 min active recall)
+   • 35-50 min: Solve 10 PYQs on rivers (15 min timed practice)
+   • 50-60 min: Quick revision of all 15 rivers (10 min speed test)
+
+3. PRACTICE PLAN
+   Be specific about numbers:
+   • Questions to solve: [Exact number and type]
+   • PYQ years to focus: [Specific years]
+   • Expected completion: [Time estimate]
+   • Target accuracy: [Percentage]
+   
+   Example:
+   • Solve 10 PYQs from 2020-2023 on river systems
+   • Time limit: 15 minutes (1.5 min per question)
+   • Target: 8/10 correct (80% accuracy)
+   • If time permits: 5 more from 2018-2019
+
+4. CONNECTION TO TODAY
+   2-3 sentences explaining:
+   • How tomorrow builds on today's {topic_name}
+   • What prerequisites you need from today
+   • Combined scoring potential
+   
+   Example:
+   "Today you learned about river basins and drainage patterns. Tomorrow's focus on specific rivers will help you apply this knowledge to answer comparison questions. Together, these topics cover 8-10 marks in every {exam_name} paper."
+
+5. PREPARATION CHECKLIST
+   What to keep ready tonight:
+   ✓ Materials needed: [List physical items]
+   ✓ Pre-read tonight: [Quick 5-min preview topics]
+   ✓ Mental preparation: [Motivation / mindset tip]
+   
+   Example:
+   ✓ Keep ready: Blank flashcards, colored pens, India map
+   ✓ Pre-read: List of 15 major rivers (5 min before sleep)
+   ✓ Mindset: "Rivers are scoring topic - 80%+ students get this right!"
+
+⚠️ CRITICAL:
+- Be SPECIFIC and CONCRETE (not vague)
+- This is an ACTION PLAN, not a wish list
+- Times must add up to {duration_minutes} minutes
+- Topics must ACTUALLY appear in tomorrow's material
+- Make it motivating but realistic"""
+        }
+        
+        return prompts.get(capsule_id, "Generate exam-focused content with PYQ citations.")
 
     def _toggle_topic_status(self, session_name, topic_name, day, dialog, canvas):
         """Toggle completion status for a topic."""
@@ -28037,27 +29478,61 @@ class StudyTimerApp(tk.Tk):
 
 
     def _get_days_until_exam(self):
-        """Calculate days remaining until exam."""
-        from config_paths import app_paths
-        
-        exam_date_file = Path(app_paths.appdata_dir) / "exam_date.json"
-        
-        if not exam_date_file.exists():
-            return None
-        
+        """Calculate days remaining until exam (supports multi-exam mapping)."""
+        from datetime import date
+        from config_paths import app_paths  # kept for legacy fallback
+        from pathlib import Path
+        import json
+
+        # 1) Preferred path: use per-exam mapping via get_exam_date_for_exam()
         try:
+            # Try to figure out the current exam name, same logic as plans/exam settings
+            exam_name = None
+
+            # If this frame already knows its current exam name
+            exam_name = getattr(self, "current_exam_name", None)
+
+            # Or from the exam name entry/combobox if present
+            if (not exam_name) and hasattr(self, "exam_name_var"):
+                try:
+                    exam_name = (self.exam_name_var.get() or "").strip()
+                except Exception:
+                    pass
+
+            # Or as a final fallback from profile
+            if not exam_name:
+                try:
+                    prof = _load_profile() or {}
+                    exam_name = (prof.get("exam_name") or "").strip()
+                except Exception:
+                    exam_name = None
+
+            # Use helper (handles per-exam and _GLOBAL_ mapping)
+            exam_date = get_exam_date_for_exam(exam_name or "_GLOBAL_")
+
+            if exam_date:
+                days_remaining = (exam_date - date.today()).days
+                return max(1, days_remaining)
+        except Exception as e:
+            print(f"⚠ Error calculating exam days (mapping): {e}")
+
+        # 2) Legacy fallback: direct exam_date.json with {"exam_date": "..."}
+        try:
+            exam_date_file = Path(app_paths.appdata_dir) / "exam_date.json"
+            if not exam_date_file.exists():
+                return None
+
             data = json.loads(exam_date_file.read_text(encoding="utf-8"))
             exam_date_str = data.get("exam_date", "")
             if not exam_date_str:
                 return None
-            
+
+            from datetime import datetime  # local import for legacy parse
             exam_date = datetime.strptime(exam_date_str, "%Y-%m-%d").date()
-            today = date.today()
-            days_remaining = (exam_date - today).days
+            days_remaining = (exam_date - date.today()).days
             return max(1, days_remaining)
-            
         except Exception as e:
-            print(f"⚠ Error calculating exam days: {e}")
+            print(f"⚠ Error calculating exam days (legacy): {e}")
             return None
 
     def _get_completion_status(self, session_name, plan_name):
@@ -28334,23 +29809,21 @@ class StudyTimerApp(tk.Tk):
                              relief="flat", bd=0, padx=20, pady=8, cursor="hand2")
         close_btn.pack(side="right")
         
-        # ✅ Use session day in the key
-        key = f"{self.current_plan_name}_{session_name}_sessionday{current_day}_{days_until_exam}daysRemaining"
-        
-        # Check existing material
-        existing_material = None
-        if materials_file.exists():
-            try:
-                materials = json.loads(materials_file.read_text(encoding="utf-8"))
-                existing_material = materials.get(key)
-            except:
-                pass
-        
+        # ✅ NEW: Check for existing material FIRST (consistent retrieval)
+        existing_material = self._find_existing_material_block(session_name, current_day, materials_file)
+       
         if existing_material:
             loading_frame.pack_forget()
-            self._display_progressive_material(scrollable_frame, existing_material, 
-                                              session_name, duration_minutes, 
-                                              days_until_exam, current_day, dialog, canvas)
+            self._display_progressive_material(
+                scrollable_frame,
+                existing_material,
+                session_name,
+                duration_minutes,
+                days_until_exam,
+                current_day,
+                dialog,
+                canvas,
+            )
             return
         
         # Generate new material
@@ -28404,42 +29877,22 @@ class StudyTimerApp(tk.Tk):
                 # Calculate content based on duration
                 topics_count = max(5, min(12, duration_minutes // 10))
                 
-                prompt = (
-                    f"You are creating a {days_until_exam}-day study plan for '{session_name}' ({exam_name}).\n"
-                    f"Session duration: {duration_minutes} minutes per day\n"
-                    f"Days until exam: {days_until_exam}\n"
-                    f"Current session day: {current_day}\n\n"
-                    f"Create {topics_count} topics. For each topic, break it into daily content for Day 1 to Day {min(days_until_exam, 10)}.\n\n"
-                    f"IMPORTANT: Make content proportional to {duration_minutes} minutes:\n"
-                    f"- More duration = more detailed content\n"
-                    f"- Each day's content_brief should be 200-400 words\n"
-                    f"- Include examples, formulas, key points\n\n"
-                    "Return ONLY this JSON (no extra text, no trailing commas):\n\n"
-                    "{\n"
-                    '  "strategy": {\n'
-                    '    "total_content_scope": "Brief overview",\n'
-                    '    "why_these_topics": "Reasoning",\n'
-                    '    "previous_year_analysis": "PYP insights",\n'
-                    '    "expected_topics": "What to expect",\n'
-                    '    "time_allocation": "How time is split"\n'
-                    '  },\n'
-                    '  "topics": [\n'
-                    '    {\n'
-                    '      "topic": "Topic name",\n'
-                    '      "importance": "High",\n'
-                    '      "exam_frequency": "Very High",\n'
-                    '      "days_allocated": 3,\n'
-                    '      "daily_breakdown": [\n'
-                    '        {\n'
-                    '          "day": 1,\n'
-                    '          "focus": "What to focus on",\n'
-                    '          "content_brief": "Detailed explanation with examples"\n'
-                    '        }\n'
-                    '      ]\n'
-                    '    }\n'
-                    '  ]\n'
-                    "}\n\n"
-                    "Remember: NO trailing commas, NO text outside JSON!"
+                # Decide day range for this block: current_day .. current_day+9 (or until exam)
+                max_block_days = 10
+                block_start_day = current_day
+                block_end_day = min(days_until_exam, block_start_day + max_block_days - 1)
+
+                # ✅ FIX: Use enhanced prompt with plan_name for subject filtering
+                prompt = self._create_enhanced_material_prompt(
+                    session_name=session_name,
+                    exam_name=exam_name,
+                    duration_minutes=duration_minutes,
+                    days_until_exam=days_until_exam,
+                    current_day=current_day,
+                    block_start_day=block_start_day,
+                    block_end_day=block_end_day,
+                    topics_count=topics_count,
+                    plan_name=self.current_plan_name  # ✅ FIX: Pass subject context
                 )
                 
                 print(f"🔄 Generating material for {session_name} Session Day {current_day} ({duration_minutes} min)...")
@@ -28447,11 +29900,11 @@ class StudyTimerApp(tk.Tk):
                 material = chat_complete_with_tracking(
                     client,
                     messages=[
-                        {"role": "system", "content": "You create detailed study plans. Return only valid JSON."},
+                        {"role": "system", "content": "You create CONSISTENT, PYQ-focused study plans. Always prioritize most frequently asked topics based on previous year analysis."},
                         {"role": "user", "content": prompt}
                     ],
                     model="gpt-4o-mini",
-                    temperature=0.7,
+                    temperature=0.3,
                     session_name=session_name,
                     purpose="material_generation"
                 )
@@ -28486,11 +29939,33 @@ class StudyTimerApp(tk.Tk):
                     materials = json.loads(materials_file.read_text(encoding="utf-8"))
                 else:
                     materials = {}
+
+                # ✅ FIX: Save with exact plan name and metadata
+                plan_name = self.current_plan_name or "Default"
+                block_key = f"{plan_name}_{session_name}_block_day{block_start_day}"
                 
-                materials[key] = material
-                materials_file.write_text(json.dumps(materials, indent=2, ensure_ascii=False), encoding="utf-8")
+                # Add metadata for validation
+                try:
+                    material_data = json.loads(material)
+                    material_data["_metadata"] = {
+                        "plan_name": plan_name,
+                        "session_name": session_name,
+                        "subject": plan_name,
+                        "block_start_day": block_start_day,
+                        "generated_at": datetime.now().isoformat()
+                    }
+                    material = json.dumps(material_data, ensure_ascii=False)
+                except:
+                    pass
                 
-                print(f"💾 Saved material for {session_name} Session Day {current_day}")
+                materials[block_key] = material
+
+                materials_file.write_text(
+                    json.dumps(materials, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                
+                print(f"💾 Saved: {block_key} (subject={plan_name})")
                 
                 def update_ui():
                     loading_frame.pack_forget()
@@ -28750,59 +30225,180 @@ class StudyTimerApp(tk.Tk):
             tk.Label(curr_frame, text="🎉 Rest day!", font=("Segoe UI", 11),
                     bg="white", fg="#95a5a6").pack(pady=50)
         else:
+            # Table for current day, built with one grid so headers & rows align
             table = tk.Frame(curr_frame, bg="white")
             table.pack(fill="both", expand=True, padx=15, pady=(0, 15))
-            
-            # Header
-            hdr = tk.Frame(table, bg="#34495e", height=40)
-            hdr.pack(fill="x")
-            hdr.pack_propagate(False)
-            
-            tk.Label(hdr, text="Topic", font=("Segoe UI", 10, "bold"),
-                    bg="#34495e", fg="white", width=20, anchor="w").pack(side="left", padx=10)
-            tk.Label(hdr, text="Focus", font=("Segoe UI", 10, "bold"),
-                    bg="#34495e", fg="white", width=25, anchor="w").pack(side="left", padx=5)
-            tk.Label(hdr, text="Priority", font=("Segoe UI", 10, "bold"),
-                    bg="#34495e", fg="white", width=10).pack(side="left", padx=5)
-            tk.Label(hdr, text="Status", font=("Segoe UI", 10, "bold"),  # 🆕 ADD THIS
-                    bg="#34495e", fg="white", width=10).pack(side="left", padx=5)  # 🆕 ADD THIS
-            tk.Label(hdr, text="Action", font=("Segoe UI", 10, "bold"),
-                    bg="#34495e", fg="white", width=12).pack(side="left", padx=5)
-            
-            # Rows
-            for i, item in enumerate(day_content):
-                row_bg = "#e8f8f5" if i % 2 == 0 else "white"
-                row = tk.Frame(table, bg=row_bg, height=60)
-                row.pack(fill="x", pady=1)
-                row.pack_propagate(False)
-                
-                tk.Label(row, text=item["topic"], font=("Segoe UI", 9, "bold"),
-                        bg=row_bg, fg="#2c3e50", width=20, anchor="w", wraplength=150).pack(side="left", padx=10)
-                
-                tk.Label(row, text=item["focus"], font=("Segoe UI", 9),
-                        bg=row_bg, fg="#7f8c8d", width=25, anchor="w", wraplength=180).pack(side="left", padx=5)
-                
-                imp_color = {"High": "#27ae60", "Medium": "#f39c12", "Low": "#95a5a6"}.get(item["importance"], "#7f8c8d")
-                tk.Label(row, text=item["importance"], font=("Segoe UI", 9, "bold"),
-                        bg=row_bg, fg=imp_color, width=10).pack(side="left", padx=5)
 
-                # 🆕 ADD STATUS COLUMN WITH TOGGLE
+            # ---------- HEADER (row = 0) ----------
+            header_cfg = [
+                ("Topic", "w"),
+                ("Focus", "w"),
+                ("Priority", "center"),
+                ("Status", "center"),
+                ("Action", "center"),
+            ]
+
+            for col, (title, anchor) in enumerate(header_cfg):
+                tk.Label(
+                    table,
+                    text=title,
+                    font=("Segoe UI", 10, "bold"),
+                    bg="#34495e",
+                    fg="white",
+                    padx=10 if col == 0 else 5,
+                    pady=5,
+                    anchor=anchor,
+                ).grid(row=0, column=col, sticky="nsew")
+
+            for col in range(len(header_cfg)):
+                table.grid_columnconfigure(col, weight=1)
+
+            # ---------- ROWS (start from row = 1) ----------
+            for row_index, item in enumerate(day_content, start=1):
+                row_bg = "#e8f8f5" if (row_index - 1) % 2 == 0 else "white"
+
+                # Topic
+                tk.Label(
+                    table,
+                    text=item["topic"],
+                    font=("Segoe UI", 9, "bold"),
+                    bg=row_bg,
+                    fg="#2c3e50",
+                    anchor="w",
+                    wraplength=200,
+                    padx=10,
+                    pady=4,
+                ).grid(row=row_index, column=0, sticky="nsew")
+
+                # Focus
+                tk.Label(
+                    table,
+                    text=item["focus"],
+                    font=("Segoe UI", 9),
+                    bg=row_bg,
+                    fg="#7f8c8d",
+                    anchor="w",
+                    wraplength=320,
+                    padx=5,
+                    pady=4,
+                ).grid(row=row_index, column=1, sticky="nsew")
+
+                # Priority
+                imp_color = {
+                    "High": "#27ae60",
+                    "Medium": "#f39c12",
+                    "Low": "#95a5a6",
+                }.get(item["importance"], "#7f8c8d")
+
+                tk.Label(
+                    table,
+                    text=item["importance"],
+                    font=("Segoe UI", 9, "bold"),
+                    bg=row_bg,
+                    fg=imp_color,
+                    padx=5,
+                    pady=4,
+                ).grid(row=row_index, column=2, sticky="nsew")
+
+                # ---------- STATUS PILL ----------
                 topic_name = item["topic"]
-                status = self._get_topic_completion_status(session_name, topic_name, current_day)
-                status_text = "✅" if status == "complete" else "⏳"
-                status_color = "#27ae60" if status == "complete" else "#f39c12"
+                status_value = self._get_topic_completion_status(
+                    session_name, topic_name, current_day
+                )
 
-                status_btn = tk.Button(row, text=status_text, font=("Segoe UI", 12, "bold"),
-                                      bg=row_bg, fg=status_color, relief="flat", bd=0, cursor="hand2",
-                                      command=lambda t=topic_name, d=current_day: self._toggle_topic_status(session_name, t, d, dialog, canvas))
-                status_btn.pack(side="left", padx=5, ipadx=8)
+                status_cell = tk.Frame(table, bg=row_bg)
+                status_cell.grid(row=row_index, column=3, sticky="nsew", padx=5, pady=4)
 
-                tk.Button(row, text="🔍 Deep Dive", font=("Segoe UI", 8, "bold"),
-                         bg="#16a085", fg="white", relief="flat", bd=0, cursor="hand2",
-                         command=lambda t=item["topic"], c=item["content_brief"]: 
-                             self._show_deep_dive_progressive(t, c, duration_minutes, current_day, session_name, dialog, canvas)
-                        ).pack(side="left", padx=5)
-        
+                def build_status_pill(state, cell=status_cell, t_name=topic_name):
+                    # Clear old pill
+                    for w in cell.winfo_children():
+                        w.destroy()
+
+                    if state == "complete":
+                        pill_bg = "#2ecc71"
+                        text = "COMPLETE"
+                    else:
+                        pill_bg = "#95a5a6"
+                        text = "PENDING"
+
+                    pill = tk.Frame(
+                        cell,
+                        bg=pill_bg,
+                        bd=0,
+                        highlightthickness=0,
+                        relief="flat",
+                        cursor="hand2",
+                    )
+                    pill.pack()
+
+                    pill.grid_columnconfigure(0, weight=1)
+                    pill.grid_columnconfigure(1, weight=1)
+
+                    knob = tk.Label(
+                        pill,
+                        text="",
+                        bg="white",
+                        width=2,
+                        height=1,
+                    )
+                    label = tk.Label(
+                        pill,
+                        text=text,
+                        font=("Segoe UI", 7, "bold"),
+                        bg=pill_bg,
+                        fg="white",
+                    )
+
+                    if state == "pending":
+                        # knob LEFT, text RIGHT
+                        knob.grid(row=0, column=0, padx=(4, 2), pady=2)
+                        label.grid(row=0, column=1, padx=(2, 4), pady=2)
+                    else:
+                        # text LEFT, knob RIGHT
+                        label.grid(row=0, column=0, padx=(4, 2), pady=2)
+                        knob.grid(row=0, column=1, padx=(2, 4), pady=2)
+
+                    def on_click(event=None, topic=t_name):
+                        # Toggle in file
+                        self._toggle_topic_status(
+                            session_name, topic, current_day, dialog, canvas
+                        )
+                        # Read back and redraw pill
+                        new_state = self._get_topic_completion_status(
+                            session_name, topic, current_day
+                        )
+                        build_status_pill(new_state, cell, topic)
+
+                    for widget in (pill, knob, label):
+                        widget.bind("<Button-1>", on_click)
+
+                build_status_pill(status_value)
+
+                # ---------- ACTION (Deep Dive) ----------
+                action_cell = tk.Frame(table, bg=row_bg)
+                # Increase the second value in padx to shove it even more to the right
+                action_cell.grid(row=row_index, column=4, sticky="e", padx=(0, 40), pady=4)
+
+                tk.Button(
+                    action_cell,
+                    text="🔍 Deep Dive",
+                    font=("Segoe UI", 8, "bold"),
+                    bg="#16a085",
+                    fg="white",
+                    relief="flat",
+                    bd=0,
+                    cursor="hand2",
+                    command=lambda t=item["topic"], c=item["content_brief"]: self._show_deep_dive_progressive(
+                        t,
+                        c,
+                        duration_minutes,
+                        current_day,
+                        session_name,
+                        dialog,
+                        canvas,
+                    ),
+                ).pack(side="right")
+                
         # ========== PREVIOUS DAYS WITH STATUS TABS ==========
         if current_day > 1:
             from config_paths import app_paths
@@ -28958,57 +30554,187 @@ class StudyTimerApp(tk.Tk):
                             if past_day_content:
                                 day_table = tk.Frame(day_frame, bg="white")
                                 day_table.pack(fill="x", padx=10, pady=10)
-                                
-                                # Mini header
-                                mini_hdr = tk.Frame(day_table, bg="#7f8c8d", height=30)
-                                mini_hdr.pack(fill="x")
-                                mini_hdr.pack_propagate(False)
-                                
-                                tk.Label(mini_hdr, text="Topic", font=("Segoe UI", 9, "bold"),
-                                        bg="#7f8c8d", fg="white", width=18, anchor="w").pack(side="left", padx=8)
-                                tk.Label(mini_hdr, text="Focus", font=("Segoe UI", 9, "bold"),
-                                        bg="#7f8c8d", fg="white", width=30, anchor="w").pack(side="left", padx=5)
-                                tk.Label(mini_hdr, text="Priority", font=("Segoe UI", 9, "bold"),
-                                        bg="#7f8c8d", fg="white", width=10).pack(side="left", padx=5)
-                                tk.Label(mini_hdr, text="Status", font=("Segoe UI", 9, "bold"),
-                                        bg="#7f8c8d", fg="white", width=8).pack(side="left", padx=5)
-                                tk.Label(mini_hdr, text="Action", font=("Segoe UI", 9, "bold"),
-                                        bg="#7f8c8d", fg="white", width=10).pack(side="left", padx=5)
-                                
-                                # Content rows
-                                for j, item in enumerate(past_day_content):
-                                    row_bg = "#f0f0f0" if j % 2 == 0 else "white"
-                                    row = tk.Frame(day_table, bg=row_bg, height=50)
-                                    row.pack(fill="x", pady=1)
-                                    row.pack_propagate(False)
-                                    
-                                    tk.Label(row, text=item["topic"], font=("Segoe UI", 8, "bold"),
-                                            bg=row_bg, fg="#2c3e50", width=18, anchor="w", wraplength=130).pack(side="left", padx=8)
-                                    
-                                    tk.Label(row, text=item["focus"], font=("Segoe UI", 8),
-                                            bg=row_bg, fg="#7f8c8d", width=30, anchor="w", wraplength=200).pack(side="left", padx=5)
-                                    
-                                    imp_color = {"High": "#27ae60", "Medium": "#f39c12", "Low": "#95a5a6"}.get(item["importance"], "#7f8c8d")
-                                    tk.Label(row, text=item["importance"], font=("Segoe UI", 8, "bold"),
-                                            bg=row_bg, fg=imp_color, width=10).pack(side="left", padx=5)
 
-                                    # Status display
-                                    past_topic = item["topic"]
-                                    past_status = item["status"]  # ✅ Use from dict
-                                    past_status_text = "✅" if past_status == "complete" else "⏳"
-                                    past_status_color = "#27ae60" if past_status == "complete" else "#f39c12"
+                                # ---------- HEADER (aligned like TODAY section) ----------
+                                header_cfg = [
+                                    ("Topic", "w"),
+                                    ("Focus", "w"),
+                                    ("Priority", "center"),
+                                    ("Status", "center"),
+                                    ("Action", "center"),
+                                ]
 
-                                    tk.Label(row, text=past_status_text, font=("Segoe UI", 10, "bold"),
-                                            bg=row_bg, fg=past_status_color, width=8).pack(side="left", padx=5)
+                                for col, (title, anchor) in enumerate(header_cfg):
+                                    tk.Label(
+                                        day_table,
+                                        text=title,
+                                        font=("Segoe UI", 9, "bold"),
+                                        bg="#2c3e50",
+                                        fg="white",
+                                        padx=5,
+                                        pady=4,
+                                        anchor=anchor,
+                                    ).grid(row=0, column=col, sticky="nsew")
 
-                                    tk.Button(row, text="🔍 View", font=("Segoe UI", 7, "bold"),
-                                             bg="#95a5a6", fg="white", relief="flat", bd=0, cursor="hand2",
-                                             command=lambda t=item["topic"], c=item["content_brief"], d=day_num: 
-                                                 self._show_deep_dive_progressive(t, c, duration_minutes, d, session_name, dialog, canvas)
-                                            ).pack(side="left", padx=5)
+                                # Make columns stretchy (same idea as top)
+                                day_table.grid_columnconfigure(0, weight=3)
+                                day_table.grid_columnconfigure(1, weight=4)
+                                day_table.grid_columnconfigure(2, weight=1)
+                                day_table.grid_columnconfigure(3, weight=1)
+                                day_table.grid_columnconfigure(4, weight=1)
+
+                                # ---------- ROWS ----------
+                                for row_index, item in enumerate(past_day_content, start=1):
+                                    row_bg = "#f8f9fa" if row_index % 2 == 1 else "white"
+
+                                    # Topic
+                                    tk.Label(
+                                        day_table,
+                                        text=item["topic"],
+                                        font=("Segoe UI", 9, "bold"),
+                                        bg=row_bg,
+                                        fg="#2c3e50",
+                                        anchor="w",
+                                        wraplength=220,
+                                        padx=5,
+                                        pady=4,
+                                    ).grid(row=row_index, column=0, sticky="nsew")
+
+                                    # Focus
+                                    tk.Label(
+                                        day_table,
+                                        text=item["focus"],
+                                        font=("Segoe UI", 9),
+                                        bg=row_bg,
+                                        fg="#7f8c8d",
+                                        anchor="w",
+                                        wraplength=320,
+                                        padx=5,
+                                        pady=4,
+                                    ).grid(row=row_index, column=1, sticky="nsew")
+
+                                    # Priority
+                                    imp_color = {
+                                        "High": "#27ae60",
+                                        "Medium": "#f39c12",
+                                        "Low": "#95a5a6",
+                                    }.get(item["importance"], "#7f8c8d")
+
+                                    tk.Label(
+                                        day_table,
+                                        text=item["importance"],
+                                        font=("Segoe UI", 9, "bold"),
+                                        bg=row_bg,
+                                        fg=imp_color,
+                                        padx=5,
+                                        pady=4,
+                                    ).grid(row=row_index, column=2, sticky="nsew")
+
+                                    # ---------- STATUS (clickable pill, like TODAY) ----------
+                                    topic_name = item["topic"]
+                                    status_value = self._get_topic_completion_status(
+                                        session_name, topic_name, day_num
+                                    )
+
+                                    status_cell = tk.Frame(day_table, bg=row_bg)
+                                    status_cell.grid(row=row_index, column=3, sticky="nsew", padx=5, pady=4)
+
+                                    def build_status_pill(state, cell=status_cell, t_name=topic_name, d=day_num):
+                                        # Clear old pill
+                                        for w in cell.winfo_children():
+                                            w.destroy()
+
+                                        if state == "complete":
+                                            pill_bg = "#2ecc71"
+                                            text = "COMPLETE"
+                                        else:
+                                            pill_bg = "#95a5a6"
+                                            text = "PENDING"
+
+                                        pill = tk.Frame(
+                                            cell,
+                                            bg=pill_bg,
+                                            bd=0,
+                                            highlightthickness=0,
+                                            relief="flat",
+                                            cursor="hand2",
+                                        )
+                                        pill.pack()
+
+                                        pill.grid_columnconfigure(0, weight=1)
+                                        pill.grid_columnconfigure(1, weight=1)
+
+                                        knob = tk.Label(
+                                            pill,
+                                            text="",
+                                            bg="white",
+                                            width=2,
+                                            height=1,
+                                        )
+                                        label = tk.Label(
+                                            pill,
+                                            text=text,
+                                            font=("Segoe UI", 7, "bold"),
+                                            bg=pill_bg,
+                                            fg="white",
+                                        )
+
+                                        if state == "pending":
+                                            # knob LEFT, text RIGHT
+                                            knob.grid(row=0, column=0, padx=(4, 2), pady=2)
+                                            label.grid(row=0, column=1, padx=(2, 4), pady=2)
+                                        else:
+                                            # text LEFT, knob RIGHT
+                                            label.grid(row=0, column=0, padx=(4, 2), pady=2)
+                                            knob.grid(row=0, column=1, padx=(2, 4), pady=2)
+
+                                        def on_click(event=None, topic=t_name, day_val=d):
+                                            # Toggle status in file
+                                            self._toggle_topic_status(
+                                                session_name, topic, day_val, dialog, canvas
+                                            )
+                                            # Rebuild Previous Days view for the current tab
+                                            prev_content.after(
+                                                10, lambda: show_filtered_days(selected_tab.get())
+                                            )
+
+                                        for widget in (pill, knob, label):
+                                            widget.bind("<Button-1>", on_click)
+
+                                    build_status_pill(status_value)
+
+                                    # ---------- ACTION (Deep Dive) ----------
+                                    action_cell = tk.Frame(day_table, bg=row_bg)
+                                    action_cell.grid(row=row_index, column=4, sticky="e", padx=(0, 40), pady=4)
+
+                                    tk.Button(
+                                        action_cell,
+                                        text="🔍 Deep Dive",
+                                        font=("Segoe UI", 8, "bold"),
+                                        bg="#16a085",
+                                        fg="white",
+                                        relief="flat",
+                                        bd=0,
+                                        cursor="hand2",
+                                        command=lambda t=item["topic"], c=item["content_brief"], d=day_num: self._show_deep_dive_progressive(
+                                            t,
+                                            c,
+                                            duration_minutes,
+                                            d,
+                                            session_name,
+                                            dialog,
+                                            canvas,
+                                        ),
+                                    ).pack(side="right")
+
                             else:
-                                tk.Label(day_frame, text="No content matching filter",
-                                        font=("Segoe UI", 9), bg="white", fg="#7f8c8d").pack(pady=10)
+                                tk.Label(
+                                    day_frame,
+                                    text="No content matching filter",
+                                    font=("Segoe UI", 9),
+                                    bg="white",
+                                    fg="#7f8c8d",
+                                ).pack(fill="x", pady=10)
                         
                         parent_frame.update_idletasks()
                         canvas.configure(scrollregion=canvas.bbox("all"))
@@ -29052,7 +30778,8 @@ class StudyTimerApp(tk.Tk):
         from tkinter import messagebox
         from pathlib import Path
         import json
-        from datetime import datetime
+        from datetime import datetime       
+        days_until_exam = self._get_days_until_exam()
         
         # ================= Capsule Section Definitions =================
         CAPSULE_SECTIONS = [
@@ -29061,7 +30788,7 @@ class StudyTimerApp(tk.Tk):
             {"id": "formulas", "emoji": "📝", "title": "Key Formulas", "short": "Formulas"},
             {"id": "practice", "emoji": "📚", "title": "Practice Problems", "short": "Practice"},
             {"id": "strategy", "emoji": "💡", "title": "Exam Strategy", "short": "Strategy"},
-            {"id": "materials", "emoji": "📑", "title": "Study Materials", "short": "Materials"},
+            {"id": "materials", "emoji": "📑", "title": "Study Materials", "short": "Sources"},
             {"id": "preview", "emoji": "🔮", "title": "Tomorrow's Preview", "short": "Preview"}
         ]
         
@@ -29237,7 +30964,8 @@ class StudyTimerApp(tk.Tk):
             capsule_contents[section["id"]] = {
                 "text": "",
                 "loaded": False,
-                "loading_more": False
+                "loading_more": False,
+                "generating": False,   # 🆕 track if this capsule is currently generating
             }
             capsule_emoji_images[section["id"]] = []
         
@@ -29724,6 +31452,109 @@ class StudyTimerApp(tk.Tk):
                 return deep_dives.get(dive_key)
             except:
                 return None
+                
+        # ========== PLAN-BASED PREVIEW HELPERS ==========
+        def _load_session_plan_material():
+            """Return the master JSON plan for this (plan, session), or None."""
+            materials_file = Path(app_paths.appdata_dir) / "session_materials.json"
+            if not materials_file.exists():
+                return None
+
+            try:
+                materials = json.loads(materials_file.read_text(encoding="utf-8"))
+            except Exception as e:
+                print(f"[DEEP_DIVE] Failed to read session_materials.json: {e}")
+                return None
+
+            # Keys look like: {plan}{session}_sessiondayX{days}daysRemaining
+            base_prefix = f"{self.current_plan_name}_{session_name}_sessionday"
+
+            # Try to respect current exam date if possible
+            days_until_exam = None
+            try:
+                days_until_exam = self._get_days_until_exam()
+            except Exception:
+                days_until_exam = None
+
+            preferred_suffix = (
+                f"_{days_until_exam}daysRemaining" if days_until_exam else None
+            )
+
+            material = None
+
+            # 1) Prefer a key matching current days_until_exam
+            if preferred_suffix:
+                for k, v in materials.items():
+                    if k.startswith(base_prefix) and k.endswith(preferred_suffix):
+                        material = v
+                        break
+
+            # 2) Fallback: any plan for this (plan, session)
+            if material is None:
+                for k, v in materials.items():
+                    if k.startswith(base_prefix):
+                        material = v
+                        break
+
+            return material
+
+        def _build_tomorrow_preview_from_plan():
+            """Build CONSISTENT tomorrow preview from saved plan."""
+            material_json = self._load_session_plan_material()
+            if not material_json:
+                return "📝 Tomorrow's content will be available after today's material is generated."
+            
+            try:
+                data = json.loads(material_json)
+            except Exception:
+                return None
+            
+            # ✅ Check for structured preview (new format)
+            tomorrow_data = data.get("tomorrows_preview", {})
+            if tomorrow_data and tomorrow_data.get("day") == current_day + 1:
+                topics = tomorrow_data.get("topics_planned", [])
+                time = tomorrow_data.get("time_breakdown", "")
+                prep = tomorrow_data.get("preparation_needed", "")
+                
+                text = f"🔮 Tomorrow's Preview – Day {current_day + 1}\n\n"
+                text += "📚 Topics Planned:\n"
+                for i, topic in enumerate(topics, 1):
+                    text += f"{i}. {topic}\n"
+                
+                if time:
+                    text += f"\n⏱ Time Allocation:\n{time}\n"
+                if prep:
+                    text += f"\n💡 Preparation Needed:\n{prep}\n"
+                
+                return text
+            
+            # Fallback: extract from daily_breakdown
+            topics = data.get("topics", [])
+            target_day = current_day + 1
+            
+            preview_items = []
+            for topic in topics:
+                for day_info in topic.get("daily_breakdown", []):
+                    if day_info.get("day") == target_day:
+                        preview_items.append({
+                            "topic": topic.get("topic"),
+                            "focus": day_info.get("focus"),
+                            "importance": topic.get("importance")
+                        })
+            
+            if not preview_items:
+                return None
+            
+            text = f"🔮 Tomorrow – Day {target_day}\n\n"
+            for item in preview_items:
+                text += f"• {item['topic']}\n"
+                if item['focus']:
+                    text += f"  Focus: {item['focus']}\n"
+                if item['importance']:
+                    text += f"  Priority: {item['importance']}\n"
+                text += "\n"
+            
+            return text
         
         # ========== DISPLAY CAPSULE CONTENT ==========
         def display_capsule_content(capsule_id):
@@ -29748,18 +31579,34 @@ class StudyTimerApp(tk.Tk):
         
         # ========== GENERATE CAPSULE CONTENT ==========
         def generate_capsule_content(capsule_id):
+            state = capsule_contents[capsule_id]
+
+            # Already fully loaded → nothing to do
+            if state["loaded"]:
+                print(f"⏭ {capsule_id} already loaded, skipping generation")
+                return
+            
+            # Already generating in another thread → don't start a second one
+            if state.get("generating"):
+                print(f"⏳ {capsule_id} is already generating, skipping duplicate call")
+                return
+
+            # Try cache first
             cached_content = load_capsule_from_cache(capsule_id)
             if cached_content:
                 display_content = self._convert_latex_to_plain(cached_content)
-                capsule_contents[capsule_id]["text"] = display_content
-                capsule_contents[capsule_id]["loaded"] = True
+                state["text"] = display_content
+                state["loaded"] = True
                 
                 if active_capsule["id"] == capsule_id:
                     display_capsule_content(capsule_id)
                 
-                print(f"✅ Loaded cached content for {capsule_id}")
+                print(f"✅ Loaded cached content for {capsule_id} (from cache)")
                 return
-            
+
+            # Mark as generating before starting thread
+            state["generating"] = True
+
             def generate():
                 try:
                     from openai import OpenAI
@@ -29794,124 +31641,26 @@ class StudyTimerApp(tk.Tk):
                         except:
                             pass
                     
-                    prompts = {
-                        "objectives": (
-                            f"Create EXAM OBJECTIVES for: {topic_name} (Day {current_day})\n"
-                            f"Exam: {exam_name} | Session: {session_name}\n"
-                            f"Focus: {content_brief}\n\n"
-                            "List 5-7 specific learning objectives that are EXAM-FOCUSED:\n"
-                            "• What questions can you solve after this?\n"
-                            "• Which formulas must you remember?\n"
-                            "• What concepts are frequently tested?\n"
-                            "• What marks can you score from this topic?\n\n"
-                            "Use bullet points (•) and PLAIN TEXT formulas only!"
-                        ),
-                        "concepts": (
-                            f"Create CORE CONCEPTS for: {topic_name} (Day {current_day})\n"
-                            f"Exam: {exam_name} | Focus: {content_brief}\n\n"
-                            "Cover:\n"
-                            "• Key definitions (as asked in exams)\n"
-                            "• Important theory points\n"
-                            "• Concept relationships\n"
-                            "• Common question patterns\n"
-                            "• Exam-relevant explanations only\n\n"
-                            "Use PLAIN TEXT formulas (NO LaTeX!)"
-                        ),
-                        "formulas": (
-                            f"Create KEY FORMULAS section for: {topic_name} (Day {current_day})\n"
-                            f"Exam: {exam_name}\n\n"
-                            "List 12-15 most important formulas:\n"
-                            "• Formula with proper notation (PLAIN TEXT)\n"
-                            "• When to use it\n"
-                            "• Units and dimensions\n"
-                            "• Common mistakes\n"
-                            "• Quick checking methods\n\n"
-                            "Format: η = W/Q_in, R = ρL/A, P = V²/R\n"
-                            "Use: η α β π Δ Σ √ × ÷ ≈ ≤ ≥"
-                        ),
-                        "practice": (
-                            f"Create PRACTICE PROBLEMS for: {topic_name} (Day {current_day})\n"
-                            f"Exam: {exam_name} | Focus: {content_brief}\n\n"
-                            "Provide:\n"
-                            "• 5 solved examples (with complete steps)\n"
-                            "• 6 practice problems (exam-style)\n"
-                            "• Step-by-step solutions\n"
-                            "• Alternative faster methods\n"
-                            "• Difficulty levels marked\n\n"
-                            "Use PLAIN TEXT formulas only!"
-                        ),
-                        "strategy": (
-                            f"Create EXAM STRATEGY for: {topic_name} (Day {current_day})\n"
-                            f"Exam: {exam_name}\n\n"
-                            "Cover:\n"
-                            "• How to identify question types\n"
-                            "• Step-by-step solving approach\n"
-                            "• Time management tips\n"
-                            "• Common mistakes to avoid\n"
-                            "• Marking scheme insights\n"
-                            "• Quick checking methods\n"
-                            "• Elimination techniques\n\n"
-                            "Focus on scoring maximum marks!"
-                        ),
-                        "materials": (
-                            f"Create STUDY MATERIALS GUIDE for: {topic_name} (Day {current_day})\n"
-                            f"Exam: {exam_name}\n\n"
-                            "⚠️ CRITICAL: Provide ONLY resources that are ACTUALLY RECOMMENDED by successful aspirants!\n\n"
-                            "Provide comprehensive study resources:\n\n"
-                            "📚 RECOMMENDED BOOKS (Most Popular Among Aspirants)\n"
-                            "• List 3-5 books that are WIDELY USED by toppers\n"
-                            "• Include: Book name, Author, Why it's recommended\n"
-                            "• Mention which specific chapters/sections to read\n"
-                            "• Example format: 'Concepts of Physics by H.C. Verma - Chapter 15 (Wave Motion) - Recommended by 95% of JEE toppers for conceptual clarity'\n\n"
-                            "🌐 QUALITY ONLINE RESOURCES\n"
-                            "• List 4-6 VERIFIED websites/platforms used by aspirants\n"
-                            "• MUST include full working URLs (https://...)\n"
-                            "• Mention what specific content is good (videos, notes, PYQs)\n"
-                            "• Example: 'Khan Academy Physics - https://www.khanacademy.org/science/physics - Excellent animated explanations'\n\n"
-                            "📺 YOUTUBE CHANNELS (Verified & Popular)\n"
-                            "• List 3-4 channels that aspirants actually follow\n"
-                            "• Mention channel name and what they're known for\n"
-                            "• Include channel URLs if possible\n\n"
-                            "📱 MOBILE APPS & TOOLS\n"
-                            "• List 2-3 helpful apps for this topic\n"
-                            "• Free and paid options\n\n"
-                            "📄 FREE STUDY MATERIALS\n"
-                            "• Where to find free notes, PYQs, practice papers\n"
-                            "• Government/official resources\n"
-                            "• Include working URLs\n\n"
-                            "💡 STUDY TIPS FOR RESOURCES\n"
-                            "• How to effectively use these materials\n"
-                            "• Recommended study sequence\n"
-                            "• Time allocation\n\n"
-                            "IMPORTANT:\n"
-                            "• Provide REAL URLs that work (https://...)\n"
-                            "• Only suggest resources that are PROVEN and POPULAR\n"
-                            "• Focus on FREE or affordable options\n"
-                            "• Be specific about what makes each resource good"
-                        ),
-                        "preview": (
-                            f"Create TOMORROW'S PREVIEW for Day {current_day + 1}\n"
-                            f"Current topic: {topic_name}\n"
-                            f"Exam: {exam_name} | Session: {session_name}\n\n"
-                            "Provide:\n"
-                            "• Brief overview of next day's topics\n"
-                            "• How it connects to today's learning\n"
-                            "• What to revise tonight\n"
-                            "• Preparation tips for tomorrow\n\n"
-                            "Keep it brief and motivating!"
-                        )
-                    }
-                    
-                    prompt = prompts.get(capsule_id, "Generate exam-focused content.")
-                    
+                    # ✅ NEW: Use enhanced capsule prompt generator
+                    prompt = self._get_enhanced_capsule_prompt(
+                        capsule_id=capsule_id,
+                        topic_name=topic_name,
+                        session_name=session_name,
+                        exam_name=exam_name,
+                        content_brief=content_brief,
+                        current_day=current_day,
+                        days_until_exam=self._get_days_until_exam(),
+                        duration_minutes=duration_minutes  # ✅ Add this
+                    )
+                   
                     content = chat_complete_with_tracking(
                         client,
                         messages=[
-                            {"role": "system", "content": f"You are an expert {exam_name} coach. Create exam-focused content. NO theory exploration - ONLY what helps score marks."},
+                            {"role": "system", "content": f"You are an expert {exam_name} coach. Create CONSISTENT exam-focused content with PYQ citations. ONLY content that appears in 50%+ of previous papers."},
                             {"role": "user", "content": prompt}
                         ],
                         model="gpt-4o-mini",
-                        temperature=0.7,
+                        temperature=0.3,
                         session_name=f"{session_name}_{topic_name}_{capsule_id}",
                         purpose=f"deep_dive_{capsule_id}"
                     )
@@ -29935,15 +31684,16 @@ class StudyTimerApp(tk.Tk):
                     
                 except Exception as e:
                     def show_error():
-                        if active_capsule["id"] == capsule_id:
-                            capsule_emoji_images[capsule_id].clear()
-                            content_text.config(state=tk.NORMAL)
-                            content_text.delete("1.0", tk.END)
-                            content_text.insert("1.0", f"❌ Error: {e}")
-                            content_text.config(state=tk.DISABLED)
+                        content_text.config(state=tk.NORMAL)
+                        content_text.delete("1.0", tk.END)
+                        content_text.insert("1.0", f"❌ Error: {e}")
+                        content_text.config(state=tk.DISABLED)
                     dive.after(0, show_error)
                     import traceback
                     traceback.print_exc()
+                finally:
+                    # Always clear generating flag when this run finishes
+                    state["generating"] = False
             
             import threading
             threading.Thread(target=generate, daemon=True).start()
@@ -29992,6 +31742,13 @@ class StudyTimerApp(tk.Tk):
             
             active_capsule["id"] = capsule_id
             display_capsule_content(capsule_id)
+
+            # 🆕 Priority loading: if user clicked this capsule and it's not ready,
+            # start generation immediately (higher priority than background).
+            state = capsule_contents[capsule_id]
+            if not state["loaded"] and not state.get("generating"):
+                print(f"⚡ Priority loading capsule: {capsule_id}")
+                generate_capsule_content(capsule_id)
         
         # Create capsule buttons
         for section in CAPSULE_SECTIONS:
@@ -31563,19 +33320,32 @@ class StudyTimerApp(tk.Tk):
         self.update_timer()
 
     def save_alarm_settings(self):
-        obj = {"alarm_time": self.alarm_time, "alarm_folder": self.alarm_folder}
+        """Save alarm time, folder and custom session alarm file."""
+        obj = {
+            "alarm_time": getattr(self, "alarm_time", ""),
+            "alarm_folder": getattr(self, "alarm_folder", ""),
+            "session_alarm_file": getattr(self, "alarm_file", None),
+        }
+        # Make sure directory exists
+        os.makedirs(os.path.dirname(app_paths.alarm_settings_file), exist_ok=True)
         with open(app_paths.alarm_settings_file, "w") as f:
             json.dump(obj, f)
 
     def load_alarm_settings(self):
+        """Load alarm time, folder and custom session alarm file."""
         if os.path.exists(app_paths.alarm_settings_file):
-            with open(app_paths.alarm_settings_file, "r") as f:
-                obj = json.load(f)
+            try:
+                with open(app_paths.alarm_settings_file, "r") as f:
+                    obj = json.load(f)
+            except Exception:
+                obj = {}
             self.alarm_time = obj.get("alarm_time", "")
             self.alarm_folder = obj.get("alarm_folder", "")
+            self.alarm_file = obj.get("session_alarm_file") or None
         else:
             self.alarm_time = ""
             self.alarm_folder = ""
+            self.alarm_file = None
 
     def select_alarm_folder(self):
         folder = filedialog.askdirectory()
@@ -31970,13 +33740,19 @@ class StudyTimerApp(tk.Tk):
 
     def select_alarm_file(self):
         filetypes = [("WAV files", "*.wav")]
-        file = filedialog.askopenfilename(title="Select Alarm Sound", filetypes=filetypes)
+        file = filedialog.askopenfilename(
+            title="Select Alarm Sound",
+            filetypes=filetypes
+        )
         if file:
             self.alarm_file = file
             self.alarm_btn.config(text="🔔✅")
         else:
             self.alarm_file = None
             self.alarm_btn.config(text="🔔")
+
+        # Persist the current choice (or clearing) to disk
+        self.save_alarm_settings()
 
     def on_app_close(self):
         import os
@@ -32234,6 +34010,72 @@ class StudyTimerApp(tk.Tk):
         self.plan_tree.heading("Break Time", text="Break Time")
         
         self.plan_tree.pack(fill=tk.BOTH, expand=True)
+        
+        # ---------- Hover effect for 📄 Create in Study Material column ----------
+        # Tag style (slight dark background + bold text = shadow-like effect)
+        self.plan_tree.tag_configure(
+            "material_hover",
+            background="#d1d5db",
+            foreground="#000000",
+            font=("Arial", 10, "bold"),
+        )
+
+        # Track currently hovered row for material column
+        self._plan_hover_row = None
+
+        def on_plan_tree_motion(event):
+            tree = self.plan_tree
+            region = tree.identify("region", event.x, event.y)
+            row = tree.identify_row(event.y)
+
+            # If we moved to another row, remove hover tag from old row
+            if self._plan_hover_row and self._plan_hover_row != row:
+                try:
+                    tags = list(tree.item(self._plan_hover_row, "tags"))
+                    if "material_hover" in tags:
+                        tags.remove("material_hover")
+                        tree.item(self._plan_hover_row, tags=tags)
+                except Exception:
+                    pass
+                self._plan_hover_row = None
+
+            # Apply hover to ANY row under the mouse
+            if region == "cell" and row:
+                tree.configure(cursor="hand2")
+                self._plan_hover_row = row
+                tags = list(tree.item(row, "tags"))
+                if "material_hover" not in tags:
+                    tags.append("material_hover")
+                    tree.item(row, tags=tags)
+            else:
+                # No row under mouse: reset cursor and remove tag
+                tree.configure(cursor="")
+                if self._plan_hover_row:
+                    try:
+                        tags = list(tree.item(self._plan_hover_row, "tags"))
+                        if "material_hover" in tags:
+                            tags.remove("material_hover")
+                            tree.item(self._plan_hover_row, tags=tags)
+                    except Exception:
+                        pass
+                    self._plan_hover_row = None
+
+        def on_plan_tree_leave(event):
+            tree = self.plan_tree
+            tree.configure(cursor="")
+            if self._plan_hover_row:
+                try:
+                    tags = list(tree.item(self._plan_hover_row, "tags"))
+                    if "material_hover" in (tags := list(tree.item(self._plan_hover_row, "tags"))):
+                        tags.remove("material_hover")
+                        tree.item(self._plan_hover_row, tags=tags)
+                except Exception:
+                    pass
+                self._plan_hover_row = None
+
+        # Bind motion + leave (add='+' so we don’t break existing bindings)
+        self.plan_tree.bind("<Motion>", on_plan_tree_motion, add="+")
+        self.plan_tree.bind("<Leave>", on_plan_tree_leave, add="+")
 
         # ================================
         # 🔥 Unified Mouse Event Handling
@@ -34900,8 +36742,23 @@ class ProfileBadge(ttk.Frame):
 
         self.pic  = tk.Label(self, bd=0, highlightthickness=0)
         self.name = ttk.Label(self, text="You", font=("Segoe UI", 10, "bold"))
+        # Tiny profile edit button style – short height, a bit wide
+        style = ttk.Style(self)
+        style.configure(
+            "ProfileEdit.TButton",
+            font=("Segoe UI", 8),      # smaller font => less height
+            padding=(4, 0),           # (left/right, top/bottom) -> almost no vertical padding
+        )
+
         # Create the button with one name
-        self.edit = ttk.Button(self, text="✎", width=2, command=self._edit, takefocus=False)
+        self.edit = ttk.Button(
+            self,
+            text="✎",
+            width=1.5,                  # wider than before, but still compact
+            style="ProfileEdit.TButton",
+            command=self._edit,
+            takefocus=False,
+        )
         # Also store it with another name for the guide
         self.profile_edit_btn = self.edit
 

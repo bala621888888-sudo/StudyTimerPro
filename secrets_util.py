@@ -100,7 +100,7 @@ def get_secret(secret_id: str):
         return value
 
     except Exception as e:
-        print(f"⚠ Failed to fetch secret {secret_id}: {type(e)._name_}: {e}")
+        print(f"⚠ Failed to fetch secret {secret_id}: {type(e).__name__}: {e}")
         return os.getenv(secret_id)
 
 # ✅ Check internet once globally

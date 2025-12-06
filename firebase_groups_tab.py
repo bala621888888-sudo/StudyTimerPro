@@ -4280,32 +4280,41 @@ class ModernGroupsTab:
         desc_text.pack(fill=tk.X)
         
         # Header Background Color
-        tk.Label(content, text="🎨 Header Background Color", 
-                font=('Segoe UI', 11, 'bold'),
-                bg='#F5F7FA', fg='#2C3E50').pack(anchor='w', pady=(15, 5))
+        tk.Label(content, text="🎨 Header Background Color",
+                 font=('Segoe UI', 11, 'bold'),
+                 bg='#F5F7FA', fg='#2C3E50').pack(anchor='w', pady=(15, 5))
 
-        color_frame = tk.Frame(content, bg='#F5F7FA')
-        color_frame.pack(fill=tk.X, pady=(0, 10))
+        # Unified area so preview and palette align nicely
+        color_area = tk.Frame(content, bg='#F5F7FA')
+        color_area.pack(fill=tk.X, pady=(0, 10))
 
         current_bg_color = metadata.get('header_bg_color', self.colors['light'])
         selected_color = tk.StringVar(value=current_bg_color)
-        
-        # Color preview
-        preview_frame = tk.Frame(color_frame, bg='#F5F7FA')
-        preview_frame.pack(anchor='w', pady=(0, 10))
-        
-        tk.Label(preview_frame, text="Preview:", font=('Segoe UI', 9),
-                bg='#F5F7FA').pack(side=tk.LEFT, padx=(0, 10))
-        
-        color_preview = tk.Canvas(preview_frame, width=120, height=40, 
-                                  bg=current_bg_color, highlightthickness=2, 
-                                  highlightbackground='#CCCCCC')
-        color_preview.pack(side=tk.LEFT)
-        
-        # Color palette
-        colors_grid = tk.Frame(content, bg='#F5F7FA')
-        colors_grid.pack(fill=tk.X, pady=(0, 10))
-        
+
+        # Make 4 equal-width columns
+        for col in range(4):
+            color_area.grid_columnconfigure(col, weight=1, uniform="colors")
+
+        # Preview row (row 0)
+        tk.Label(
+            color_area,
+            text="Preview:",
+            font=('Segoe UI', 9),
+            bg='#F5F7FA',
+            fg='#2C3E50'
+        ).grid(row=0, column=0, sticky="w", padx=(0, 10), pady=(0, 8))
+
+        color_preview = tk.Canvas(
+            color_area,
+            height=40,
+            bg=current_bg_color,
+            highlightthickness=2,
+            highlightbackground='#CCCCCC'
+        )
+        # Span remaining columns so its width matches the palette area
+        color_preview.grid(row=0, column=1, columnspan=3, sticky="nsew", pady=(0, 8))
+
+        # Color palette buttons
         preset_colors = [
             ('#FFFFFF', 'White'),
             ('#F8F9FA', 'Light Gray'),
@@ -4324,29 +4333,38 @@ class ModernGroupsTab:
             ('#B3E5FC', 'Light Blue'),
             ('#F0F4C3', 'Lime')
         ]
-        
+
         def set_color(color):
             selected_color.set(color)
             color_preview.config(bg=color)
-        
+
+        max_cols = 4
         for i, (color, name) in enumerate(preset_colors):
-            row = i // 4
-            col = i % 4
-            
-            color_container = tk.Frame(colors_grid, bg='#F5F7FA')
-            color_container.grid(row=row, column=col, padx=5, pady=5)
-            
-            color_btn = tk.Frame(color_container, bg=color, width=90, height=35,
-                                relief='raised', borderwidth=2, cursor='hand2')
-            color_btn.pack()
-            color_btn.pack_propagate(False)
-            
-            color_label = tk.Label(color_btn, text=name, font=('Segoe UI', 8),
-                                  bg=color, cursor='hand2')
-            color_label.pack(expand=True)
-            
+            row = 1 + i // max_cols   # start from row 1 (row 0 is preview)
+            col = i % max_cols
+
+            # This frame is the button and stretches to fill its grid cell
+            color_btn = tk.Frame(
+                color_area,
+                bg=color,
+                relief='raised',
+                borderwidth=2,
+                cursor='hand2'
+            )
+            color_btn.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+
+            label = tk.Label(
+                color_btn,
+                text=name,
+                font=('Segoe UI', 8),
+                bg=color,
+                cursor='hand2'
+            )
+            label.pack(expand=True, fill="both", padx=2, pady=2)
+
+            # Click handling
             color_btn.bind('<Button-1>', lambda e, c=color: set_color(c))
-            color_label.bind('<Button-1>', lambda e, c=color: set_color(c))
+            label.bind('<Button-1>', lambda e, c=color: set_color(c))
 
         # Security Settings
         tk.Label(content, text="🔒 Security Settings",
