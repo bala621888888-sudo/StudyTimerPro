@@ -23,6 +23,9 @@ import hashlib
 from pathlib import Path
 from secrets_util import get_secret
 import platform
+import psutil
+import tkinter.messagebox as mb
+import tempfile
 from api_client import api
 from token_tracker import create_token_usage_widget, set_refresh_callback
 import subprocess
@@ -64,7 +67,7 @@ print(f"ENCRYPTED_CREDENTIALS exists: {bool(get_secret('ENCRYPTED_CREDENTIALS'))
 print(f"LB_SHEET_ID: {get_secret('LB_SHEET_ID')}")
 # ===== Subscription pricing (in rupees) =====
 SUBSCRIPTION_PRICE_NORMAL_RUPEES   = 349  # Standard price
-SUBSCRIPTION_PRICE_REFERRAL_RUPEES = 1  # Discounted price when referral code applied
+SUBSCRIPTION_PRICE_REFERRAL_RUPEES = 199  # Discounted price when referral code applied
 # Razorpay PUBLIC key (same as in Cloud Function)
 RAZORPAY_KEY_ID = "rzp_live_RCiAvkzn29q7AQ" 
 import os
@@ -99,18 +102,77 @@ TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN")
 
 LB_CREDENTIALS = None
 
-try:
-    import win32event, win32api, winerror
-    # Create a named mutex (unique app name)
-    mutex = win32event.CreateMutex(None, False, "StudyTimerSingleInstance")
-    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
-        # Another instance is already running
-        import tkinter.messagebox as mb
+LOCKFILE = os.path.join(tempfile.gettempdir(), "studytimer.lock")
+
+def is_already_running():
+    """
+    Check if another real StudyTimer instance is running.
+
+    Uses a lock file containing the PID. If the PID is dead,
+    treat it as not running and delete the stale lock file.
+    """
+    if not os.path.exists(LOCKFILE):
+        return False
+
+    try:
+        with open(LOCKFILE, "r") as f:
+            pid_str = f.read().strip()
+        pid = int(pid_str) if pid_str else None
+    except Exception:
+        # Corrupted lock file – remove it and continue
+        try:
+            os.remove(LOCKFILE)
+        except OSError:
+            pass
+        return False
+
+    # If PID exists and process is alive, another instance is running
+    try:
+        if pid and psutil.pid_exists(pid):
+            return True
+    except Exception:
+        pass
+
+    # Stale lock (process dead) – clean it up
+    try:
+        os.remove(LOCKFILE)
+    except OSError:
+        pass
+    return False
+
+
+def create_lock():
+    with open(LOCKFILE, "w") as f:
+        f.write(str(os.getpid()))
+
+def remove_lock():
+    if os.path.exists(LOCKFILE):
+        try:
+            os.remove(LOCKFILE)
+        except OSError:
+            pass
+
+def run_app():
+    """Main entry point with single-instance protection."""
+    global APP_INSTANCE
+
+    # 🔒 single instance using lock file
+    if is_already_running():
         mb.showinfo("Study Timer", "⚠ Study Timer is already running.")
         sys.exit(0)
-except ImportError:
-    # If pywin32 not available, fall back to lock file
-    pass
+
+    create_lock()
+
+    # StudyTimerApp is itself a tk.Tk subclass – it IS the root window
+    APP_INSTANCE = StudyTimerApp()
+
+    # remove lock when window closes
+    def _on_close():
+        remove_lock()
+        APP_INSTANCE.destroy()
+
+    APP_INSTANCE.protocol("WM_DELETE_WINDOW", _on_close)
+    APP_INSTANCE.mainloop()
     
 load_dotenv()
 # Decrypt service account (skip if offline)
@@ -9905,14 +9967,14 @@ class OnboardingWizard(tk.Toplevel):
         wrap = tk.Frame(avatar_frame, bg="white")
         wrap.pack()
 
-        # Avatar loading logic (keeping original)
+        # Avatar loading logic (use the same app_paths as the rest of the app)
         avatars_dir = getattr(self.app, 'avatars_dir', None)
         if avatars_dir is None:
             try:
-                import app_paths
+                from config_paths import app_paths
                 avatars_dir = app_paths.avatars_dir
-            except:
-                avatars_dir = os.path.join(os.getenv('APPDATA'), 'StudyTimer', 'avatars')
+            except Exception:
+                avatars_dir = os.path.join(os.getenv('APPDATA') or "", 'StudyTimer', 'avatars')
         
         os.makedirs(avatars_dir, exist_ok=True)
         
@@ -15617,6 +15679,7 @@ def load_last_active_plan():
 class StudyTimerApp(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.withdraw()
         self._promoter_device = False
         self.bind_all('<Control-Shift-D>', self._on_dev_shortcut)
         print("[DEV] Ctrl+Shift+D global shortcut bound")
@@ -16442,6 +16505,21 @@ class StudyTimerApp(tk.Tk):
             self.after(100, self._check_initial_tampered_state)
         else:
             print("[PROMOTER] Skipping tampered-state startup check (promoter device)")
+        
+        if hasattr(self, 'license_manager') and self.license_manager:
+            self.license_manager.main_app_instance = self
+        self._check_day_change_on_startup()
+
+        # Don’t hide features for promoter devices, even if trial was tampered
+        if not getattr(self, "_promoter_device", False):
+            self.after(100, self._check_initial_tampered_state)
+        else:
+            print("[PROMOTER] Skipping tampered-state startup check (promoter device)")
+
+        # 🔹 Now the UI is ready – show the main window once
+        self.deiconify()
+        self.lift()
+        self.focus_force()
         
         # --- End
         
@@ -30028,40 +30106,57 @@ Based on the study plan, create a SPECIFIC, ACTIONABLE preview:
         """Check if any session days were skipped and auto-generate their structure."""
         if current_session_day <= 1:
             return  # First day, nothing to check
-        
-        # Check which days already have generated material
+
         existing_days = set()
         if materials_file.exists():
             try:
                 materials = json.loads(materials_file.read_text(encoding="utf-8"))
-                # Find all keys for this session
+                plan_name = self.current_plan_name or "Default"
+
+                import re
+
+                # ✅ NEW: read coverage from block_day* keys (main material format)
+                block_prefix = f"{plan_name}_{session_name}_block_day"
                 for key in materials.keys():
-                    if f"{self.current_plan_name}_{session_name}_sessionday" in key:
-                        # Extract day number from key
-                        import re
-                        match = re.search(r'_sessionday(\d+)_', key)
-                        if match:
-                            existing_days.add(int(match.group(1)))
-            except:
-                pass
-        
-        # Find missing days (1 to current_session_day-1)
-        missing_days = []
-        for day in range(1, current_session_day):
-            if day not in existing_days:
-                missing_days.append(day)
-        
+                    if key.startswith(block_prefix):
+                        m = re.search(r"_block_day(\d+)", key)
+                        if not m:
+                            continue
+                        start_day = int(m.group(1))
+
+                        # Assume each block covers up to 10 days (same as generator)
+                        if isinstance(days_until_exam, int) and days_until_exam > 0:
+                            end_day = min(start_day + 10 - 1, days_until_exam)
+                        else:
+                            end_day = start_day + 10 - 1
+
+                        for d in range(start_day, end_day + 1):
+                            existing_days.add(d)
+
+                # 🔁 (Optional backward-compat) also consider old 'sessionday' keys if present
+                sessionday_prefix = f"{plan_name}_{session_name}_sessionday"
+                for key in materials.keys():
+                    if key.startswith(sessionday_prefix):
+                        m = re.search(r"sessionday(\d+)", key)
+                        if m:
+                            existing_days.add(int(m.group(1)))
+            except Exception as e:
+                print(f"[SKIP] Failed to inspect existing material blocks: {e}")
+
+        # Days from 1 .. current_session_day-1 that have no plan coverage
+        missing_days = [d for d in range(1, current_session_day) if d not in existing_days]
+
         if not missing_days:
             return  # No missing days
-        
+
         print(f"🔄 Found {len(missing_days)} skipped session days for {session_name}: {missing_days}")
-        
-        # Auto-generate structure for missing days
+
+        # Auto-generate a lightweight block for the skipped range
         self._generate_lightweight_structure_for_days(
-            session_name, 
-            missing_days, 
-            materials_file, 
-            days_until_exam
+            session_name,
+            missing_days,
+            materials_file,
+            days_until_exam,
         )
 
     def _generate_lightweight_structure_for_days(self, session_name, missing_days, materials_file, days_until_exam):
@@ -30146,21 +30241,30 @@ Based on the study plan, create a SPECIFIC, ACTIONABLE preview:
             import re
             material = re.sub(r',(\s*[}\]])', r'\1', material)
             
-            # Validate
+            # Validate the JSON once
             json.loads(material)
-            
-            # Save structure for each missing day
+
+            # ✅ Save as a single block, compatible with _find_existing_material_block
             materials_file.parent.mkdir(parents=True, exist_ok=True)
             if materials_file.exists():
                 materials = json.loads(materials_file.read_text(encoding="utf-8"))
             else:
                 materials = {}
-            
-            for day in missing_days:
-                key = f"{self.current_plan_name}_{session_name}_day{day}_{days_until_exam}daysRemaining"
-                materials[key] = material
-            
-            materials_file.write_text(json.dumps(materials, indent=2, ensure_ascii=False), encoding="utf-8")
+
+            plan_name = self.current_plan_name or "Default"
+            # Earliest day that has no material yet
+            block_start_day = min(missing_days) if missing_days else 1
+
+            block_key = f"{plan_name}_{session_name}_block_day{block_start_day}"
+
+            materials[block_key] = material
+
+            materials_file.write_text(
+                json.dumps(materials, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            print(f"✅ Generated structure for skipped days block: {block_key}")
             
             print(f"✅ Generated structure for {len(missing_days)} skipped days")
             
@@ -36771,32 +36875,76 @@ class ProfileBadge(ttk.Frame):
 
     def refresh(self):
         """Read profile.json and repaint name + avatar."""
-        import os
+        import os, json
+        from config_paths import app_paths
+
         prof = _load_profile()
         self.name.configure(text=(prof.get("user_name") or "You"))
 
+        # 1️⃣ Try stored absolute path first
         path = prof.get("avatar_path") or ""
+
+        # 2️⃣ Fallback: derive from avatar_id if path missing/invalid
+        if (not path) or (not os.path.isfile(path)):
+            avatar_id = prof.get("avatar_id")
+            if avatar_id:
+                try:
+                    candidates = [
+                        os.path.join(app_paths.avatars_dir, f"avatar {avatar_id}.png"),
+                        os.path.join(app_paths.avatars_dir, f"avatar{avatar_id}.png"),
+                    ]
+                    for cand in candidates:
+                        if os.path.isfile(cand):
+                            path = cand
+                            # Persist fixed path back to profile.json
+                            prof["avatar_path"] = path
+                            try:
+                                os.makedirs(os.path.dirname(app_paths.profile_file), exist_ok=True)
+                                with open(app_paths.profile_file, "w", encoding="utf-8") as f:
+                                    json.dump(prof, f, indent=2)
+                            except Exception as e:
+                                print(f"[PROFILE] Failed to persist avatar path: {e}")
+                            break
+                except Exception as e:
+                    print(f"[PROFILE] avatar fallback error: {e}")
+
+        # 3️⃣ Finally, render the avatar (if any)
         try:
             if path and os.path.isfile(path):
                 from PIL import Image, ImageTk, ImageDraw
                 im = Image.open(path).convert("RGBA").resize((22, 22))
-                m  = Image.new("L", (22,22), 0)
-                ImageDraw.Draw(m).ellipse((0,0,22,22), fill=255)
-                av = Image.new("RGBA", (22,22), (0,0,0,0))
-                av.paste(im, (0,0), m)
+                m  = Image.new("L", (22, 22), 0)
+                ImageDraw.Draw(m).ellipse((0, 0, 22, 22), fill=255)
+                av = Image.new("RGBA", (22, 22), (0, 0, 0, 0))
+                av.paste(im, (0, 0), m)
                 self._photo = ImageTk.PhotoImage(av)
                 self.pic.configure(image=self._photo)
             else:
                 self.pic.configure(image="")
                 self._photo = None
-        except Exception:
+        except Exception as e:
+            print(f"[PROFILE] avatar render error: {e}")
             self.pic.configure(image="")
             self._photo = None
 
     def _edit(self):
-        # Open the setup wizard to change name/avatar
+        """Open the setup wizard to change name/avatar, then refresh badge."""
         try:
-            OnboardingWizard(self.app)
+            wiz = OnboardingWizard(self.app)
+
+            def _wait_and_refresh():
+                try:
+                    # When wizard window is gone, refresh the badge
+                    if not wiz.winfo_exists():
+                        self.refresh()
+                    else:
+                        self.after(300, _wait_and_refresh)
+                except Exception as e:
+                    print("[PROFILE] wait wizard err:", e)
+
+            # Poll until the wizard is closed, then update avatar/name
+            self.after(300, _wait_and_refresh)
+
         except Exception as e:
             print("[PROFILE] open wizard error:", e)
             
@@ -36820,62 +36968,75 @@ def test_weekly_reset():
         return False 
         
 if __name__ == "__main__":
-    
-  
-    # Run weekly reset test once
-    app_paths.migrate_existing_data()
-    result = test_weekly_reset()
-    print("Weekly reset test passed!" if result else "Weekly reset test failed.")
+
+    # 🔒 Single-instance check using the lock file
+    if is_already_running():
+        mb.showinfo("Study Timer", "⚠ Study Timer is already running.")
+        sys.exit(0)
+
+    create_lock()
 
     try:
-        # Check Razorpay
-        try:
-            import razorpay
-            print("[PAYMENT] Razorpay library available")
-        except ImportError:
-            print("[PAYMENT] WARNING: Razorpay library not installed")
+        # Run weekly reset test once
+        app_paths.migrate_existing_data()
+        result = test_weekly_reset()
+        print("Weekly reset test passed!" if result else "Weekly reset test failed.")
 
-        # LAUNCH DIRECTLY WITHOUT SEPARATE AUTH WINDOW
-        app = StudyTimerApp()
-        
-        # Optional: Try to load auth data if exists
         try:
-            user_config_file = os.path.join(os.getenv('APPDATA'), 'StudyTimer', 'user_config.json')
-            if os.path.exists(user_config_file):
-                with open(user_config_file, 'r') as f:
-                    app.auth_user_data = json.load(f)
-                    print(f"[AUTH] ✓ Loaded: {app.auth_user_data.get('email', 'Unknown')}")
+            # Check Razorpay
+            try:
+                import razorpay
+                print("[PAYMENT] Razorpay library available")
+            except ImportError:
+                print("[PAYMENT] WARNING: Razorpay library not installed")
+
+            # LAUNCH DIRECTLY WITHOUT SEPARATE AUTH WINDOW
+            app = StudyTimerApp()
+
+            # Optional: Try to load auth data if exists
+            try:
+                user_config_file = os.path.join(
+                    os.getenv("APPDATA"), "StudyTimer", "user_config.json"
+                )
+                if os.path.exists(user_config_file):
+                    with open(user_config_file, "r") as f:
+                        app.auth_user_data = json.load(f)
+                        print(
+                            f"[AUTH] ✓ Loaded: {app.auth_user_data.get('email', 'Unknown')}"
+                        )
+            except Exception as e:
+                print(f"[AUTH] No existing auth: {e}")
+                app.auth_user_data = None
+
+            # Add auto-updater with profile path
+            app = add_auto_update_to_app(
+                app,
+                CURRENT_VERSION,
+                profile_path=app_paths.profile_file,
+            )
+
+            # Optional: Add payment menu
+            try:
+                app.add_payment_menu()
+            except Exception:
+                pass
+
+            # Start remote control if available
+            try:
+                launch_remote_control(app)
+            except NameError:
+                pass
+
+            # Run Tkinter loop
+            app.mainloop()
+
         except Exception as e:
-            print(f"[AUTH] No existing auth: {e}")
-            app.auth_user_data = None
-        
-        # Import app_paths to get profile file location
-       
-        # Add auto-updater with profile path
-        app = add_auto_update_to_app(
-            app, 
-            CURRENT_VERSION,
-            profile_path=app_paths.profile_file
-        )
+            import tkinter.messagebox as mbox
+            import traceback
 
-        # Optional: Add payment menu
-        try:
-            app.add_payment_menu()
-        except Exception:
-            pass
+            mbox.showerror("Error", f"{e}\n\n{traceback.format_exc()}")
 
-        # Start remote control if available
-        try:
-            launch_remote_control(app)
-        except NameError:
-            pass
-
-        # Run Tkinter loop
-        app.mainloop()
-
-    except Exception as e:
-        import tkinter.messagebox as mbox
-        import traceback
-        mbox.showerror("Error", f"{e}\n\n{traceback.format_exc()}")
-
+    finally:
+        # ALWAYS remove lock when app exits (normally or by error)
+        remove_lock()
         
