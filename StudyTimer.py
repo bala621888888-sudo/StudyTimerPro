@@ -102,6 +102,26 @@ TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN")
 
 LB_CREDENTIALS = None
 
+def run_subprocess_hidden(cmd, **kwargs):
+    """
+    Run subprocess without flashing a console window on Windows.
+    Usage examples:
+        run_subprocess_hidden(["wmic", "bios", "get", "serialnumber"], capture_output=True, text=True)
+        run_subprocess_hidden(["attrib", "+H", "+R", "+S", file_path], shell=True)
+    """
+    import os
+    import subprocess
+
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        CREATE_NO_WINDOW = 0x08000000
+        kwargs.setdefault("startupinfo", startupinfo)
+        kwargs.setdefault("creationflags", CREATE_NO_WINDOW)
+
+    return subprocess.run(cmd, **kwargs)
+
+
 LOCKFILE = os.path.join(tempfile.gettempdir(), "studytimer.lock")
 
 def is_already_running():
@@ -4486,19 +4506,29 @@ class SecureTrialManager:
                 except:
                     pass
                 
-                # Get BIOS serial number
+                # Get BIOS serial number (WITHOUT showing any cmd window)
                 try:
                     import subprocess
+
+                    # Default: no special flags
+                    creationflags = 0
+                    # On Windows, this constant exists and hides the console window
+                    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                        creationflags = subprocess.CREATE_NO_WINDOW
+
                     result = subprocess.run(
                         ["wmic", "bios", "get", "serialnumber"],
-                        capture_output=True, text=True
+                        capture_output=True,
+                        text=True,
+                        creationflags=creationflags,  # 👈 hides the cmd window
                     )
                     if result.returncode == 0:
                         lines = result.stdout.strip().split('\n')
                         if len(lines) > 1:
                             identifiers.append(lines[1].strip())
-                except:
-                    pass
+                except Exception as e:
+                    # Don’t crash fingerprint if BIOS serial fails
+                    print(f"[TRIAL] BIOS serial fetch failed: {e}")
             
             # Add disk serial
             try:
@@ -15565,7 +15595,12 @@ def hide_and_protect_files():
     for file_path in files:
         print(f"Hiding: {file_path}")  # Debug
         try:
-            result = subprocess.run(['attrib', '+H', '+R', '+S', file_path], shell=True, capture_output=True, text=True)
+            result = run_subprocess_hidden(
+                ['attrib', '+H', '+R', '+S', file_path],
+                shell=True,
+                capture_output=True,
+                text=True
+            )
             print(f"Result for {file_path}: {result.returncode}")  # Debug
         except Exception as e:
             print(f"Error hiding {file_path}: {e}")
@@ -15581,7 +15616,13 @@ def unhide_and_make_writable():
     files = csv_files + json_files
     
     for file_path in files:
-        subprocess.run(['attrib', '-H', '-R', '-S', file_path], shell=True)
+        try:
+            run_subprocess_hidden(
+                ['attrib', '-H', '-R', '-S', file_path],
+                shell=True
+            )
+        except Exception as e:
+            print(f"Error unhiding {file_path}: {e}")
     
     print(f"Unhidden {len(files)} files for app use")
     
@@ -22747,7 +22788,13 @@ class StudyTimerApp(tk.Tk):
         files = csv_files + json_files
         
         for file_path in files:
-            subprocess.run(['attrib', '-H', '-R', '-S', file_path], shell=True)
+            try:
+                run_subprocess_hidden(
+                    ['attrib', '-H', '-R', '-S', file_path],
+                    shell=True
+                )
+            except Exception as e:
+                print(f"Error unhiding {file_path}: {e}")
         
         print(f"Manually unhidden {len(files)} files")
         # Optional: Show message box
@@ -31087,8 +31134,23 @@ Based on the study plan, create a SPECIFIC, ACTIONABLE preview:
                 font=("Segoe UI", 14, "bold"), bg="#16a085", fg="white").pack(anchor="w")
         tk.Label(title_frame, text=topic_name,
                 font=("Segoe UI", 11), bg="#16a085", fg="#ecf0f1").pack(anchor="w")
-        tk.Label(title_frame, text=f"Focus: {content_brief[:60]}..." if len(content_brief) > 60 else f"Focus: {content_brief}",
-                font=("Segoe UI", 9), bg="#16a085", fg="#bdc3c7").pack(anchor="w")
+
+        # 🔒 Safely handle None / non-string content_brief
+        focus_raw = content_brief if isinstance(content_brief, str) else ("" if content_brief is None else str(content_brief))
+        focus_clean = focus_raw.strip()
+
+        if not focus_clean:
+            focus_clean = "No specific focus summary provided"
+
+        focus_display = focus_clean if len(focus_clean) <= 60 else focus_clean[:60] + "..."
+
+        tk.Label(
+            title_frame,
+            text=f"Focus: {focus_display}",
+            font=("Segoe UI", 9),
+            bg="#16a085",
+            fg="#bdc3c7",
+        ).pack(anchor="w")
         
         def send_to_telegram():
             """Send all capsule contents to Telegram as single HTML."""
