@@ -1103,79 +1103,6 @@ class FirebaseStorage:
         except Exception as e:
             return False, f"Error: {str(e)}"
             
-
-class MessageListener:
-    """Firebase real-time message listener using polling"""
-
-    def __init__(self, chat_id, callback, db_instance, is_group=False):
-        self.chat_id = chat_id
-        self.callback = callback
-        self.db = db_instance
-        self.is_group = is_group
-        self.running = False
-        self.thread = None
-        self.last_message_count = 0
-        self.last_check = 0
-    
-    def start(self):
-        """Start listening for new messages"""
-        if self.running:
-            return
-        
-        self.running = True
-        self.thread = threading.Thread(target=self._listen_loop, daemon=True)
-        self.thread.start()
-        print(f"[LISTENER] Started for chat {self.chat_id}")
-    
-    def stop(self):
-        """Stop listening"""
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=1)
-        print(f"[LISTENER] Stopped for chat {self.chat_id}")
-    
-    def _listen_loop(self):
-        """Background loop to check for new messages"""
-        while self.running:
-            try:
-                # Only check every 3 seconds to reduce load
-                current_time = time.time()
-                if current_time - self.last_check < 3:
-                    time.sleep(0.5)
-                    continue
-                
-                self.last_check = current_time
-                
-                # Fetch latest messages
-                if self.is_group:
-                    messages = self.db.get_group_messages_by_id(self.chat_id)
-                else:
-                    messages = self.db.get_messages(self.chat_id)
-                
-                if messages:
-                    message_count = len(messages)
-                    
-                    # Check if there are new messages
-                    if message_count > self.last_message_count:
-                        print(f"[LISTENER] New messages detected: {message_count} (was {self.last_message_count})")
-                        self.last_message_count = message_count
-                        
-                        # Put update request in queue for UI thread
-                        message_queue.put({
-                            'type': 'update_messages',
-                            'chat_id': self.chat_id,
-                            'messages': messages
-                        })
-                    else:
-                        self.last_message_count = message_count
-                
-                # Sleep before next check
-                time.sleep(1)
-                
-            except Exception as e:
-                print(f"[LISTENER ERROR] {e}")
-                time.sleep(2)  # Wait longer on error
-
 """
 Cache-First Loading Strategy for Chat App
 Replace the relevant sections in your code with these improved versions.
@@ -3945,102 +3872,62 @@ def main(page: ft.Page):
     def handle_back_navigation(e=None):
         """Handle Android back button and swipe back - OPTIMIZED"""
         print(f"[BACK] handle_back_navigation called, stack size: {len(navigation_stack)}")
-        
-        # First check if navigation stack has items (e.g., inside a chat)
+
+        # 1️⃣ If we are currently inside a private chat, go back to Private tab
+        try:
+            if active_screen.get("current") == "private_chat":
+                print("[BACK] Currently in private_chat screen -> back_to_chat_list()")
+                back_to_chat_list(e)
+                return True
+        except Exception as screen_ex:
+            print(f"[BACK] Error checking active_screen for private_chat: {screen_ex}")
+
+        # 2️⃣ If there is something in navigation_stack (e.g. group editor, etc.)
         if len(navigation_stack) > 0:
-            stop_auto_refresh()
+            try:
+                stop_auto_refresh()
+            except Exception as stop_ex:
+                print(f"[BACK] Error while stopping auto-refresh: {stop_ex}")
+
             previous_view = navigation_stack.pop()
-            previous_view()
+            try:
+                previous_view()
+            except Exception as nav_ex:
+                print(f"[BACK] Error while calling previous_view: {nav_ex}")
             return True  # Indicate we handled the back action
-        
-        # If on main menu, check if we can go to tab 0 first
+
+        # 3️⃣ If on a later tab, jump back to tab 0 (Promoter)
         try:
             current_tab = activate_tab_ref.get("current_tab", 0)
-            if current_tab > 0 and activate_tab_ref.get("fn"):
+            fn = activate_tab_ref.get("fn")
+            if current_tab > 0 and fn:
                 # Go back to first tab (Promoter)
                 print(f"[BACK] On tab {current_tab}, going to tab 0")
-                activate_tab_ref
+                fn(0)
                 return True
         except Exception as tab_ex:
             print(f"[BACK] Tab check error: {tab_ex}")
-        
-        # Double-tap to exit logic
+
+        # 4️⃣ Double-tap to exit logic
         current_time = time.time()
         if current_time - last_back_press["time"] < 2:  # 2 seconds window
             # Second press within 2 seconds - allow exit
             print("[BACK] Double back press - allowing exit")
-            return False
+            return False  # Let app close
         else:
             # First press - show toast and wait for second
             last_back_press["time"] = current_time
             try:
                 page.snack_bar = ft.SnackBar(
                     content=ft.Text("Press back again to exit"),
-                    duration=2000
+                    duration=2000,
                 )
                 page.snack_bar.open = True
                 page.update()
-            except:
-                pass
+            except Exception as sb_ex:
+                print(f"[BACK] Error showing back snack_bar: {sb_ex}")
             print("[BACK] First back press - waiting for second")
-            return True  # Don't exit yet
-        
-    # Set up back button handler for keyboard (desktop/escape key)
-    page.on_keyboard_event = (
-        lambda e: handle_back_navigation(e) if e.key == "Escape" else None
-    )
-
-    # 🔴 NEW: Intercept Android hardware back via root View
-    try:
-        if page.views and len(page.views) > 0:
-            root_view = page.views[0]
-
-            # Prevent automatic pop of root view on back
-            root_view.can_pop = False
-
-            def on_root_confirm_pop(e):
-                print("[BACK] root_view.on_confirm_pop called")
-                handled = handle_back_navigation(None)
-
-                # If we handled navigation (went back / showed snackbar),
-                # don't close the app. If we didn't handle (second back),
-                # allow the root view to be popped (app closes).
-                root_view.confirm_pop(not handled)
-
-            root_view.on_confirm_pop = on_root_confirm_pop
-            print("[BACK] Root view back handler registered")
-    except Exception as ex:
-        print(f"[BACK] Root view back setup error: {ex}")
-
-    # Android hardware back button support
-    try:
-        page.window_prevent_close = True
-        
-        def on_window_event(e):
-            print(f"[BACK] Window event: {e.data}")
-            if e.data == "close":
-                # Try to navigate back first
-                handled = handle_back_navigation(None)
-                if not handled:
-                    # Navigation stack empty, allow close
-                    page.window_destroy()
-        
-        page.on_window_event = on_window_event
-        
-        # ✅ Optional: Android-specific back handler (may or may not fire)
-        if hasattr(page, 'on_back_button'):
-            def on_android_back(e):
-                print("[BACK] Android back button pressed")
-                handled = handle_back_navigation(None)
-                if handled:
-                    e.prevent_default = True  # Prevent app from closing
-                # If not handled, let app close naturally
-            
-            page.on_back_button = on_android_back
-            print("[BACK] Android back button handler registered")
-            
-    except Exception as ex:
-        print(f"Back button setup: {ex}")
+            return True  # Handled (do not exit on first press)
     
     # Auto-login check - NON-BLOCKING VERSION
     def check_auto_login():
@@ -8303,6 +8190,49 @@ def main(page: ft.Page):
             "loading": False,
             "last_refresh": None
         }
+        
+        def format_rupees_indian(amount):
+            """Format rupee values like 1,23,456 instead of 123k."""
+            try:
+                n = int(round(float(amount)))
+            except Exception:
+                return "₹0"
+
+            sign = "-" if n < 0 else ""
+            n = abs(n)
+            s = str(n)
+
+            if len(s) <= 3:
+                grouped = s
+            else:
+                last3 = s[-3:]
+                rest = s[:-3]
+                parts = []
+                while len(rest) > 2:
+                    parts.append(rest[-2:])
+                    rest = rest[:-2]
+                if rest:
+                    parts.append(rest)
+                grouped = ",".join(reversed(parts)) + "," + last3
+
+            return f"{sign}₹{grouped}"
+
+        def adjust_amount_font_size(base_size, amount_text):
+            """Slightly reduce font size for longer amounts so they never get cut off."""
+            try:
+                length = len(str(amount_text))
+            except Exception:
+                length = 0
+
+            size = base_size
+            if length >= 12:
+                size = base_size - 4
+            elif length >= 10:
+                size = base_size - 3
+            elif length >= 8:
+                size = base_size - 2
+
+            return max(10, size)
 
         # Avatar colors for visual variety (used when no profile pic)
         AVATAR_COLORS = [
@@ -8558,6 +8488,52 @@ def main(page: ft.Page):
                     border=ft.border.all(3, "white") if is_top3 else ft.border.all(2, "white")
                 )
 
+                # Helpers for Hall of Fame amounts
+        def format_rupees_indian(amount):
+            """Format 1234567 as ₹12,34,567 (Indian system)."""
+            try:
+                amt = int(round(float(amount)))
+            except Exception:
+                amt = 0
+
+            negative = amt < 0
+            amt = abs(amt)
+            s = str(amt)
+
+            if len(s) > 3:
+                last3 = s[-3:]
+                rest = s[:-3]
+                parts = []
+                while len(rest) > 2:
+                    parts.insert(0, rest[-2:])
+                    rest = rest[:-2]
+                if rest:
+                    parts.insert(0, rest)
+                s = ",".join(parts) + "," + last3
+
+            result = f"₹{s}"
+            if negative:
+                result = "-" + result
+            return result
+
+        def adjust_amount_font_size(base_size, text, min_size=10):
+            """
+            Shrink font a bit when digits increase so it never gets cut off.
+            Counts only digits in the formatted text.
+            """
+            digits_only = "".join(ch for ch in text if ch.isdigit())
+            length = len(digits_only)
+
+            size = base_size
+            if length <= 6:
+                return size
+
+            extra = length - 6
+            size = base_size - extra * 1.2
+            if size < min_size:
+                size = min_size
+            return size
+
         def create_hof_podium_card(entry, position="center"):
             """Create a podium card for top 3 with gaming style"""
             if not entry:
@@ -8582,55 +8558,69 @@ def main(page: ft.Page):
             medal_colors = {1: "#FFD700", 2: "#94A3B8", 3: "#CD7F32"}
             medal_color = medal_colors.get(rank, "#FFD700")
             
-            # Format earnings
+            # Format earnings with Indian grouping (e.g., ₹1,23,456)
             earnings = entry.get("earnings", 0)
-            if earnings >= 1000:
-                earnings_text = f"₹{earnings/1000:.1f}K"
-            else:
-                earnings_text = f"₹{earnings:.0f}"
+            earnings_text = format_rupees_indian(earnings)
+            effective_score_size = adjust_amount_font_size(score_size, earnings_text)
             
             return ft.Container(
-                content=ft.Column([
-                    ft.Container(height=top_padding),
-                    ft.Stack([
-                        create_hof_avatar(entry, size=avatar_size, is_top3=True),
+                content=ft.Column(
+                    [
+                        ft.Container(height=top_padding),
+                        ft.Stack(
+                            [
+                                create_hof_avatar(entry, size=avatar_size, is_top3=True),
+                                ft.Container(
+                                    content=create_hof_rank_badge(rank),
+                                    right=-5,
+                                    bottom=-5,
+                                ),
+                            ],
+                            width=avatar_size + 10,
+                            height=avatar_size + 10,
+                        ),
+                        ft.Container(height=8),
+                        ft.Text(
+                            entry.get("name", "Unknown"),
+                            size=name_size,
+                            weight="bold",
+                            color="white",
+                            text_align=ft.TextAlign.CENTER,
+                            max_lines=1,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                            width=card_width - 10,
+                        ),
+                        ft.Container(height=4),
                         ft.Container(
-                            content=create_hof_rank_badge(rank),
-                            right=-5,
-                            bottom=-5,
-                        )
-                    ], width=avatar_size + 10, height=avatar_size + 10),
-                    ft.Container(height=8),
-                    ft.Text(
-                        entry.get("name", "Unknown"),
-                        size=name_size,
-                        weight="bold",
-                        color="white",
-                        text_align=ft.TextAlign.CENTER,
-                        max_lines=1,
-                        overflow=ft.TextOverflow.ELLIPSIS,
-                        width=card_width - 10
-                    ),
-                    ft.Container(height=4),
-                    ft.Container(
-                        content=ft.Row([
-                            ft.Icon(ft.Icons.MONETIZATION_ON, size=score_size, color="#FFD700"),
-                            ft.Text(
-                                earnings_text,
-                                size=score_size,
-                                weight="bold",
-                                color="white"
+                            content=ft.Row(
+                                [
+                                    # 💰 Amount only (no money icon), dark green
+                                    ft.Text(
+                                        earnings_text,
+                                        size=effective_score_size,
+                                        weight="bold",
+                                        color="#166534",  # dark green
+                                    ),
+                                    ft.Container(
+                                        content=ft.Icon(
+                                            ft.Icons.WORKSPACE_PREMIUM,
+                                            size=14,
+                                            color="white",
+                                        ),
+                                        bgcolor=medal_color,
+                                        border_radius=4,
+                                        padding=2,
+                                        margin=ft.margin.only(left=4),
+                                    ),
+                                ],
+                                alignment=ft.MainAxisAlignment.CENTER,
+                                spacing=4,
                             ),
-                            ft.Container(
-                                content=ft.Icon(ft.Icons.WORKSPACE_PREMIUM, size=14, color="white"),
-                                bgcolor=medal_color,
-                                border_radius=4,
-                                padding=2,
-                                margin=ft.margin.only(left=4)
-                            )
-                        ], alignment=ft.MainAxisAlignment.CENTER, spacing=4),
-                    ),
-                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=0),
+                        ),
+                    ],
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=0,
+                ),
                 width=card_width,
             )
 
@@ -8643,49 +8633,63 @@ def main(page: ft.Page):
             badge_colors = ["#F59E0B", "#10B981", "#6366F1", "#EC4899", "#06B6D4"]
             badge_color = badge_colors[(rank - 4) % len(badge_colors)]
             
-            # Format earnings
+            # Format earnings with Indian grouping
             earnings = entry.get("earnings", 0)
-            if earnings >= 1000:
-                earnings_text = f"₹{earnings/1000:.1f}K"
-            else:
-                earnings_text = f"₹{earnings:.0f}"
+            earnings_text = format_rupees_indian(earnings)
+            amount_size = adjust_amount_font_size(14, earnings_text)
             
             return ft.Container(
-                content=ft.Row([
-                    ft.Container(
-                        content=ft.Text(str(rank), size=16, weight="bold", color="#1E3A5F"),
-                        width=30,
-                    ),
-                    create_hof_avatar(entry, size=50, is_top3=False),
-                    ft.Container(width=10),
-                    ft.Container(
-                        content=ft.Text(
-                            entry.get("name", "Unknown"),
-                            size=14,
-                            weight="w500",
-                            color="#1E3A5F",
-                            overflow=ft.TextOverflow.ELLIPSIS,
-                            max_lines=1,
+                content=ft.Row(
+                    [
+                        ft.Container(
+                            content=ft.Text(
+                                str(rank),
+                                size=16,
+                                weight="bold",
+                                color="#1E3A5F",
+                            ),
+                            width=30,
                         ),
-                        expand=True,
-                    ),
-                    ft.Row([
-                        ft.Icon(ft.Icons.MONETIZATION_ON, size=18, color="#FFD700"),
-                        ft.Text(
-                            earnings_text,
-                            size=14,
-                            weight="bold",
-                            color="#1E3A5F"
+                        create_hof_avatar(entry, size=50, is_top3=False),
+                        ft.Container(width=10),
+                        ft.Container(
+                            content=ft.Text(
+                                entry.get("name", "Unknown"),
+                                size=14,
+                                weight="w500",
+                                color="#1E3A5F",
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                                max_lines=1,
+                            ),
+                            expand=True,
                         ),
-                    ], spacing=4),
-                    ft.Container(width=8),
-                    ft.Container(
-                        content=ft.Icon(ft.Icons.WORKSPACE_PREMIUM, size=16, color="white"),
-                        bgcolor=badge_color,
-                        border_radius=6,
-                        padding=6,
-                    ),
-                ], alignment=ft.MainAxisAlignment.START, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                        ft.Row(
+                            [
+                                # 💰 Amount only (no money icon), dark green
+                                ft.Text(
+                                    earnings_text,
+                                    size=amount_size,
+                                    weight="bold",
+                                    color="#166534",  # dark green
+                                ),
+                            ],
+                            spacing=4,
+                        ),
+                        ft.Container(width=8),
+                        ft.Container(
+                            content=ft.Icon(
+                                ft.Icons.WORKSPACE_PREMIUM,
+                                size=16,
+                                color="white",
+                            ),
+                            bgcolor=badge_color,
+                            border_radius=6,
+                            padding=6,
+                        ),
+                    ],
+                    alignment=ft.MainAxisAlignment.START,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
                 padding=ft.padding.symmetric(horizontal=15, vertical=12),
                 margin=ft.margin.symmetric(horizontal=10, vertical=4),
                 bgcolor="white",
@@ -8777,22 +8781,17 @@ def main(page: ft.Page):
             border_radius=20,
         )
         
-        hof_refresh_btn = ft.IconButton(
-            icon=ft.Icons.REFRESH,
-            icon_color="white",
-            icon_size=24,
-            on_click=on_refresh_hof,
-            tooltip="Refresh rankings"
-        )
-
         # Podium section with gradient background
         hof_podium_section = ft.Container(
             content=ft.Column([
                 ft.Container(
-                    content=ft.Row([
-                        hof_top_btn,
-                        hof_refresh_btn
-                    ], alignment=ft.MainAxisAlignment.CENTER, spacing=10),
+                    content=ft.Row(
+                        [
+                            hof_top_btn,
+                        ],
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        spacing=10,
+                    ),
                     padding=ft.padding.only(top=15, bottom=10),
                 ),
                 # Loading indicator (centered)
@@ -10718,15 +10717,40 @@ def main(page: ft.Page):
                 pass
     
     def back_to_chat_list(e):
-        """Go back from private chat to chat list."""
-        print('[DEBUG] back_to_chat_list clicked')
+        """Go back from private chat to the main PRIVATE tab list."""
+        print("[DEBUG] back_to_chat_list clicked")
         try:
-            stop_auto_refresh_messages()  # ✅ Stop timer
-            stop_message_listener(current_chat_id)  # Stop listener for current chat
-            show_chat_list()  # Go directly to chat list
+            # 1) Stop private chat auto-refresh + listener
+            try:
+                stop_auto_refresh_messages()  # stop timer thread
+            except Exception as t_ex:
+                print(f"[DEBUG] stop_auto_refresh_messages error: {t_ex}")
+
+            try:
+                if current_chat_id:
+                    stop_message_listener(current_chat_id)
+            except Exception as l_ex:
+                print(f"[DEBUG] stop_message_listener error: {l_ex}")
+
+            # We are no longer on the private_chat screen
+            active_screen["current"] = None
+
+            # 2) Rebuild the main menu layout (tabs + bottom nav)
+            print("[DEBUG] back_to_chat_list -> show_main_menu()")
+            show_main_menu()
+
+            # 3) Jump directly to the PRIVATE tab (index 4)
+            try:
+                fn = activate_tab_ref.get("fn")
+                if fn:
+                    print("[DEBUG] back_to_chat_list -> activate_tab(4)")
+                    fn(4)
+            except Exception as tab_ex:
+                print(f"[DEBUG] back_to_chat_list: failed to activate private tab: {tab_ex}")
+
         except Exception as ex:
-            print(f'[ERROR] back_to_chat_list: {ex}')
-            show_snackbar(f'Back error: {ex}')
+            print(f"[ERROR] back_to_chat_list: {ex}")
+            show_snackbar(f"Back error: {ex}")
 
     def show_chat_screen():
         nonlocal displayed_message_ids, current_chat_user 
