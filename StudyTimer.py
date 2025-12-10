@@ -1,5 +1,7 @@
 # ==== EMBEDDED LEADERBOARD WIDGETS (Top-10 + Top-3) ====
 from __future__ import annotations
+import sys
+IS_CHILD_PROCESS = ("--child" in sys.argv)
 from datetime import date, datetime, timezone
 import os, math, random, requests
 import gspread
@@ -60,11 +62,24 @@ from firebase_admin import credentials, db
 import os, json, google.auth
 import json
 from secrets_util import get_secret, ONLINE, get_encrypted_gspread_client
-gspread_client = get_encrypted_gspread_client()
-load_dotenv()
-print(f"ENCRYPTION_KEY exists: {bool(get_secret('ENCRYPTION_KEY'))}")
-print(f"ENCRYPTED_CREDENTIALS exists: {bool(get_secret('ENCRYPTED_CREDENTIALS'))}")
-print(f"LB_SHEET_ID: {get_secret('LB_SHEET_ID')}")
+
+# Only hit Secret Manager / gspread from the CHILD (main UI) process.
+if IS_CHILD_PROCESS:
+    try:
+        gspread_client = get_encrypted_gspread_client()
+    except Exception as e:
+        print(f"[INIT] Encrypted gspread client init failed: {e}")
+        gspread_client = None
+
+    # This prints your "[dotenv] Skipping..." line only in the child process
+    load_dotenv()
+    print(f"ENCRYPTION_KEY exists: {bool(get_secret('ENCRYPTION_KEY'))}")
+    print(f"ENCRYPTED_CREDENTIALS exists: {bool(get_secret('ENCRYPTED_CREDENTIALS'))}")
+    print(f"LB_SHEET_ID: {get_secret('LB_SHEET_ID')}")
+else:
+    # Parent splash process: no network / secrets here
+    gspread_client = None
+
 # ===== Subscription pricing (in rupees) =====
 SUBSCRIPTION_PRICE_NORMAL_RUPEES   = 349  # Standard price
 SUBSCRIPTION_PRICE_REFERRAL_RUPEES = 199  # Discounted price when referral code applied
@@ -97,30 +112,14 @@ from token_tracker import (
 )
 
 # 👇 This line replaces your old hardcoded TELEGRAM_BOT_TOKEN
-TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN")
+if IS_CHILD_PROCESS:
+    TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN")
+else:
+    TELEGRAM_BOT_TOKEN = None
+
 
 
 LB_CREDENTIALS = None
-
-def run_subprocess_hidden(cmd, **kwargs):
-    """
-    Run subprocess without flashing a console window on Windows.
-    Usage examples:
-        run_subprocess_hidden(["wmic", "bios", "get", "serialnumber"], capture_output=True, text=True)
-        run_subprocess_hidden(["attrib", "+H", "+R", "+S", file_path], shell=True)
-    """
-    import os
-    import subprocess
-
-    if os.name == "nt":
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        CREATE_NO_WINDOW = 0x08000000
-        kwargs.setdefault("startupinfo", startupinfo)
-        kwargs.setdefault("creationflags", CREATE_NO_WINDOW)
-
-    return subprocess.run(cmd, **kwargs)
-
 
 LOCKFILE = os.path.join(tempfile.gettempdir(), "studytimer.lock")
 
@@ -194,32 +193,32 @@ def run_app():
     APP_INSTANCE.protocol("WM_DELETE_WINDOW", _on_close)
     APP_INSTANCE.mainloop()
     
-load_dotenv()
-# Decrypt service account (skip if offline)
-encryption_key = get_secret('ENCRYPTION_KEY')
-if encryption_key:
-    cipher = Fernet(encryption_key.encode())
-    encrypted_sa = get_secret('ENCRYPTED_SERVICE_ACCOUNT')
-    
-    # ADD THIS CHECK:
-    if encrypted_sa:
-        try:
-            service_account_json = cipher.decrypt(encrypted_sa.encode()).decode()
-            service_account = json.loads(service_account_json)
-        except Exception as e:
-            print(f"Failed to decrypt service account: {e}")
+# Default so the name exists in both parent + child
+service_account = None
+
+if IS_CHILD_PROCESS:
+    # Decrypt service account (skip if offline)
+    encryption_key = get_secret('ENCRYPTION_KEY')
+    if encryption_key:
+        cipher = Fernet(encryption_key.encode())
+        encrypted_sa = get_secret('ENCRYPTED_SERVICE_ACCOUNT')
+        if encrypted_sa:
+            try:
+                service_account_json = cipher.decrypt(encrypted_sa.encode()).decode()
+                service_account = json.loads(service_account_json)
+            except Exception as e:
+                print(f"Failed to decrypt service account: {e}")
+                service_account = None
+                print("Running in offline mode - Firebase features disabled")
+        else:
             service_account = None
-            print("Running in offline mode - Firebase features disabled")
+            print("Running in offline mode - No encrypted service account found")
     else:
         service_account = None
-        print("Running in offline mode - No encrypted service account found")
-else:
-    service_account = None
-    print("Running in offline mode - Firebase features disabled")
-    
-
+        print("Running in offline mode - Firebase features disabled")
 
 from api_client import api
+
 
 def ensure_anonymous_token():
     """Silently login if no token exists."""
@@ -274,8 +273,13 @@ def is_system_time_valid(max_drift_minutes: int = 5):
         print(f"[TIME-CHECK] Unable to validate system time: {e}")
         return False, None
 
-FIREBASE_DATABASE_URL = get_secret("FIREBASE_DATABASE_URL") or "https://leaderboard-98e8c-default-rtdb.asia-southeast1.firebasedatabase.app"
-FIREBASE_SERVICE_ACCOUNT = get_decrypted_service_account()
+if IS_CHILD_PROCESS:
+    FIREBASE_DATABASE_URL = get_secret("FIREBASE_DATABASE_URL") or \
+        "https://leaderboard-98e8c-default-rtdb.asia-southeast1.firebasedatabase.app"
+    FIREBASE_SERVICE_ACCOUNT = get_decrypted_service_account()
+else:
+    FIREBASE_DATABASE_URL = "https://leaderboard-98e8c-default-rtdb.asia-southeast1.firebasedatabase.app"
+    FIREBASE_SERVICE_ACCOUNT = None
 
 # ===== Google Sheets sync (safe: writes ONLY your row) =====
 # Configure via environment variables (or edit defaults below):
@@ -283,19 +287,25 @@ FIREBASE_SERVICE_ACCOUNT = get_decrypted_service_account()
 #   LB_SHEET_ID: spreadsheet key or full URL
 #   LB_WORKSHEET: worksheet/tab name (default "Sheet1")
 
-import os, time
+LB_CREDENTIALS = LB_CREDENTIALS  # keep your existing line here if you have it
 
-LB_SHEET_ID    = get_secret("LB_SHEET_ID")
-LB_WORKSHEET   = get_secret("LB_WORKSHEET") or "Sheet1"
+if IS_CHILD_PROCESS:
+    LB_SHEET_ID    = get_secret("LB_SHEET_ID")
+    LB_WORKSHEET   = get_secret("LB_WORKSHEET") or "Sheet1"
+else:
+    LB_SHEET_ID    = None
+    LB_WORKSHEET   = "Sheet1"
 
 DAILY_REPORT_STATUS_FILE = app_paths.daily_report_file
-
 
 CURRENT_VERSION = "version 00.04.10.25"
 
 # === Razorpay key bootstrap (final) ===
 RAZORPAY_KEY_ID = "rzp_live_RCiAvkzn29q7AQ"  # your real Razorpay Key ID (public)
-RAZORPAY_KEY_SECRET = get_secret("RAZORPAY_KEY_SECRET")  # Load from secret manager
+if IS_CHILD_PROCESS:
+    RAZORPAY_KEY_SECRET = get_secret("RAZORPAY_KEY_SECRET")  # Load from secret manager
+else:
+    RAZORPAY_KEY_SECRET = None
 # === end bootstrap ===
 
 APP_INSTANCE = None
@@ -3052,6 +3062,8 @@ StudyTimer Team"""
             pady=5
         )
         self.apply_btn.pack(side="left", padx=10)
+        # Remember default button text (used when we reset after promoter check)
+        self.apply_btn_default_text = self.apply_btn.cget("text")
 
         # Secondary button - smaller size  
        
@@ -3239,14 +3251,25 @@ StudyTimer Team"""
             return False
 
     def start_promoter_validation(self, activation_key, fallback_message):
-        """Secondary validation path to identify promoters when referral fails."""
-        if not self.promoter_manager:
-            self.status_label.config(text=fallback_message, fg="red")
-            self.apply_btn.config(state="normal", text="Apply Code & Save 40%")
+        """Secondary validation path to identify promoters (from referral OR manual popup)."""
+        # If promoter manager is not configured, we can only show a message
+        if not getattr(self, "promoter_manager", None):
+            if getattr(self, "status_label", None):
+                self.status_label.config(text=fallback_message, fg="red")
+            if getattr(self, "apply_btn", None):
+                default_text = getattr(self, "apply_btn_default_text", self.apply_btn.cget("text"))
+                self.apply_btn.config(state="normal", text=default_text)
             return
 
-        self.status_label.config(text="Checking promoter access...", fg="blue")
-        self.apply_btn.config(state="disabled", text="Checking promoter...")
+        # Update UI while checking
+        if getattr(self, "status_label", None):
+            self.status_label.config(text="Checking promoter access...", fg="blue")
+
+        if getattr(self, "apply_btn", None):
+            try:
+                self.apply_btn.config(state="disabled", text="Checking promoter...")
+            except Exception:
+                pass
 
         def check_promoter():
             try:
@@ -3256,22 +3279,150 @@ StudyTimer Team"""
                 result = None
 
             def finish():
+                default_text = getattr(
+                    self,
+                    "apply_btn_default_text",
+                    self.apply_btn.cget("text") if getattr(self, "apply_btn", None) else "Apply",
+                )
+
                 if result is True:
+                    # Common success flow (used by referral + manual activation)
                     self.show_promoter_welcome(activation_key)
                 elif result is False:
-                    self.status_label.config(text=fallback_message, fg="red")
-                    self.apply_btn.config(state="normal", text="Apply Code & Save 40%")
+                    # Invalid key OR blocked due to already having another key
+                    if getattr(self, "status_label", None):
+                        self.status_label.config(text=fallback_message, fg="red")
+                    if getattr(self, "apply_btn", None):
+                        self.apply_btn.config(state="normal", text=default_text)
                 else:
-                    self.status_label.config(
-                        text=f"{fallback_message} (connect to internet for promoter check)",
-                        fg="red",
-                    )
-                    self.apply_btn.config(state="normal", text="Apply Code & Save 40%")
+                    # Could not verify online
+                    if getattr(self, "status_label", None):
+                        self.status_label.config(
+                            text=f"{fallback_message} (connect to internet for promoter check)",
+                            fg="red",
+                        )
+                    if getattr(self, "apply_btn", None):
+                        self.apply_btn.config(state="normal", text=default_text)
 
-            if self.validation_window:
+            if getattr(self, "validation_window", None):
                 self.validation_window.after(0, finish)
 
         threading.Thread(target=check_promoter, daemon=True).start()
+        
+    def show_promoter_activation_prompt(self):
+        """
+        Open a dedicated popup ONLY for promoter activation.
+        Triggered manually via Ctrl+Shift+P.
+        """
+        # If a previous validation window exists, close it to avoid confusion
+        if getattr(self, "validation_window", None) and self.validation_window.winfo_exists():
+            try:
+                self.validation_window.destroy()
+            except Exception:
+                pass
+
+        print("[PROMOTER] Opening manual promoter activation window")
+
+        self.validation_window = tk.Toplevel(self.main_app)
+        self.validation_window.title("Promoter Activation - StudyTimer Pro")
+        self.validation_window.resizable(False, False)
+
+        # Size + center
+        width, height = 480, 260
+        self.validation_window.geometry(f"{width}x{height}")
+        self.validation_window.transient(self.main_app)
+        self.validation_window.grab_set()
+        self.validation_window.update_idletasks()
+        x = (self.validation_window.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.validation_window.winfo_screenheight() // 2) - (height // 2)
+        self.validation_window.geometry(f"{width}x{height}+{x}+{y}")
+
+        main = tk.Frame(self.validation_window, bg="white", padx=20, pady=20)
+        main.pack(fill="both", expand=True)
+
+        header = tk.Label(
+            main,
+            text="Activate Promoter Access",
+            font=("Arial", 16, "bold"),
+            bg="white",
+            fg="#4CAF50",
+        )
+        header.pack(anchor="w")
+
+        desc = tk.Label(
+            main,
+            text="Enter your promoter activation key to unlock full promoter access on this device.\n"
+                 "This is separate from referral discount codes.",
+            font=("Arial", 10),
+            bg="white",
+            fg="#555",
+            justify="left",
+            wraplength=440,
+        )
+        desc.pack(anchor="w", pady=(8, 16))
+
+        tk.Label(
+            main,
+            text="Activation Key",
+            font=("Arial", 11, "bold"),
+            bg="white",
+        ).pack(anchor="w")
+
+        entry = tk.Entry(main, font=("Arial", 12), bd=2, relief="solid")
+        entry.pack(fill="x", pady=(5, 2))
+        entry.focus()
+
+        self.status_label = tk.Label(
+            main,
+            text="",
+            font=("Arial", 10),
+            bg="white",
+            fg="red",
+        )
+        self.status_label.pack(anchor="w", pady=(4, 0))
+
+        btn_frame = tk.Frame(main, bg="white")
+        btn_frame.pack(fill="x", pady=(18, 0))
+
+        def on_activate():
+            key = entry.get().strip()
+            if not key:
+                self.status_label.config(text="Please enter activation key", fg="red")
+                return
+
+            print(f"[PROMOTER] Manual activation submitted: {key}")
+            # Use the SAME backend logic as referral fallback
+            self.start_promoter_validation(key, "Invalid promoter activation key")
+
+        self.apply_btn = tk.Button(
+            btn_frame,
+            text="Verify & Activate",
+            command=on_activate,
+            font=("Arial", 10, "bold"),
+            bg="#4CAF50",
+            fg="white",
+            width=16,
+            height=2,
+            cursor="hand2",
+            relief="flat",
+            bd=0,
+            activebackground="#45a049",
+            activeforeground="white",
+        )
+        self.apply_btn.pack(side="left")
+
+        # Default button text for this context
+        self.apply_btn_default_text = self.apply_btn.cget("text")
+
+        def on_close():
+            print("[PROMOTER] Manual promoter activation window closed")
+            try:
+                self.validation_window.destroy()
+            except Exception:
+                pass
+
+        self.validation_window.protocol("WM_DELETE_WINDOW", on_close)
+        self.validation_window.bind("<Return>", lambda e: on_activate())
 
     def show_promoter_welcome(self, activation_key):
         """Show welcome popup for verified promoters."""
@@ -4506,29 +4657,29 @@ class SecureTrialManager:
                 except:
                     pass
                 
-                # Get BIOS serial number (WITHOUT showing any cmd window)
+                # Get BIOS serial number (🛠 hide CMD window on Windows)
                 try:
                     import subprocess
 
-                    # Default: no special flags
-                    creationflags = 0
-                    # On Windows, this constant exists and hides the console window
-                    if hasattr(subprocess, "CREATE_NO_WINDOW"):
-                        creationflags = subprocess.CREATE_NO_WINDOW
+                    # Configure startup info so the WMIC window is hidden
+                    startup_info = subprocess.STARTUPINFO()
+                    startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
                     result = subprocess.run(
                         ["wmic", "bios", "get", "serialnumber"],
                         capture_output=True,
                         text=True,
-                        creationflags=creationflags,  # 👈 hides the cmd window
+                        startupinfo=startup_info,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
                     )
+
                     if result.returncode == 0:
-                        lines = result.stdout.strip().split('\n')
+                        lines = result.stdout.strip().splitlines()
                         if len(lines) > 1:
                             identifiers.append(lines[1].strip())
-                except Exception as e:
-                    # Don’t crash fingerprint if BIOS serial fails
-                    print(f"[TRIAL] BIOS serial fetch failed: {e}")
+                except Exception:
+                    # If WMIC fails for any reason, just skip it
+                    pass
             
             # Add disk serial
             try:
@@ -6674,14 +6825,61 @@ class PromoterStatusManager:
             sheet = client.open_by_key(self.promoter_sheet_id)
             worksheet = sheet.worksheet(self.promoter_worksheet)
 
-            # Column A = activation_key
-            keys = worksheet.col_values(1)
-            if activation_key not in keys:
-                print(f"[PROMOTER] Activation key {activation_key} not found in sheet")
+            current_fp = (self.machine_fingerprint or "").strip()
+            if not current_fp:
+                print("[PROMOTER] No local machine fingerprint; treating as invalid")
                 return False
 
-            row_index = keys.index(activation_key) + 1
-            row_data = worksheet.row_values(row_index)
+            # Read ALL rows once (including header)
+            rows = worksheet.get_all_values()
+            if not rows or len(rows) < 2:
+                print("[PROMOTER] Promoter sheet is empty or has only header")
+                return False
+
+            # ------------------------------------------------------------------
+            # 1) Check if THIS machine is already bound to some other ACTIVE key
+            # ------------------------------------------------------------------
+            existing_key = None
+            existing_status = False
+
+            # Assume row 1 is header -> start from row 2
+            for idx in range(2, len(rows) + 1):
+                row = rows[idx - 1]
+                row_key = row[0].strip() if len(row) > 0 and row[0] else ""
+                row_fp = row[1].strip() if len(row) > 1 and row[1] else ""
+                status_value = row[5] if len(row) > 5 else ""
+                status_bool = self._normalize_bool(status_value)
+
+                if row_fp == current_fp and row_key:
+                    existing_key = row_key
+                    existing_status = status_bool
+                    break
+
+            # ❌ Already bound to a *different* ACTIVE key -> don't allow new key
+            if existing_key and existing_key != activation_key and existing_status:
+                print(
+                    f"[PROMOTER] This device ({current_fp}) is already registered with key "
+                    f"{existing_key}. New key {activation_key} is not allowed."
+                )
+                return False
+
+            # ------------------------------------------------------------------
+            # 2) Locate the row for THIS activation key
+            # ------------------------------------------------------------------
+            key_row_index = None
+            row_data = None
+
+            for idx in range(2, len(rows) + 1):
+                row = rows[idx - 1]
+                row_key = row[0].strip() if len(row) > 0 and row[0] else ""
+                if row_key == activation_key:
+                    key_row_index = idx
+                    row_data = row
+                    break
+
+            if not key_row_index:
+                print(f"[PROMOTER] Activation key {activation_key} not found in sheet")
+                return False
 
             # Column B = machine_fingerprint
             sheet_machine = ""
@@ -6692,22 +6890,19 @@ class PromoterStatusManager:
             status_value = row_data[5] if len(row_data) > 5 else ""
             status_bool = self._normalize_bool(status_value)
 
-            current_fp = (self.machine_fingerprint or "").strip()
-            if not current_fp:
-                print("[PROMOTER] No local machine fingerprint; treating as invalid")
-                return False
-
-            # If sheet Status is TRUE and no machine is stored yet, bind this device
+            # If Status is TRUE and no machine is stored yet, bind THIS device to THIS row
             if status_bool and not sheet_machine:
                 try:
-                    worksheet.update_cell(row_index, 2, current_fp)  # Col B
+                    worksheet.update_cell(key_row_index, 2, current_fp)  # Col B
                     sheet_machine = current_fp
                     print(
-                        f"[PROMOTER] Bound activation key {activation_key} to fingerprint {current_fp}"
+                        f"[PROMOTER] Bound activation key {activation_key} to fingerprint "
+                        f"{current_fp} at row {key_row_index}"
                     )
                 except Exception as e:
                     print(
-                        f"[PROMOTER] Failed to write fingerprint for key {activation_key}: {e}"
+                        f"[PROMOTER] Failed to write fingerprint for key {activation_key} "
+                        f"at row {key_row_index}: {e}"
                     )
 
             # If sheet already has fingerprint and it does not match this machine -> invalid
@@ -6723,7 +6918,8 @@ class PromoterStatusManager:
                 return True
 
             print(
-                f"[PROMOTER] Status is not TRUE for key {activation_key} (value={status_value!r})"
+                f"[PROMOTER] Status is not TRUE for key {activation_key} "
+                f"(value={status_value!r})"
             )
             return False
 
@@ -6784,21 +6980,86 @@ class PromoterStatusManager:
                     os.remove(path)
             except Exception as e:
                 print(f"[PROMOTER] Failed to remove status file {path}: {e}")
+                
+    def _machine_has_other_active_key(self, activation_key: str):
+        """Check in the Google Sheet if THIS machine fingerprint already has some
+        OTHER activation key marked as active.
 
-    # ------------------------------------------------------------------
+        Returns:
+            True  -> there is another active key for this fingerprint
+            False -> no other active key found or check failed
+        """
+        try:
+            client = get_encrypted_gspread_client()
+            if not client or not self.promoter_sheet_id:
+                print("[PROMOTER] No sheets client / sheet id; cannot check existing mapping")
+                return False
+
+            sheet = client.open_by_key(self.promoter_sheet_id)
+            worksheet = sheet.worksheet(self.promoter_worksheet)
+
+            current_fp = (self.machine_fingerprint or "").strip()
+            if not current_fp:
+                return False
+
+            try:
+                # Column B = machine_fingerprint
+                fingerprints = worksheet.col_values(2)
+            except Exception as e:
+                print(f"[PROMOTER] Failed to read fingerprint column: {e}")
+                return False
+
+            for idx, fp in enumerate(fingerprints):
+                if not fp:
+                    continue
+                if fp.strip() != current_fp:
+                    continue
+
+                row_index = idx + 1
+                try:
+                    row_data = worksheet.row_values(row_index)
+                except Exception as e:
+                    print(f"[PROMOTER] Failed to read row {row_index}: {e}")
+                    continue
+
+                key_in_row = row_data[0].strip() if len(row_data) > 0 and row_data[0] else ""
+                status_value = row_data[5] if len(row_data) > 5 else ""
+                status_bool = self._normalize_bool(status_value)
+
+                # Only ACTIVE mappings for a *different* key should block
+                if status_bool and key_in_row and key_in_row != activation_key:
+                    print(
+                        f"[PROMOTER] Found other active key {key_in_row} for fingerprint {current_fp} "
+                        f"(trying {activation_key})"
+                    )
+                    return True
+
+            return False
+        except Exception as e:
+            print(f"[PROMOTER] Error while checking existing promoter mapping: {e}")
+            # On any error, do not hard-block activation
+            return False
+
+        # ------------------------------------------------------------------
     # PUBLIC API
     # ------------------------------------------------------------------
     def verify_and_save_promoter(self, activation_key: str):
         """Used when user enters an activation key for the first time."""
         online_status = self.lookup_promoter_online(activation_key)
+
         if online_status is True:
-            # Valid promoter for this machine
+            # ✅ Valid promoter for this machine
             self.save_promoter_status(activation_key, True)
             return True
+
         if online_status is False:
-            # Key exists but not valid for this machine / status FALSE
-            self.save_promoter_status(activation_key, False)
+            # ❌ Invalid / not allowed key – DON'T touch existing local status
+            print(
+                "[PROMOTER] Verification failed for this key on this device "
+                "- keeping any existing local promoter status as-is."
+            )
             return False
+
         # None -> could not reach sheet; show "try again" in UI
         return None
 
@@ -13603,8 +13864,13 @@ import os
 import csv
 import sys
 import random
-import pygame
+# 🔹 Only import pygame in the CHILD process (main UI)
+if IS_CHILD_PROCESS:
+    import pygame
+else:
+    pygame = None  # so references won't crash in parent
 import re
+import math
 import threading
 import time
 from datetime import datetime, timedelta, date, time as dtime# Make sure this is at the top of your file
@@ -15595,12 +15861,7 @@ def hide_and_protect_files():
     for file_path in files:
         print(f"Hiding: {file_path}")  # Debug
         try:
-            result = run_subprocess_hidden(
-                ['attrib', '+H', '+R', '+S', file_path],
-                shell=True,
-                capture_output=True,
-                text=True
-            )
+            result = subprocess.run(['attrib', '+H', '+R', '+S', file_path], shell=True, capture_output=True, text=True)
             print(f"Result for {file_path}: {result.returncode}")  # Debug
         except Exception as e:
             print(f"Error hiding {file_path}: {e}")
@@ -15616,13 +15877,7 @@ def unhide_and_make_writable():
     files = csv_files + json_files
     
     for file_path in files:
-        try:
-            run_subprocess_hidden(
-                ['attrib', '-H', '-R', '-S', file_path],
-                shell=True
-            )
-        except Exception as e:
-            print(f"Error unhiding {file_path}: {e}")
+        subprocess.run(['attrib', '-H', '-R', '-S', file_path], shell=True)
     
     print(f"Unhidden {len(files)} files for app use")
     
@@ -15718,15 +15973,24 @@ def load_last_active_plan():
     return "Default"
 
 class StudyTimerApp(tk.Tk):
-    def __init__(self):
+    def __init__(self, ready_flag_path=None):
         super().__init__()
-        self.withdraw()
         self._promoter_device = False
-        self.bind_all('<Control-Shift-D>', self._on_dev_shortcut)
-        print("[DEV] Ctrl+Shift+D global shortcut bound")
-        # 🔹 NEW: diagnostics shortcut
-        self.bind_all('<Control-Shift-S>', self._on_send_diagnostics)
-        print("[DIAG] Ctrl+Shift+S global shortcut bound for diagnostics")
+        self._ready_flag_path = ready_flag_path
+        # Developer shortcut (Ctrl+Shift+D / Ctrl+Shift+d)
+        for k in ("d", "D"):
+            self.bind_all(f"<Control-Shift-{k}>", self._on_dev_shortcut)
+        print("[DEV] Ctrl+Shift+D / d global shortcut bound")
+
+        # Diagnostics shortcut (Ctrl+Shift+S / Ctrl+Shift+s)
+        for k in ("s", "S"):
+            self.bind_all(f"<Control-Shift-{k}>", self._on_send_diagnostics)
+        print("[DIAG] Ctrl+Shift+S / s global shortcut bound for diagnostics")
+
+        # Promoter activation shortcut (Ctrl+Shift+P / Ctrl+Shift+p)
+        for k in ("p", "P"):
+            self.bind_all(f"<Control-Shift-{k}>", self._on_promoter_activation_shortcut)
+        print("[PROMOTER] Ctrl+Shift+P / p global shortcut bound for promoter activation")
         # Load profile and set user info on app
         profile = _load_profile()
         self.user_uid = profile.get("uid", "")
@@ -15799,7 +16063,7 @@ class StudyTimerApp(tk.Tk):
             print(f"[MAIN] ❌ Failed to initialize ReferralValidator: {e}")
             import traceback
             traceback.print_exc()
-        self.config = load_config()  
+        self.app_config = load_config()
         self.title("Study Timer App with Data Tracker")
         self.geometry("600x150")
         self._skipped_payment = False
@@ -15812,8 +16076,8 @@ class StudyTimerApp(tk.Tk):
             print("[DEBUG] Anonymous login failed ❌")
         # Initialize network tracker
         self.tracker = NetworkTracker()        
-        self.telegram_bot_token = self.config.get("telegram_bot_token", "")
-        self.telegram_chat_id   = self.config.get("telegram_chat_id", "")
+        self.telegram_bot_token = self.app_config.get("telegram_bot_token", "")
+        self.telegram_chat_id   = self.app_config.get("telegram_chat_id", "")
         # --- ensure StringVars for totals exist ---
         try:
             import tkinter as tk
@@ -16023,9 +16287,9 @@ class StudyTimerApp(tk.Tk):
         self.after(3_000, self._gsync_write_tick)
         self.after(5_000, self._gsync_read_tick)
         self.state("zoomed")
-        self.config = load_config()
-        self.telegram_bot_token = self.config.get("telegram_bot_token", "")
-        self.telegram_chat_id   = self.config.get("telegram_chat_id", "")
+        self.app_config = load_config()
+        self.telegram_bot_token = self.app_config.get("telegram_bot_token", "")
+        self.telegram_chat_id   = self.app_config.get("telegram_chat_id", "")
         # Load profile.json (separate from config.json)
         _prof = _load_profile()
         self.user_name = _prof.get("user_name", "")
@@ -16075,7 +16339,12 @@ class StudyTimerApp(tk.Tk):
         self.title("Study Timer Pro")
         self.geometry("1080x1920")
         self.resizable(True, True)
-        pygame.mixer.init()
+        # 🔊 Init pygame mixer only in CHILD (and only if imported)
+        if pygame is not None:
+            try:
+                pygame.mixer.init()
+            except Exception as e:
+                print(f"[INIT] pygame mixer init failed: {e}")
         # initial badge paint
         try:
             self.update_profile_badge()
@@ -16541,27 +16810,25 @@ class StudyTimerApp(tk.Tk):
             self.license_manager.main_app_instance = self
         self._check_day_change_on_startup()
 
-        # Don’t hide features for promoter devices, even if trial was tampered
-        if not getattr(self, "_promoter_device", False):
-            self.after(100, self._check_initial_tampered_state)
-        else:
-            print("[PROMOTER] Skipping tampered-state startup check (promoter device)")
-        
-        if hasattr(self, 'license_manager') and self.license_manager:
-            self.license_manager.main_app_instance = self
-        self._check_day_change_on_startup()
-
-        # Don’t hide features for promoter devices, even if trial was tampered
         if not getattr(self, "_promoter_device", False):
             self.after(100, self._check_initial_tampered_state)
         else:
             print("[PROMOTER] Skipping tampered-state startup check (promoter device)")
 
-        # 🔹 Now the UI is ready – show the main window once
-        self.deiconify()
-        self.lift()
-        self.focus_force()
-        
+        # 🔔 Tell the splash that UI is ready (AFTER first layout)
+        if getattr(self, "_ready_flag_path", None):
+            def _mark_ready():
+                try:
+                    with open(self._ready_flag_path, "w", encoding="utf-8") as f:
+                        f.write("ready")
+                    print(f"[SPLASH] Ready flag written to {self._ready_flag_path}")
+                except Exception as e:
+                    print(f"[SPLASH] Failed to write ready flag: {e}")
+
+            # As soon as Tk gets its first idle time after creating the window,
+            # mark the splash as ready. This avoids any fixed delay.
+            self.after_idle(_mark_ready)
+
         # --- End
         
     def _ensure_exam_countdown_label(self):
@@ -17655,7 +17922,28 @@ class StudyTimerApp(tk.Tk):
         except Exception:
             pass
 
-        print(f"[DIAG] Diagnostics send result: {success}")   
+        print(f"[DIAG] Diagnostics send result: {success}") 
+
+    def _on_promoter_activation_shortcut(self, event=None):
+        """Ctrl+Shift+P -> open manual promoter activation popup."""
+        print("[PROMOTER] Ctrl+Shift+P pressed - opening manual promoter activation dialog")
+        try:
+            validator = getattr(self, "referral_validator", None)
+            if validator is None:
+                print("[PROMOTER] ReferralValidator not available; trying to create one...")
+                try:
+                    validator = ReferralValidator(self)
+                    self.referral_validator = validator
+                    print("[PROMOTER] ReferralValidator created for manual promoter activation")
+                except Exception as e:
+                    print(f"[PROMOTER] Failed to create ReferralValidator: {e}")
+                    return
+
+            # Open the dedicated promoter activation popup
+            validator.show_promoter_activation_prompt()
+
+        except Exception as e:
+            print(f"[PROMOTER] Error while handling promoter activation shortcut: {e}")        
         
     def show_plan_menu(self):
         """Show plan menu with individual submenus per plan."""
@@ -21748,110 +22036,7 @@ class StudyTimerApp(tk.Tk):
             print(f"Error getting reply details: {e}")
             return None
 
-    # Remove the old complex show_reply_dialog method and mark_selected_as_read method
-    # They are replaced by the simpler versions above
-
-    def check_for_new_notifications(self):
-        """Check for new replies from admin and show flash message if any - only once per session"""
-        try:
-            user_name, user_id = self.get_current_user_info()
-            unread_count = self.get_unread_notifications_count(user_id)
-            
-            if unread_count > 0:
-                # Update bell icon with red badge
-                self.update_notification_badge(unread_count)
-                
-                # Show flash message for unread notifications (only once)
-                self.show_notification_flash(unread_count)
-            else:
-                # Remove red badge if no unread notifications
-                self.update_notification_badge(0)
-                
-        except Exception as e:
-            print(f"Error checking notifications: {e}")
-
-            help_text = tk.Text(
-                scrollable_frame,
-                height=4,
-                font=("Arial", 9),
-                wrap="word",
-                relief="solid",
-                bd=1,
-                bg="#F8F9FA"
-            )
-            help_text.pack(fill="x", pady=(10, 5))
-            help_text.insert("1.0", reply_data['help_report'])
-            help_text.config(state="disabled")
-        
-        # Admin Reply
-        if reply_data['admin_reply'].strip():
-            tk.Label(
-                scrollable_frame,
-                text="💬 Admin Reply:",
-                font=("Arial", 10, "bold"),
-                fg="#27AE60",
-                anchor="w"
-            ).pack(fill="x", pady=(20, 5))
-            
-            reply_frame = tk.Frame(scrollable_frame, bg="#E8F5E8", relief="solid", bd=1)
-            reply_frame.pack(fill="x", pady=(0, 10))
-            
-            reply_text_widget = tk.Text(
-                reply_frame,
-                height=6,
-                font=("Arial", 10),
-                wrap="word",
-                relief="flat",
-                bg="#E8F5E8",
-                fg="#2C3E50"
-            )
-            reply_text_widget.pack(fill="x", padx=10, pady=10)
-            reply_text_widget.insert("1.0", reply_data['admin_reply'])
-            reply_text_widget.config(state="disabled")
-        else:
-            tk.Label(
-                scrollable_frame,
-                text="⏳ No reply yet. We'll get back to you soon!",
-                font=("Arial", 10, "italic"),
-                fg="#95A5A6",
-                anchor="w"
-            ).pack(fill="x", pady=(20, 10))
-        
-        # Pack canvas and scrollbar
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        # Buttons frame
-        button_frame = tk.Frame(main_frame)
-        button_frame.pack(fill="x", pady=(20, 0))
-        
-        # Mark as Read button (only if there's a reply)
-        if reply_data['admin_reply'].strip() and reply_data['reply_status'].lower() != "read":
-            mark_read_btn = tk.Button(
-                button_frame,
-                text="Mark as Read",
-                font=("Arial", 10, "bold"),
-                bg="#27AE60",
-                fg="white",
-                padx=20,
-                pady=8,
-                command=lambda: self.mark_reply_as_read(reply_data['row_number'], reply_dialog)
-            )
-            mark_read_btn.pack(side="left", padx=(0, 10))
-        
-        # Close button
-        close_btn = tk.Button(
-            button_frame,
-            text="Close",
-            font=("Arial", 10),
-            bg="#95A5A6",
-            fg="white",
-            padx=20,
-            pady=8,
-            command=reply_dialog.destroy
-        )
-        close_btn.pack(side="right")
-
+    
     def mark_selected_as_read(self):
         """Mark selected notification as read"""
         selection = self.notifications_tree.selection()
@@ -22788,13 +22973,7 @@ class StudyTimerApp(tk.Tk):
         files = csv_files + json_files
         
         for file_path in files:
-            try:
-                run_subprocess_hidden(
-                    ['attrib', '-H', '-R', '-S', file_path],
-                    shell=True
-                )
-            except Exception as e:
-                print(f"Error unhiding {file_path}: {e}")
+            subprocess.run(['attrib', '-H', '-R', '-S', file_path], shell=True)
         
         print(f"Manually unhidden {len(files)} files")
         # Optional: Show message box
@@ -25282,10 +25461,10 @@ class StudyTimerApp(tk.Tk):
         print("="*50)
         
         # Check 1: Configuration
-        sender_email = self.config.get("sender_email")
-        sender_password = self.config.get("sender_password") 
-        recipients = self.config.get("recipient_emails", [])
-        enabled = self.config.get("email_enabled", False)
+        sender_email = self.app_config.get("sender_email")
+        sender_password = self.app_config.get("sender_password") 
+        recipients = self.app_config.get("recipient_emails", [])
+        enabled = self.app_config.get("email_enabled", False)
         
         print(f"📧 Sender Email: {sender_email}")
         print(f"🔐 Password Length: {len(sender_password) if sender_password else 0} chars")
@@ -25362,9 +25541,9 @@ class StudyTimerApp(tk.Tk):
         if not self.debug_email_connection():
             return False
         
-        sender_email = self.config.get("sender_email")
-        sender_password = self.config.get("sender_password")
-        recipients = self.config.get("recipient_emails", [])
+        sender_email = self.app_config.get("sender_email")
+        sender_password = self.app_config.get("sender_password")
+        recipients = self.app_config.get("recipient_emails", [])
         
         try:
             print("\n📝 Creating test email message...")
@@ -25446,7 +25625,7 @@ class StudyTimerApp(tk.Tk):
                  font=("Arial", 9), fg="gray").pack()
 
         # Current recipients
-        current_emails = self.config.get("recipient_emails", [])
+        current_emails = self.app_config.get("recipient_emails", [])
         if isinstance(current_emails, str):
             current_emails = [current_emails] if current_emails else []
 
@@ -25521,7 +25700,7 @@ class StudyTimerApp(tk.Tk):
                   font=("Arial", 8), bg="#f44336", fg="white").pack(pady=(0, 10))
 
         # Enable checkbox
-        email_enabled = tk.BooleanVar(value=self.config.get("email_enabled", False))
+        email_enabled = tk.BooleanVar(value=self.app_config.get("email_enabled", False))
         
         tk.Checkbutton(popup, text="Enable daily email reports", 
                        variable=email_enabled, font=("Arial", 10)).pack(pady=5)
@@ -25535,9 +25714,9 @@ class StudyTimerApp(tk.Tk):
                 messagebox.showwarning("No Recipients", "Add at least one email address")
                 return
 
-            self.config["recipient_emails"] = current_emails.copy()
-            self.config["email_enabled"] = email_enabled.get()
-            save_config(self.config)
+            self.app_config["recipient_emails"] = current_emails.copy()
+            self.app_config["email_enabled"] = email_enabled.get()
+            save_config(self.app_config)
 
             status = "enabled" if email_enabled.get() else "saved (disabled)"
             messagebox.showinfo("Success", f"Settings {status}")
@@ -25576,10 +25755,10 @@ class StudyTimerApp(tk.Tk):
         
         
         
-        if not self.config.get("email_enabled", False):
+        if not self.app_config.get("email_enabled", False):
             return False
         
-        recipient_emails = self.config.get("recipient_emails", [])
+        recipient_emails = self.app_config.get("recipient_emails", [])
         if not recipient_emails:
             return False
         
@@ -25593,8 +25772,8 @@ class StudyTimerApp(tk.Tk):
             from email import encoders
             import smtplib
             
-            sender_email = self.config.get("sender_email")
-            sender_password = self.config.get("sender_password")
+            sender_email = self.app_config.get("sender_email")
+            sender_password = self.app_config.get("sender_password")
             
             if not sender_email or not sender_password:
                 print("[EMAIL] Sender not configured")
@@ -25766,7 +25945,7 @@ class StudyTimerApp(tk.Tk):
                     print(f"[REPORT] Telegram failed: {e}")
 
             # ✅ Send via Email - unchanged
-            if self.config.get("email_enabled", False):
+            if self.app_config.get("email_enabled", False):
                 if self.is_premium_user():
                     try:
                         self.send_simple_email_report(report_date, sent_via)
@@ -27201,8 +27380,8 @@ class StudyTimerApp(tk.Tk):
         def save_and_close():
             """Save Telegram chat ID only — bot token removed (handled by backend)."""
             self.telegram_chat_id = chat_entry.get().strip()
-            self.config["telegram_chat_id"] = self.telegram_chat_id
-            save_config(self.config)
+            self.app_config["telegram_chat_id"] = self.telegram_chat_id
+            save_config(self.app_config)
             popup.destroy()
             messagebox.showinfo("Saved", "Telegram chat ID saved successfully.")
 
@@ -34741,8 +34920,8 @@ Based on the study plan, create a SPECIFIC, ACTIONABLE preview:
                 font=("Arial", 7, "bold"), fg="#4CAF50", relief="flat", bd=0).pack(anchor="w")
         
         # Email status
-        recipient_count = len(self.config.get("recipient_emails", []))
-        email_enabled = self.config.get("email_enabled", False)
+        recipient_count = len(self.app_config.get("recipient_emails", []))
+        email_enabled = self.app_config.get("email_enabled", False)
         
         if email_enabled and recipient_count > 0:
             status_text = f"✅ Email reports enabled ({recipient_count} recipients)"
@@ -37029,65 +37208,109 @@ def test_weekly_reset():
         print(f"Test failed: {e}")
         return False 
         
-if __name__ == "__main__":
+def _get_splash_ready_flag_path():
+    """
+    Path to a tiny 'ready' flag file. The child process will create this
+    when the Tkinter UI is ready. The splash watches for this file.
+    """
+    try:
+        return os.path.join(tempfile.gettempdir(), "studytimer_ready.flag")
+    except Exception:
+        base = getattr(sys, "executable", sys.argv[0])
+        return os.path.join(os.path.dirname(base), "studytimer_ready.flag")
+
+
+def _run_main_app(ready_flag_path=None):
+    """
+    Main StudyTimer application entry point.
+    This runs in the CHILD process when we start with --child.
+    """
 
     # 🔒 Single-instance check using the lock file
     if is_already_running():
-        mb.showinfo("Study Timer", "⚠ Study Timer is already running.")
-        sys.exit(0)
+        try:
+            mb.showinfo("Study Timer", "⚠ Study Timer is already running.")
+        except Exception:
+            pass
+        return
 
     create_lock()
 
     try:
-        # Run weekly reset test once
-        app_paths.migrate_existing_data()
-        result = test_weekly_reset()
-        print("Weekly reset test passed!" if result else "Weekly reset test failed.")
+        # Run weekly reset / migration once
+        try:
+            app_paths.migrate_existing_data()
+            result = test_weekly_reset()
+            print("Weekly reset test passed!" if result else "Weekly reset test failed.")
+        except Exception as e:
+            print(f"[INIT] Weekly reset / migrate failed: {e}")
 
         try:
-            # Check Razorpay
+            # Check Razorpay (optional)
             try:
-                import razorpay
+                import razorpay  # type: ignore
                 print("[PAYMENT] Razorpay library available")
             except ImportError:
                 print("[PAYMENT] WARNING: Razorpay library not installed")
 
-            # LAUNCH DIRECTLY WITHOUT SEPARATE AUTH WINDOW
-            app = StudyTimerApp()
+            # === CREATE MAIN TK APP (passes ready_flag_path) ===
+            app = StudyTimerApp(ready_flag_path=ready_flag_path)
 
-            # Optional: Try to load auth data if exists
+            # Extra safety: also mark the ready flag from inside the Tk loop.
+            # Even if the internal hook inside StudyTimerApp fails, this will
+            # still close the splash almost immediately after the window appears.
+            if ready_flag_path:
+                def _mark_ready_from_main():
+                    try:
+                        with open(ready_flag_path, "w", encoding="utf-8") as f:
+                            f.write("ready")
+                        print(f"[SPLASH] Ready flag (fallback) written from _run_main_app: {ready_flag_path}")
+                    except Exception as e:
+                        print(f"[SPLASH] Failed to write ready flag from _run_main_app: {e}")
+                # Schedule with zero delay so it runs as soon as mainloop starts
+                app.after(0, _mark_ready_from_main)
+
+            # Load auth user data if exists
             try:
                 user_config_file = os.path.join(
-                    os.getenv("APPDATA"), "StudyTimer", "user_config.json"
+                    os.getenv("APPDATA") or "",
+                    "StudyTimer",
+                    "user_config.json",
                 )
                 if os.path.exists(user_config_file):
-                    with open(user_config_file, "r") as f:
+                    with open(user_config_file, "r", encoding="utf-8") as f:
                         app.auth_user_data = json.load(f)
                         print(
                             f"[AUTH] ✓ Loaded: {app.auth_user_data.get('email', 'Unknown')}"
                         )
+                else:
+                    app.auth_user_data = None
             except Exception as e:
                 print(f"[AUTH] No existing auth: {e}")
                 app.auth_user_data = None
 
             # Add auto-updater with profile path
-            app = add_auto_update_to_app(
-                app,
-                CURRENT_VERSION,
-                profile_path=app_paths.profile_file,
-            )
+            try:
+                app = add_auto_update_to_app(
+                    app,
+                    CURRENT_VERSION,
+                    profile_path=app_paths.profile_file,
+                )
+            except Exception as e:
+                print(f"[UPDATER] Failed to attach auto-updater: {e}")
 
             # Optional: Add payment menu
             try:
-                app.add_payment_menu()
-            except Exception:
-                pass
+                if hasattr(app, "add_payment_menu"):
+                    app.add_payment_menu()
+            except Exception as e:
+                print(f"[PAYMENT] add_payment_menu failed: {e}")
 
             # Start remote control if available
             try:
                 launch_remote_control(app)
-            except NameError:
-                pass
+            except Exception as e:
+                print(f"[REMOTE] Remote control launch failed: {e}")
 
             # Run Tkinter loop
             app.mainloop()
@@ -37096,9 +37319,238 @@ if __name__ == "__main__":
             import tkinter.messagebox as mbox
             import traceback
 
-            mbox.showerror("Error", f"{e}\n\n{traceback.format_exc()}")
+            try:
+                mbox.showerror("Error", f"{e}\n\n{traceback.format_exc()}")
+            except Exception:
+                print("[FATAL] Unhandled exception in GUI:")
+                print(e)
+                traceback.print_exc()
 
     finally:
         # ALWAYS remove lock when app exits (normally or by error)
         remove_lock()
-        
+        # Clean up ready-flag on exit
+        if ready_flag_path and os.path.exists(ready_flag_path):
+            try:
+                os.remove(ready_flag_path)
+            except Exception:
+                pass
+
+
+def _run_with_embedded_splash():
+    """
+    PARENT process:
+      - calculates a per-version flag path
+      - if '--child' is present, run main app directly with that flag
+      - otherwise start child process and show a small embedded splash
+        until the child signals that the UI is ready.
+
+    CHILD process:
+      - _run_main_app(ready_flag_path=...) will create the flag when
+        the main Tkinter window is fully initialized.
+    """
+    import tkinter as tk
+    from tkinter import ttk  # kept in case we need later
+    import glob
+
+    try:
+        # PIL is already used elsewhere in your app / exe
+        from PIL import Image, ImageTk  # type: ignore
+    except Exception:
+        Image = ImageTk = None  # type: ignore
+
+    # ------------------------------------------------------------------
+    # 1) Compute per-version ready flag
+    # ------------------------------------------------------------------
+    ready_flag = _get_splash_ready_flag_path()
+
+    # ------------------------------------------------------------------
+    # 2) CHILD MODE: run the main app and return
+    # ------------------------------------------------------------------
+    if "--child" in sys.argv:
+        _run_main_app(ready_flag_path=ready_flag)
+        return
+
+    # ------------------------------------------------------------------
+    # 3) PARENT MODE: clean old flag + start child process
+    # ------------------------------------------------------------------
+    try:
+        if os.path.exists(ready_flag):
+            os.remove(ready_flag)
+    except Exception as e:
+        print(f"[SPLASH] Could not remove old ready flag: {e}")
+
+    # ----- Build child command -----
+    if getattr(sys, "frozen", False):
+        # Running from EXE – the exe is already StudyTimer
+        child_cmd = [sys.executable, "--child"]
+        popen_kwargs = {}
+        if os.name == "nt":
+            # In EXE mode there is no console anyway, but keep this just in case
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            popen_kwargs["creationflags"] = creationflags
+    else:
+        # Running from plain Python -> keep console visible for debugging
+        script_path = os.path.abspath(sys.argv[0])
+        child_cmd = [sys.executable, script_path, "--child"]
+        popen_kwargs = {}      # 🔴 no CREATE_NO_WINDOW here
+
+    try:
+        subprocess.Popen(child_cmd, **popen_kwargs)
+        print(f"[SPLASH] Started child process: {child_cmd}")
+    except Exception as e:
+        print(f"[SPLASH] Failed to start child process, running direct: {e}")
+        _run_main_app(ready_flag_path=None)
+        return
+
+    # ------------------------------------------------------------------
+    # 4) Build splash window (image-based)
+    # ------------------------------------------------------------------
+    root = tk.Tk()
+    root.overrideredirect(True)
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    bg = "#000000"
+
+    def _find_splash_image() -> str | None:
+        """Look for a splash image near the app.
+
+        Search order:
+          1) <app dir>/logo/*.png / *.jpg / *.jpeg / *.bmp
+          2) <app dir>/assets/*.png / *.jpg / *.jpeg / *.bmp
+          3) <app dir>/*.png / *.jpg / *.jpeg / *.bmp
+        """
+
+        # IMPORTANT:
+        # For EXE we want the folder where the EXE lives
+        # (where you put the 'logo' folder), NOT _MEIPASS.
+        if getattr(sys, "frozen", False):
+            base_dir = os.path.dirname(getattr(sys, "executable", sys.argv[0]))
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        candidates: list[str] = []
+        search_dirs = [
+            os.path.join(base_dir, "logo"),
+            os.path.join(base_dir, "assets"),
+            base_dir,
+        ]
+        patterns = ("*.png", "*.jpg", "*.jpeg", "*.bmp")
+
+        for d in search_dirs:
+            if not os.path.isdir(d):
+                continue
+            for pattern in patterns:
+                candidates.extend(glob.glob(os.path.join(d, pattern)))
+            if candidates:
+                break
+
+        return sorted(candidates)[0] if candidates else None
+
+    splash_image = None
+    img_w, img_h = 560, 315  # default if no image
+
+    if Image is not None:
+        try:
+            img_path = _find_splash_image()
+            if img_path and os.path.exists(img_path):
+                print(f"[SPLASH] Using image: {img_path}")
+                img = Image.open(img_path)
+                # Simple resize to fit a nice rectangle
+                img = img.resize((img_w, img_h), Image.LANCZOS)
+                splash_image = ImageTk.PhotoImage(img)
+            else:
+                print("[SPLASH] No splash image found – using text splash instead.")
+        except Exception as e:
+            print(f"[SPLASH] Error loading splash image: {e}")
+            splash_image = None
+
+    # Center window
+    screen_w = root.winfo_screenwidth()
+    screen_h = root.winfo_screenheight()
+    x = (screen_w - img_w) // 2
+    y = (screen_h - img_h) // 2
+    root.geometry(f"{img_w}x{img_h}+{x}+{y}")
+    root.configure(bg=bg)
+
+    # Main frame
+    frame = tk.Frame(root, bg=bg)
+    frame.pack(fill="both", expand=True)
+
+    # If we have an image, fill almost everything with it
+    if splash_image is not None:
+        img_label = tk.Label(frame, image=splash_image, bg=bg, bd=0)
+        img_label.image = splash_image  # keep reference
+        img_label.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Small text overlay at bottom-left
+        msg_label = tk.Label(
+            frame,
+            text="Loading your study workspace...",
+            font=("Segoe UI", 10),
+            bg=bg,
+            fg="#ffffff",
+            anchor="w",
+        )
+        msg_label.place(relx=0.03, rely=0.95, anchor="sw")
+    else:
+        # Fallback: simple text-only splash
+        title_lbl = tk.Label(
+            frame,
+            text="StudyTimerPro",
+            font=("Segoe UI", 16, "bold"),
+            bg=bg,
+            fg="#ffffff",
+        )
+        title_lbl.pack(pady=(40, 10))
+
+        msg_label = tk.Label(
+            frame,
+            text="Loading your study workspace...",
+            font=("Segoe UI", 10),
+            bg=bg,
+            fg="#ffffff",
+        )
+        msg_label.pack(pady=(10, 0))
+
+    # ------------------------------------------------------------------
+    # 5) Poll ready flag and close splash when UI is ready
+    # ------------------------------------------------------------------
+    closed = {"done": False}
+
+    def close_splash():
+        if closed["done"]:
+            return
+        closed["done"] = True
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+    start_time = time.time()
+    MAX_WAIT = 60  # seconds – safety vs infinite 'freeze'
+
+    def check_ready():
+        # Child wrote the ready flag → close splash now
+        if os.path.exists(ready_flag):
+            close_splash()
+            return
+
+        # Safety timeout
+        elapsed = time.time() - start_time
+        if elapsed > MAX_WAIT:
+            msg_label.config(text="Startup is taking too long. Please try again.")
+            root.after(1500, close_splash)
+            return
+
+        root.after(250, check_ready)
+
+    check_ready()
+    root.mainloop()
+
+if __name__ == "__main__":
+    _run_with_embedded_splash()
+
