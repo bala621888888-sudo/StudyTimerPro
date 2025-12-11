@@ -16198,6 +16198,42 @@ def load_last_active_plan():
 class StudyTimerApp(tk.Tk):
     def __init__(self, ready_flag_path=None):
         super().__init__()
+
+        # 🔹 Show a bare window + loading text IMMEDIATELY
+        self.title("StudyTimerPro")
+        self.geometry("1080x720")  # temporary; you override later anyway
+        try:
+            self.configure(bg="#1a1a2e")
+        except Exception:
+            pass
+
+        # Full-window loading overlay
+        self._loading_frame = tk.Frame(self, bg="#1a1a2e")
+        self._loading_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        self._loading_label = tk.Label(
+            self._loading_frame,
+            text="Loading StudyTimerPro...",
+            font=("Segoe UI", 18, "bold"),
+            bg="#1a1a2e",
+            fg="white",
+        )
+        self._loading_label.pack(expand=True)
+
+        self._progress_label = tk.Label(
+            self._loading_frame,
+            text="Initializing...",
+            font=("Segoe UI", 10),
+            bg="#1a1a2e",
+            fg="#888888",
+        )
+        self._progress_label.pack()
+
+        # Let Tk draw the window BEFORE heavy init continues
+        self.update_idletasks()
+        self.update()
+
+        # 🔹 your existing fields start here
         self._promoter_device = False
         self._ready_flag_path = ready_flag_path
         # Developer shortcut (Ctrl+Shift+D / Ctrl+Shift+d)
@@ -16990,8 +17026,24 @@ class StudyTimerApp(tk.Tk):
             # As soon as Tk gets its first idle time after creating the window,
             # mark the splash as ready. This avoids any fixed delay.
             self.after_idle(_mark_ready)
+            
+        # ✅ Remove loading overlay now that full UI is ready
+        if hasattr(self, "_loading_frame") and self._loading_frame.winfo_exists():
+            try:
+                self._loading_frame.destroy()
+            except Exception:
+                pass
 
         # --- End
+        
+    def _update_loading_status(self, message: str) -> None:
+        """Update loading overlay message if it is still visible."""
+        try:
+            if hasattr(self, "_progress_label") and self._progress_label.winfo_exists():
+                self._progress_label.config(text=message)
+                self.update_idletasks()
+        except Exception:
+            pass
         
     def _lazy_init_sync_services(self):
         """Initialize Google Sheets + Firebase sync in a background thread."""
