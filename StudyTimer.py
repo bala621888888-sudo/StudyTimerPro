@@ -1,127 +1,360 @@
 # ==== EMBEDDED LEADERBOARD WIDGETS (Top-10 + Top-3) ====
 from __future__ import annotations
+
 import sys
-IS_CHILD_PROCESS = ("--child" in sys.argv)
-from datetime import date, datetime, timezone
-import os, math, random, requests
-import gspread
-from PIL import Image, ImageTk, ImageDraw, ImageFont, ImageFont, ImageDraw, ImageFilter, ImageChops, Image as PILImage
-try:
-    from oauth2client.service_account import ServiceAccountCredentials
-except Exception:
-    ServiceAccountCredentials = None
-from tkinter import ttk
-import tkinter as tk
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
-import smtplib, ssl
-import time, platform, hashlib, uuid
-from email.utils import parsedate_to_datetime
-from config_paths import app_paths
-import hashlib
-from pathlib import Path
-from secrets_util import get_secret
-import platform
-import psutil
-import tkinter.messagebox as mb
-import tempfile
-from api_client import api
-from token_tracker import create_token_usage_widget, set_refresh_callback
-import subprocess
-from cryptography.fernet import Fernet
-import base64
-from tkinter import Button
-from secrets_util import get_encrypted_gspread_client
-import json
-from ai_chat_dialog import AIChatDialog 
-from api_client import api
-import hashlib, base64, json, os, time, threading, requests
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-import platform, uuid, psutil
-# Add this line at the top with your other imports
-from auto_updater import add_auto_update_to_app
-import tkinter as tk
-import tkinter.ttk as ttk
-import subprocess
-import glob
-import tkinter as tk
-from encrypted_gspread_connection import service_account, service_account_from_encrypted
-import tempfile
-from cryptography.fernet import Fernet
-from dotenv import load_dotenv
-from Authenticator import UnifiedAuthSystem
-import threading
-from PIL import Image, ImageTk
-import firebase_admin
-from firebase_admin import credentials, db
-import os, json, google.auth
-import json
-from secrets_util import get_secret, ONLINE, get_encrypted_gspread_client
-
-# Only hit Secret Manager / gspread from the CHILD (main UI) process.
-if IS_CHILD_PROCESS:
-    try:
-        gspread_client = get_encrypted_gspread_client()
-    except Exception as e:
-        print(f"[INIT] Encrypted gspread client init failed: {e}")
-        gspread_client = None
-
-    # This prints your "[dotenv] Skipping..." line only in the child process
-    load_dotenv()
-    print(f"ENCRYPTION_KEY exists: {bool(get_secret('ENCRYPTION_KEY'))}")
-    print(f"ENCRYPTED_CREDENTIALS exists: {bool(get_secret('ENCRYPTED_CREDENTIALS'))}")
-    print(f"LB_SHEET_ID: {get_secret('LB_SHEET_ID')}")
-else:
-    # Parent splash process: no network / secrets here
-    gspread_client = None
-
-# ===== Subscription pricing (in rupees) =====
-SUBSCRIPTION_PRICE_NORMAL_RUPEES   = 349  # Standard price
-SUBSCRIPTION_PRICE_REFERRAL_RUPEES = 199  # Discounted price when referral code applied
-# Razorpay PUBLIC key (same as in Cloud Function)
-RAZORPAY_KEY_ID = "rzp_live_RCiAvkzn29q7AQ" 
 import os
+
+# ============================================================
+# 🔒 STEP 1: gRPC env vars FIRST (before ANY other imports)
+# ============================================================
 os.environ["GRPC_VERBOSITY"] = "ERROR"
 os.environ["GRPC_TRACE"] = ""
-import sys
-from ai_chat_dialog import open_ai_chat_dialog
-from firebase_groups_tab import add_firebase_groups_tab
-from google.cloud import secretmanager
-import os
-os.environ["GRPC_VERBOSITY"] = "ERROR"
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "0"
 os.environ["GOOGLE_CLOUD_DISABLE_ALTS"] = "true"
 os.environ["GRPC_DNS_RESOLVER"] = "native"
-from token_tracker import (
-    chat_complete_with_tracking,
-    create_token_usage_widget,
-    refresh_token_display
-)
-from token_manager import get_token_manager
-from token_tracker import InsufficientTokensError
-from purchase_dialog import show_purchase_dialog
-from token_tracker import (
-    create_token_usage_widget, 
-    set_refresh_callback,
-    chat_complete_with_tracking
-)
+os.environ["GRPC_POLL_STRATEGY"] = "poll"
 
-# 👇 This line replaces your old hardcoded TELEGRAM_BOT_TOKEN
-if IS_CHILD_PROCESS:
-    TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN")
-else:
+# ============================================================
+# 🔒 STEP 2: Hide console IMMEDIATELY + Keep hiding it
+# ============================================================
+if os.name == "nt":
+    try:
+        import ctypes
+        import threading
+        
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        
+        def _hide_console_now():
+            """Hide console window immediately."""
+            try:
+                hwnd = kernel32.GetConsoleWindow()
+                if hwnd:
+                    user32.ShowWindow(hwnd, 0)  # SW_HIDE
+                if getattr(sys, "frozen", False):
+                    kernel32.FreeConsole()
+            except:
+                pass
+        
+        def _console_killer():
+            """Background thread that keeps hiding console for 10 seconds."""
+            import time
+            end_time = time.time() + 10  # Run for 10 seconds
+            while time.time() < end_time:
+                try:
+                    hwnd = kernel32.GetConsoleWindow()
+                    if hwnd:
+                        user32.ShowWindow(hwnd, 0)
+                except:
+                    pass
+                time.sleep(0.05)  # Check every 50ms
+        
+        # Hide immediately
+        _hide_console_now()
+        
+        # Start background killer thread
+        killer_thread = threading.Thread(target=_console_killer, daemon=True)
+        killer_thread.start()
+        
+    except Exception:
+        pass
+
+IS_CHILD_PROCESS = ("--child" in sys.argv)
+
+# 🔒 When running as .py without splash, treat as child process (need full imports)
+if not getattr(sys, "frozen", False):
+    IS_CHILD_PROCESS = True  # Force full imports for .py files
+
+# ============================================================
+# 🔒 DEBUG: Catch and show errors in messagebox (not console)
+# ============================================================
+import tkinter as tk
+from tkinter import messagebox
+
+def show_error_and_exit(exc_type, exc_value, exc_tb):
+    """Show errors in a messagebox since console is hidden."""
+    import traceback
+    error_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    
+    # Create hidden root for messagebox
+    root = tk.Tk()
+    root.withdraw()
+    
+    messagebox.showerror("StudyTimer Error", f"An error occurred:\n\n{error_msg[:1500]}")
+    root.destroy()
+    sys.exit(1)
+
+# Set global exception handler
+sys.excepthook = show_error_and_exit
+
+# ============================================================
+# 🔒 STEP 3: PARENT = minimal imports, CHILD = full imports
+# ============================================================
+if not IS_CHILD_PROCESS:
+    # ========== PARENT PROCESS (SPLASH ONLY) ==========
+    # Only import what splash screen needs - NOTHING ELSE
+    import tkinter as tk
+    from tkinter import ttk
+    from PIL import Image, ImageTk
+    import subprocess
+    import time
+    import glob
+    import tempfile
+    from pathlib import Path
+    import ssl
+    import json
+    import hashlib
+    import uuid
+    import platform
+    import threading
+    import base64
+    import math
+    import random
+    import re
+    from datetime import date, datetime, timezone, timedelta
+    from datetime import time as dtime
+    from collections import defaultdict
+    import traceback
+    
+    # ADD THESE for license manager:
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    
+    # ========== PARENT: Import real config_paths (it's safe) ==========
+    from config_paths import app_paths
+    
+    # Dummy placeholders so code doesn't crash
+    requests = None
+    gspread = None
+    firebase_admin = None
+    credentials = None
+    db = None
+    secretmanager = None
+    api = None
+    gspread_client = None
     TELEGRAM_BOT_TOKEN = None
+    service_account = None
+    ONLINE = False
+    LB_CREDENTIALS = None
+    pygame = None
+    psutil = None
+    winsound = None
+    canvas = None
+    reportlab = None
+    Fernet = None
+    razorpay = None
+    razorpay_client = None
+    Flask = None
+    remote_app = None
+    
+    LOCKFILE = os.path.join(tempfile.gettempdir(), "studytimer.lock")
+    
+    def get_secret(key):
+        return None
+    def get_encrypted_gspread_client():
+        return None
+    def launch_remote_control(app_instance):
+        pass  # Do nothing in parent
 
+else:
+    # ========== CHILD PROCESS (FULL APP) ==========
+    # Now safe to import EVERYTHING
+    
+    # Standard library
+    from datetime import date, datetime, timezone, timedelta
+    from datetime import time as dtime
+    import math, random
+    import re
+    import ssl
+    import time
+    import platform
+    import hashlib
+    import uuid
+    import threading
+    import base64
+    import json
+    import glob
+    import tempfile
+    import traceback
+    import io
+    import csv
+    import queue
+    from pathlib import Path
+    from collections import defaultdict
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email import encoders
+    from email.utils import parsedate_to_datetime
+    
+    # Tkinter
+    import tkinter as tk
+    from tkinter import ttk, messagebox, filedialog, simpledialog, Button
+    import tkinter.messagebox as mb
+    import tkinter.font as tkfont
+    
+    # PIL
+    from PIL import Image, ImageTk, ImageDraw, ImageFont, ImageFilter, ImageChops, Image as PILImage
+    
+    # System
+    import psutil
+    
+    # Crypto
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    
+    # Windows-specific
+    if platform.system() == "Windows":
+        import winsound
+        import winreg
+    else:
+        winsound = None
+        winreg = None
+    
+    # Optional imports with fallbacks
+    try:
+        import pygame
+    except ImportError:
+        pygame = None
+    
+    try:
+        from oauth2client.service_account import ServiceAccountCredentials
+    except Exception:
+        ServiceAccountCredentials = None
+    
+    try:
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib import colors
+        from reportlab.platypus import Table, TableStyle
+    except ImportError:
+        canvas = None
+        A4 = None
+        colors = None
+        Table = None
+        TableStyle = None
+    
+    # Environment/Config
+    from dotenv import load_dotenv
+    from config_paths import app_paths
+    
+    # Network imports
+    import requests
+    import gspread
+    import firebase_admin
+    from firebase_admin import credentials, db
+    import google.auth
+    from google.cloud import secretmanager
+    from secrets_util import get_secret, ONLINE, get_encrypted_gspread_client
+    from encrypted_gspread_connection import service_account, service_account_from_encrypted
+    from api_client import api
+    from ai_chat_dialog import AIChatDialog, open_ai_chat_dialog
+    from firebase_groups_tab import add_firebase_groups_tab
+    from token_tracker import (
+        chat_complete_with_tracking,
+        create_token_usage_widget,
+        refresh_token_display,
+        set_refresh_callback
+    )
+    from token_manager import get_token_manager
+    from token_tracker import InsufficientTokensError
+    from purchase_dialog import show_purchase_dialog
+    from auto_updater import add_auto_update_to_app
+    from Authenticator import UnifiedAuthSystem
+    
+    # Flask for remote control
+    try:
+        from flask import Flask, redirect, url_for, request, Response
+        remote_app = Flask(__name__)
+    except ImportError:
+        Flask = None
+        remote_app = None
+    
+    # Razorpay
+    try:
+        import razorpay
+    except ImportError:
+        razorpay = None
+    
+    # Initialize network / secret data lazily
+    gspread_client = None
+    TELEGRAM_BOT_TOKEN = None
+    service_account = None
 
+    _network_initialized = False
+    _secrets_initialized = False
 
-LB_CREDENTIALS = None
+    def _lazy_init_secrets():
+        """
+        Fetch all secrets (Telegram token, encrypted service account, etc.)
+        ONLY once, and only when we really need them.
+        """
+        global TELEGRAM_BOT_TOKEN, service_account, _secrets_initialized
+        if _secrets_initialized:
+            return
+        _secrets_initialized = True
 
-LOCKFILE = os.path.join(tempfile.gettempdir(), "studytimer.lock")
+        try:
+            # Telegram token (if you still need it here)
+            TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN")
+        except Exception as e:
+            print(f"[INIT] TELEGRAM_BOT_TOKEN fetch failed: {e}")
+
+        try:
+            # Decrypt service account for Firebase / Sheets, etc.
+            encryption_key = get_secret("ENCRYPTION_KEY")
+            if encryption_key:
+                cipher = Fernet(encryption_key.encode())
+                encrypted_sa = get_secret("ENCRYPTED_SERVICE_ACCOUNT")
+                if encrypted_sa:
+                    service_account_json = cipher.decrypt(encrypted_sa.encode()).decode()
+                    service_account = json.loads(service_account_json)
+        except Exception as e:
+            print(f"[INIT] Failed to decrypt service account: {e}")
+
+    def _lazy_init_network():
+        """Initialize network services AFTER window is visible."""
+        global gspread_client, _network_initialized
+        if _network_initialized:
+            return
+        _network_initialized = True
+
+        # Step 1: fetch secrets (can be slow – do it here, not at import)
+        _lazy_init_secrets()
+
+        # Step 2: create the encrypted gspread client
+        try:
+            gspread_client = get_encrypted_gspread_client()
+        except Exception as e:
+            print(f"[INIT] Encrypted gspread client init failed: {e}")
+            gspread_client = None
+
+    # Load local .env file (fast – no network)
+    load_dotenv()
+
+    # Subscription pricing – this is fine to keep here
+    SUBSCRIPTION_PRICE_NORMAL_RUPEES = 349
+    SUBSCRIPTION_PRICE_REFERRAL_RUPEES = 199
+    RAZORPAY_KEY_ID = "rzp_live_RCiAvkzn29q7AQ"
+
+    LB_CREDENTIALS = None
+    LOCKFILE = os.path.join(tempfile.gettempdir(), "studytimer.lock")
+
+    # Subscription pricing
+    SUBSCRIPTION_PRICE_NORMAL_RUPEES = 349
+    SUBSCRIPTION_PRICE_REFERRAL_RUPEES = 199
+    RAZORPAY_KEY_ID = "rzp_live_RCiAvkzn29q7AQ"
+    
+    LB_CREDENTIALS = None
+    LOCKFILE = os.path.join(tempfile.gettempdir(), "studytimer.lock")
+
+# ============================================================
+# REST OF YOUR CODE STARTS HERE
+# (Keep everything from line ~177 onwards in your original file)
+# ============================================================
 
 def is_already_running():
     """
@@ -192,32 +425,9 @@ def run_app():
 
     APP_INSTANCE.protocol("WM_DELETE_WINDOW", _on_close)
     APP_INSTANCE.mainloop()
-    
-# Default so the name exists in both parent + child
-service_account = None
 
 if IS_CHILD_PROCESS:
-    # Decrypt service account (skip if offline)
-    encryption_key = get_secret('ENCRYPTION_KEY')
-    if encryption_key:
-        cipher = Fernet(encryption_key.encode())
-        encrypted_sa = get_secret('ENCRYPTED_SERVICE_ACCOUNT')
-        if encrypted_sa:
-            try:
-                service_account_json = cipher.decrypt(encrypted_sa.encode()).decode()
-                service_account = json.loads(service_account_json)
-            except Exception as e:
-                print(f"Failed to decrypt service account: {e}")
-                service_account = None
-                print("Running in offline mode - Firebase features disabled")
-        else:
-            service_account = None
-            print("Running in offline mode - No encrypted service account found")
-    else:
-        service_account = None
-        print("Running in offline mode - Firebase features disabled")
-
-from api_client import api
+    from api_client import api
 
 
 def ensure_anonymous_token():
@@ -700,28 +910,28 @@ def get_sheet_id():
 
 # Updated ReferralSystem class with UPI, Telegram notifications, and subscription requirements
 
-import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
-import json
-import os
-import uuid
-import random
-import string
-import hashlib
-import platform
-import subprocess
-import requests
-import threading
-from datetime import datetime
-import gspread
-from google.oauth2.service_account import Credentials
-from cryptography.fernet import Fernet
-from dotenv import load_dotenv
-import re
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-
+if IS_CHILD_PROCESS:
+    import tkinter as tk
+    from tkinter import messagebox, simpledialog, ttk
+    import json
+    import os
+    import uuid
+    import random
+    import string
+    import hashlib
+    import platform
+    import subprocess
+    import requests
+    import threading
+    from datetime import datetime
+    import gspread
+    from google.oauth2.service_account import Credentials
+    from cryptography.fernet import Fernet
+    from dotenv import load_dotenv
+    import re
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
 
 class ReferralSystem:
     def __init__(self, main_app):
@@ -2095,23 +2305,24 @@ def _create_default_profile():
         print(f"Error creating profile: {e}")
         return {'uid': str(uuid.uuid4()), 'username': 'User'}
         
-import os
-import sys
-import json
-import hashlib
-import platform
-import uuid
-import threading
-import time
-import requests
-import smtplib
-from datetime import datetime
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from cryptography.fernet import Fernet
-import gspread
-import tkinter as tk
-from tkinter import messagebox
+if IS_CHILD_PROCESS:       
+    import os
+    import sys
+    import json
+    import hashlib
+    import platform
+    import uuid
+    import threading
+    import time
+    import requests
+    import smtplib
+    from datetime import datetime
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    from cryptography.fernet import Fernet
+    import gspread
+    import tkinter as tk
+    from tkinter import messagebox
 
 
 class ReferralValidator:
@@ -4312,22 +4523,23 @@ class PaymentWizardWithLicenseReady(tk.Toplevel):
                 self.withdraw()  # Hide window instead of destroying
         else:
             self.destroy()
-
-import os
-import json
-import time
-import hashlib
-import platform
-import uuid
-import psutil
-from datetime import datetime, timedelta
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-import base64
-import winreg  # For Windows registry
-import tempfile
-import shutil
+            
+if IS_CHILD_PROCESS:
+    import os
+    import json
+    import time
+    import hashlib
+    import platform
+    import uuid
+    import psutil
+    from datetime import datetime, timedelta
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    import base64
+    import winreg  # For Windows registry
+    import tempfile
+    import shutil
 
 class SecureTrialManager:
     """
@@ -4633,20 +4845,21 @@ class SecureTrialManager:
         print("[DEV] Nuclear cleanup complete ✅ (Trial + Tamper data wiped, source safe)")
         
     def _get_advanced_machine_fingerprint(self):
-        """Generate a more robust machine fingerprint"""
+        """Generate a more robust machine fingerprint (no WMIC / no CMD popup)"""
         try:
+            # Base identifiers (common across platforms)
             identifiers = [
                 platform.system(),
                 platform.machine(),
                 platform.processor(),
                 str(uuid.getnode()),  # MAC address
-                platform.node(),  # Computer name
+                platform.node(),      # Computer name
             ]
-            
-            # Add Windows-specific identifiers
+
+            # Add Windows-specific identifiers (no external commands)
             if platform.system() == "Windows":
                 try:
-                    # Get Windows Product ID
+                    # Windows Product ID from registry
                     key = winreg.OpenKey(
                         winreg.HKEY_LOCAL_MACHINE,
                         r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
@@ -4654,48 +4867,27 @@ class SecureTrialManager:
                     product_id = winreg.QueryValueEx(key, "ProductId")[0]
                     identifiers.append(product_id)
                     winreg.CloseKey(key)
-                except:
-                    pass
-                
-                # Get BIOS serial number (🛠 hide CMD window on Windows)
-                try:
-                    import subprocess
-
-                    # Configure startup info so the WMIC window is hidden
-                    startup_info = subprocess.STARTUPINFO()
-                    startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-                    result = subprocess.run(
-                        ["wmic", "bios", "get", "serialnumber"],
-                        capture_output=True,
-                        text=True,
-                        startupinfo=startup_info,
-                        creationflags=subprocess.CREATE_NO_WINDOW,
-                    )
-
-                    if result.returncode == 0:
-                        lines = result.stdout.strip().splitlines()
-                        if len(lines) > 1:
-                            identifiers.append(lines[1].strip())
                 except Exception:
-                    # If WMIC fails for any reason, just skip it
+                    # If registry lookup fails, just skip it
                     pass
-            
-            # Add disk serial
+
+            # Add disk/device info (no external commands)
             try:
                 for disk in psutil.disk_partitions():
-                    if disk.device and 'cdrom' not in disk.opts:
+                    # skip CD/DVD drives
+                    if disk.device and "cdrom" not in disk.opts.lower():
                         identifiers.append(disk.device)
                         break
-            except:
+            except Exception:
                 pass
-            
-            combined = '|'.join(str(i) for i in identifiers if i)
-            return hashlib.sha256(combined.encode()).hexdigest()
-            
+
+            combined = "|".join(str(i) for i in identifiers if i)
+            return hashlib.sha256(combined.encode("utf-8")).hexdigest()
+
         except Exception as e:
             print(f"[TRIAL] Fingerprint generation error: {e}")
-            return hashlib.sha256(str(uuid.getnode()).encode()).hexdigest()
+            # Fallback: simple MAC-based fingerprint
+            return hashlib.sha256(str(uuid.getnode()).encode("utf-8")).hexdigest()
     
     def _get_all_storage_locations(self):
         """5 separate locations that survive folder deletion"""
@@ -5475,49 +5667,49 @@ class SecureTrialManager:
         )
         return base64.urlsafe_b64encode(kdf.derive(password))
     
-# Razorpay Payment Integration for Study Timer App
-import razorpay
-import webbrowser
-import threading
-from flask import Flask, request, render_template_string, jsonify
-import json
-import time
-from datetime import datetime
-
-
-
-PAYMENT_AMOUNT = 19900  # Amount in paise 19900
-import requests
-import urllib3
-from requests.adapters import HTTPAdapter
-from urllib3.util.ssl_ import create_urllib3_context
-
-# Disable SSL warnings
-urllib3.disable_warnings()
-
-# Create custom session that ignores SSL issues
-class CustomHTTPAdapter(HTTPAdapter):
-    def init_poolmanager(self, *args, **kwargs):
-        ctx = create_urllib3_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        kwargs['ssl_context'] = ctx
-        return super().init_poolmanager(*args, **kwargs)
-
-session = requests.Session()
-session.mount('https://', CustomHTTPAdapter())
-
-# Monkey patch requests to use our session
-requests.get = session.get
-requests.post = session.post
-
-# Now initialize Razorpay - it will use the patched requests
-razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
-
-# Initialize Razorpay client
-razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
-from secrets_util import get_encrypted_gspread_client
-
+# ============================================================
+# Razorpay Payment Integration - ONLY for child process
+# ============================================================
+if IS_CHILD_PROCESS:
+    import razorpay
+    import webbrowser
+    from flask import Flask, request, render_template_string, jsonify
+    PAYMENT_AMOUNT = 19900  # Amount in paise 19900
+    import urllib3
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.ssl_ import create_urllib3_context
+    
+    # Disable SSL warnings
+    urllib3.disable_warnings()
+    
+    # Create custom session that ignores SSL issues
+    class CustomHTTPAdapter(HTTPAdapter):
+        def init_poolmanager(self, *args, **kwargs):
+            ctx = create_urllib3_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            kwargs['ssl_context'] = ctx
+            return super().init_poolmanager(*args, **kwargs)
+    
+    session = requests.Session()
+    session.mount('https://', CustomHTTPAdapter())
+    
+    # Monkey patch requests to use our session
+    requests.get = session.get
+    requests.post = session.post
+    
+    # Now initialize Razorpay - it will use the patched requests
+    razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+    
+    from secrets_util import get_encrypted_gspread_client
+else:
+    # Parent process - dummy placeholders
+    razorpay = None
+    razorpay_client = None
+    Flask = None
+    PAYMENT_AMOUNT = 19900
+    CustomHTTPAdapter = None
+    session = None
 
 class UnifiedLicenseManager:
     """Clean unified manager for both payments and licenses in single Google Sheet row"""
@@ -9009,35 +9201,36 @@ class NetworkTracker:
             return f"{kb / 1024:.2f} MB"
 
 # ---------------- Monkey-Patch Requests ----------------
-_original_get = requests.get
-_original_post = requests.post
+if IS_CHILD_PROCESS:
+    _original_get = requests.get
+    _original_post = requests.post
 
-def tracked_get(*args, **kwargs):
-    response = _original_get(*args, **kwargs)
-    request_size = sum(len(str(k)) + len(str(v)) for k,v in response.request.headers.items())
-    if response.request.body:
-        request_size += len(response.request.body)
-    response_size = len(response.content)
-    NetworkTracker.add_request(request_size, response_size)
-    return response
+    def tracked_get(*args, **kwargs):
+        response = _original_get(*args, **kwargs)
+        request_size = sum(len(str(k)) + len(str(v)) for k,v in response.request.headers.items())
+        if response.request.body:
+            request_size += len(response.request.body)
+        response_size = len(response.content)
+        NetworkTracker.add_request(request_size, response_size)
+        return response
 
-def tracked_post(*args, **kwargs):
-    response = _original_post(*args, **kwargs)
-    request_size = sum(len(str(k)) + len(str(v)) for k,v in response.request.headers.items())
-    if response.request.body:
-        request_size += len(response.request.body)
-    response_size = len(response.content)
-    NetworkTracker.add_request(request_size, response_size)
-    return response
+    def tracked_post(*args, **kwargs):
+        response = _original_post(*args, **kwargs)
+        request_size = sum(len(str(k)) + len(str(v)) for k,v in response.request.headers.items())
+        if response.request.body:
+            request_size += len(response.request.body)
+        response_size = len(response.content)
+        NetworkTracker.add_request(request_size, response_size)
+        return response
 
-# Apply monkey-patch
-requests.get = tracked_get
-requests.post = tracked_post
+    # Apply monkey-patch
+    requests.get = tracked_get
+    requests.post = tracked_post
 
-import gspread
-from datetime import datetime, timedelta
-import json
-import time
+    import gspread
+    from datetime import datetime, timedelta
+    import json
+    import time
 
 class WeeklyResetManager:
     """Manages weekly resets on Google Sheets - both leaderboard and top rankers"""
@@ -9511,10 +9704,11 @@ class SheetSync:
         finally:
             self._updating = False
             
-import firebase_admin
-from firebase_admin import credentials, db
-from datetime import datetime
-import os
+if IS_CHILD_PROCESS:
+    import firebase_admin
+    from firebase_admin import credentials, db
+    from datetime import datetime
+    import os
 
 class FirebaseSync:
     def __init__(self, profile_loader, profile_saver, database_url=None, service_account_path=None):
@@ -13853,54 +14047,38 @@ class Top3Panel(ttk.Frame):
                 slot["bar_canvas"].pack_forget()
 
 
-        
-
-import tkinter as tk
-import tkinter.font as tkfont
-from tkinter import ttk, messagebox, filedialog, simpledialog
-import datetime
-import json
-import os
-import csv
-import sys
-import random
-# 🔹 Only import pygame in the CHILD process (main UI)
 if IS_CHILD_PROCESS:
-    import pygame
-else:
-    pygame = None  # so references won't crash in parent
-import re
-import math
-import threading
-import time
-from datetime import datetime, timedelta, date, time as dtime# Make sure this is at the top of your file
-from collections import defaultdict
-import queue
-import requests
-import datetime as dt
-from tkinter import filedialog, messagebox
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-import io
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.platypus import Table, TableStyle
-
+    import tkinter as tk
+    import tkinter.font as tkfont
+    from tkinter import ttk, messagebox, filedialog, simpledialog
+    import datetime
+    import json
+    import os
+    import csv
+    import sys
+    import random
+    import re
+    import math
+    import threading
+    import time
+    from datetime import datetime, timedelta, date, time as dtime
+    from collections import defaultdict
+    import queue
+    import requests
+    import datetime as dt
+    from tkinter import filedialog, messagebox
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4
+    import io
+    from reportlab.lib import colors
+    from reportlab.platypus import Table, TableStyle
     
-
-
-# For alarm
-import platform
-if platform.system() == "Windows":
-    import winsound
-else:
-    winsound = None
-
-        
-
-
-
+    import platform
+    if platform.system() == "Windows":
+        import winsound
+    else:
+        winsound = None
+   
 def _load_medal_icons(folder=app_paths.medals_dir, size=16):
     """
     Load gold/silver/bronze PNGs from the app directory.
@@ -14779,8 +14957,18 @@ def save_schedule(sched):
     for s in sched:
         if isinstance(s, (list, tuple)) and len(s) == 4:
             cleaned.append(list(s))  # Ensure JSON serializable
-    with open(CUSTOM_SCHEDULE_FILE, "w") as f:
-        json.dump(cleaned, f)
+
+    try:
+        # Make sure directory exists
+        os.makedirs(os.path.dirname(CUSTOM_SCHEDULE_FILE), exist_ok=True)
+
+        with open(CUSTOM_SCHEDULE_FILE, "w") as f:
+            json.dump(cleaned, f)
+    except PermissionError as e:
+        # Don't crash the whole app – just log it
+        print(f"[SCHEDULE] Permission denied saving {CUSTOM_SCHEDULE_FILE}: {e}")
+    except Exception as e:
+        print(f"[SCHEDULE] Error saving schedule to {CUSTOM_SCHEDULE_FILE}: {e}")
 
 def load_schedule():
     if os.path.exists(CUSTOM_SCHEDULE_FILE):
@@ -15845,6 +16033,40 @@ def test_license_system():
         traceback.print_exc()
         return False
 
+# ------------------------------------------------------------
+# Helper: run 'attrib' without flashing a console window
+# ------------------------------------------------------------
+def _run_attrib_silent(flags, file_path):
+    """
+    Run Windows 'attrib' on file_path without popping a CMD window.
+
+    flags: list like ["+H", "+R", "+S"] or ["-H", "-R", "-S"]
+    """
+    if os.name != "nt":
+        # attrib is Windows-only; on other OS just skip
+        return
+
+    try:
+        startup_info = subprocess.STARTUPINFO()
+        startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    except Exception:
+        startup_info = None
+
+    cmd = ["attrib", *flags, file_path]
+
+    try:
+        subprocess.run(
+            cmd,
+            shell=False,                   # no cmd.exe
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            startupinfo=startup_info,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+    except Exception as e:
+        print(f"[ATTRIB] Error running {' '.join(cmd)}: {e}")
+
 def hide_and_protect_files():
     # Always use the AppData\Roaming\StudyTimer directory
     files_directory = os.path.join(os.getenv('APPDATA'), 'StudyTimer')
@@ -15861,15 +16083,15 @@ def hide_and_protect_files():
     for file_path in files:
         print(f"Hiding: {file_path}")  # Debug
         try:
-            result = subprocess.run(['attrib', '+H', '+R', '+S', file_path], shell=True, capture_output=True, text=True)
-            print(f"Result for {file_path}: {result.returncode}")  # Debug
+            _run_attrib_silent(["+H", "+R", "+S"], file_path)
         except Exception as e:
             print(f"Error hiding {file_path}: {e}")
     
     print(f"Successfully processed {len(files)} files")
 
+
 def unhide_and_make_writable():
-    """Unhide files when app starts"""
+    """Unhide files when app starts (no CMD flash)"""
     files_directory = os.path.join(os.getenv('APPDATA'), 'StudyTimer')
     
     csv_files = glob.glob(os.path.join(files_directory, "*.csv"))
@@ -15877,9 +16099,10 @@ def unhide_and_make_writable():
     files = csv_files + json_files
     
     for file_path in files:
-        subprocess.run(['attrib', '-H', '-R', '-S', file_path], shell=True)
+        _run_attrib_silent(["-H", "-R", "-S"], file_path)
     
     print(f"Unhidden {len(files)} files for app use")
+
     
 def save_last_active_plan(plan_name):
     """
@@ -15995,92 +16218,36 @@ class StudyTimerApp(tk.Tk):
         profile = _load_profile()
         self.user_uid = profile.get("uid", "")
         self.user_name = profile.get("user_name", "")
-        unhide_and_make_writable()      
-        # ========== RESTORE MISSING FILES FIRST (SYNCHRONOUS) ==========
-        print("[INIT] Checking for cloud restore before loading data...")
-        try:
-            self.check_cloud_restore_on_startup_sync()
-        except Exception as e:
-            print(f"[INIT] Restore failed: {e}")
-        print("[INIT] Restore check complete - proceeding with initialization\n")
-        # ================================================================
-        
-        # Now continue with rest of initialization
-        try:
-            print("[INIT] Initializing unified license manager...")
-            self.license_manager = UnifiedLicenseManager(LB_CREDENTIALS, LB_SHEET_ID)                
-            print("[INIT] Unified license manager initialized successfully")
-        except Exception as e:
-            print(f"[INIT] ERROR: Failed to initialize license manager: {e}")
-            messagebox.showerror("Initialization Error", f"Failed to initialize license manager: {e}")
-            self.quit()
-            return
-        try:
-            print("[INIT] Initializing trial manager...")
-            self.trial_manager = SecureTrialManager(LB_CREDENTIALS, LB_SHEET_ID, self.license_manager)
-            print("[INIT] Trial manager initialized successfully")
-        except Exception as e:
-            print(f"[INIT] Trial manager initialization error: {e}")
-            self.trial_manager = None
 
+        # ✅ IMPORTANT: unhide & make JSON/CSV writable before anything saves
         try:
-            print("[INIT] Initializing promoter manager...")
-            self.promoter_manager = PromoterStatusManager(self.license_manager)
-            print("[INIT] Promoter manager initialized")
+            unhide_and_make_writable()
         except Exception as e:
-            print(f"[INIT] Promoter manager initialization error: {e}")
-            self.promoter_manager = None
+            print(f"[ATTRIB] Unhide failed: {e}")
 
-        # 🔹 Check if this machine is already an active promoter
-        try:
-            if self.promoter_manager:
-                if self.promoter_manager.is_promoter_active():
-                    print("[PROMOTER] Active promoter device detected – skipping license/trial checks")
-                    self._promoter_device = True
-                else:
-                    print("[PROMOTER] Not a promoter device")
-        except Exception as e:
-            print(f"[PROMOTER] Error while checking promoter status: {e}")
+        # -------------------------------------------------
+        # Heavy startup (cloud restore, license, login) will
+        # now run in a BACKGROUND THREAD so UI can show first
+        # -------------------------------------------------
+        import threading
 
-        # Continue with migration and other initialization
-        try:
-            migrated = app_paths.migrate_existing_data()
-            if migrated:
-                print(f"Successfully migrated {len(migrated)} files to AppData folder")
-        except Exception as e:
-            print(f"Migration failed: {e}")
-        try:
-            migrated = app_paths.migrate_existing_data()
-            if migrated:
-                print(f"Successfully migrated {len(migrated)} files to AppData folder")
-        except Exception as e:
-            print(f"Migration failed: {e}")
-        print("[MAIN] Initializing ReferralValidator...")
-        try:
-            self.referral_validator = ReferralValidator(self)
-            print("[MAIN] ✓ ReferralValidator initialized successfully")
-        except Exception as e:
-            print(f"[MAIN] ❌ Failed to initialize ReferralValidator: {e}")
-            import traceback
-            traceback.print_exc()
-        self.app_config = load_config()
-        self.title("Study Timer App with Data Tracker")
-        self.geometry("600x150")
+
+        # Make sure attributes exist before background thread uses them
+        self.license_manager = None
+        self.trial_manager = None
+        self.promoter_manager = None
+        self.referral_validator = None
+        self.app_config = {}
         self._skipped_payment = False
-        print("[DEBUG] Logging in anonymously...")
-        login_data = api.anonymous_login()
-        if login_data.get("success") and login_data.get("idToken"):
-            api.set_auth_token(login_data["idToken"])
-            print("[DEBUG] Token set successfully ✅")
-        else:
-            print("[DEBUG] Anonymous login failed ❌")
-        # Initialize network tracker
-        self.tracker = NetworkTracker()        
-        self.telegram_bot_token = self.app_config.get("telegram_bot_token", "")
-        self.telegram_chat_id   = self.app_config.get("telegram_chat_id", "")
-        # --- ensure StringVars for totals exist ---
+        self.tracker = None
+        self.telegram_bot_token = ""
+        self.telegram_chat_id = ""
+
+        threading.Thread(target=self._background_startup, daemon=True).start()
+
+        # --- ensure StringVars for totals exist (cheap UI objects) ---
         try:
-            import tkinter as tk
+            # tk is already imported at top of file
             self.today_total_row_var = getattr(self, 'today_total_row_var', tk.StringVar(value=''))
             self.all_day_total_row_var = getattr(self, 'all_day_total_row_var', tk.StringVar(value=''))
         except Exception:
@@ -16144,17 +16311,11 @@ class StudyTimerApp(tk.Tk):
                 self.progress_exam_date = date.today()
                 self.after(150, _run_wiz)
                 self.after(200, getattr(self, '_refresh_profile_badge', lambda: None))
-        self._sheet_sync = SheetSync(app_load_profile_for_sync, app_save_profile_for_sync)
-        self._firebase_sync = FirebaseSync(
-            profile_loader=_load_profile,
-            profile_saver=_save_profile,
-            database_url=FIREBASE_DATABASE_URL,
-            service_account_path=FIREBASE_SERVICE_ACCOUNT
-        )
-        try:
-            self._sheet_sync.schedule_heartbeat(self, self._sheet_get_stats)
-        except Exception as e:
-            print('[GSYNC] schedule failed:', e)
+        # Defer heavy Google Sheets / Firebase initialization so UI is fast
+        self._sheet_sync = None
+        self._firebase_sync = None
+        # Start sync services a bit later, in background
+        self.after(2000, self._lazy_init_sync_services)
             
         def integrity_check():
             try:
@@ -16805,6 +16966,7 @@ class StudyTimerApp(tk.Tk):
         self.referral_system = None
         self.setup_email_and_referral_ui()
         self.referral_validator = None
+        self.after(1000, _lazy_init_network)
         self.premium_features_unlocked = False        
         if hasattr(self, 'license_manager') and self.license_manager:
             self.license_manager.main_app_instance = self
@@ -16830,6 +16992,177 @@ class StudyTimerApp(tk.Tk):
             self.after_idle(_mark_ready)
 
         # --- End
+        
+    def _lazy_init_sync_services(self):
+        """Initialize Google Sheets + Firebase sync in a background thread."""
+        import threading
+
+        def _worker():
+            sheet = None
+            fb = None
+
+            # --- Google Sheets sync (SheetSync) ---
+            try:
+                print("[SYNC] Initializing Google Sheets sync...")
+                sheet = SheetSync(app_load_profile_for_sync, app_save_profile_for_sync)
+                print("[SYNC] Google Sheets sync ready.")
+            except Exception as e:
+                print("[SYNC] SheetSync init failed:", e)
+
+            # --- Firebase sync ---
+            try:
+                print("[SYNC] Initializing Firebase sync...")
+                fb = FirebaseSync(
+                    profile_loader=_load_profile,
+                    profile_saver=_save_profile,
+                    database_url=FIREBASE_DATABASE_URL,
+                    service_account_path=FIREBASE_SERVICE_ACCOUNT,
+                )
+                print("[SYNC] Firebase sync ready.")
+            except Exception as e:
+                print("[SYNC] FirebaseSync init failed:", e)
+
+            # Attach to self + schedule heartbeat on the Tk main thread
+            def _attach():
+                if sheet is not None:
+                    self._sheet_sync = sheet
+                    try:
+                        self._sheet_sync.schedule_heartbeat(self, self._sheet_get_stats)
+                    except Exception as e:
+                        print("[GSYNC] schedule failed:", e)
+
+                if fb is not None:
+                    self._firebase_sync = fb
+
+            self.after(0, _attach)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        
+    def _background_startup(self):
+        """
+        Heavy startup tasks that used to block __init__.
+        Runs in a background thread so the UI is usable immediately.
+        Only UI stuff is done via self.after(...) on the main thread.
+        """
+        try:
+            # 1) Unhide / make files writable
+            try:
+                unhide_and_make_writable()
+            except Exception as e:
+                print(f"[INIT] unhide_and_make_writable failed: {e}")
+
+            # 2) Cloud restore (Sync from backup if needed)
+            print("[INIT] Checking for cloud restore before loading data...")
+            try:
+                self.check_cloud_restore_on_startup_sync()
+            except Exception as e:
+                print(f"[INIT] Restore failed: {e}")
+            print("[INIT] Restore check complete - proceeding with initialization")
+
+            # 3) License manager
+            try:
+                print("[INIT] Initializing unified license manager...")
+                lm = UnifiedLicenseManager(LB_CREDENTIALS, LB_SHEET_ID)
+                print("[INIT] Unified license manager initialized successfully")
+                self.license_manager = lm
+            except Exception as e:
+                print(f"[INIT] ERROR: Failed to initialize license manager: {e}")
+
+                def _show_license_error():
+                    messagebox.showerror(
+                        "Initialization Error",
+                        f"Failed to initialize license manager: {e}"
+                    )
+                    try:
+                        self.quit()
+                    except Exception:
+                        pass
+
+                # Show the error on main thread and exit
+                self.after(0, _show_license_error)
+                return
+
+            # 4) Trial manager
+            try:
+                print("[INIT] Initializing trial manager...")
+                tm = SecureTrialManager(LB_CREDENTIALS, LB_SHEET_ID, self.license_manager)
+                print("[INIT] Trial manager initialized successfully")
+                self.trial_manager = tm
+            except Exception as e:
+                print(f"[INIT] Trial manager initialization error: {e}")
+                self.trial_manager = None
+
+            # 5) Promoter manager
+            try:
+                print("[INIT] Initializing promoter manager...")
+                pm = PromoterStatusManager(self.license_manager)
+                print("[INIT] Promoter manager initialized")
+                self.promoter_manager = pm
+            except Exception as e:
+                print(f"[INIT] Promoter manager initialization error: {e}")
+                self.promoter_manager = None
+
+            # 6) Check if this machine is an active promoter
+            try:
+                if self.promoter_manager and self.promoter_manager.is_promoter_active():
+                    print("[PROMOTER] Active promoter device detected – skipping license/trial checks")
+                    self._promoter_device = True
+                else:
+                    print("[PROMOTER] Not a promoter device")
+            except Exception as e:
+                print(f"[PROMOTER] Error while checking promoter status: {e}")
+
+            # 7) Migrate any old data
+            try:
+                migrated = app_paths.migrate_existing_data()
+                if migrated:
+                    print(f"Successfully migrated {len(migrated)} files to AppData folder")
+            except Exception as e:
+                print(f"Migration failed: {e}")
+
+            try:
+                migrated = app_paths.migrate_existing_data()
+                if migrated:
+                    print(f"Successfully migrated {len(migrated)} files to AppData folder")
+            except Exception as e:
+                print(f"Migration failed: {e}")
+
+            # 8) Referral validator
+            print("[MAIN] Initializing ReferralValidator...")
+            try:
+                self.referral_validator = ReferralValidator(self)
+                print("[MAIN] ✓ ReferralValidator initialized successfully")
+            except Exception as e:
+                print(f"[MAIN] ❌ Failed to initialize ReferralValidator: {e}")
+                import traceback
+                traceback.print_exc()
+
+            # 9) Load config + telegram IDs
+            cfg = load_config()
+            self.app_config = cfg
+            self.telegram_bot_token = cfg.get("telegram_bot_token", "")
+            self.telegram_chat_id = cfg.get("telegram_chat_id", "")
+            self._skipped_payment = False
+
+            # 10) Anonymous login to API
+            print("[DEBUG] Logging in anonymously...")
+            try:
+                login_data = api.anonymous_login()
+                if login_data.get("success") and login_data.get("idToken"):
+                    api.set_auth_token(login_data["idToken"])
+                    print("[DEBUG] Token set successfully ✅")
+                else:
+                    print("[DEBUG] Anonymous login failed ❌")
+            except Exception as e:
+                print(f"[DEBUG] Anonymous login exception: {e}")
+
+            # 11) Network tracker
+            self.tracker = NetworkTracker()
+            print("[INIT] Background startup finished.")
+        except Exception as e:
+            print(f"[INIT] Unexpected error in _background_startup: {e}")
+            import traceback
+            traceback.print_exc()
         
     def _ensure_exam_countdown_label(self):
         """Create the small slim countdown label if missing."""
@@ -22965,7 +23298,7 @@ class StudyTimerApp(tk.Tk):
         }
         
     def unhide_files_manually(self):
-        """Manual unhide function"""
+        """Manual unhide function (no CMD flash)"""
         files_directory = os.path.join(os.getenv('APPDATA'), 'StudyTimer')
         
         csv_files = glob.glob(os.path.join(files_directory, "*.csv"))
@@ -22973,12 +23306,12 @@ class StudyTimerApp(tk.Tk):
         files = csv_files + json_files
         
         for file_path in files:
-            subprocess.run(['attrib', '-H', '-R', '-S', file_path], shell=True)
+            _run_attrib_silent(["-H", "-R", "-S"], file_path)
         
         print(f"Manually unhidden {len(files)} files")
-        # Optional: Show message box
         import tkinter.messagebox as msgbox
-        msgbox.showinfo("Files Unhidden", f"Made {len(files)} files visible and editable") 
+        msgbox.showinfo("Files Unhidden", f"Made {len(files)} files visible and editable")
+
         
     def switch_plan(self, event=None):
         """Switch to selected plan and refresh UI."""
@@ -25359,15 +25692,15 @@ class StudyTimerApp(tk.Tk):
             prof = _load_profile()
             name = prof.get("user_name", "")
 
-            online_now = bool(
-                getattr(self, 'stopwatch_running', False) or
+            online_now = (
                 getattr(self, 'extra_study_running', False) or
                 (getattr(self, 'registered', False)
                  and getattr(self, 'elapsed_timer_enabled', False)
                  and not getattr(self, 'paused', True)
                  and getattr(self, 'study_active_from', None) is not None)
             )
-            self._sheet_sync.update(name=name, online=online_now)
+            if getattr(self, "_sheet_sync", None):
+                self._sheet_sync.update(name=name, online=online_now)
         except Exception as e:
             print("[GSYNC] profile push failed:", e)
         
@@ -36900,180 +37233,76 @@ Based on the study plan, create a SPECIFIC, ACTIONABLE preview:
         self.pause_btn.config(state=tk.DISABLED, text="Pause")
         self.study_active_from = None
     
-from flask import Flask, redirect, url_for, request, Response
-import threading
+if IS_CHILD_PROCESS:
+    from flask import Flask, redirect, url_for, request, Response
+    import threading
+    
+    remote_app = Flask(__name__)
+    study_timer_app_instance = None
+    
+    from datetime import datetime
 
-remote_app = Flask(__name__)
-study_timer_app_instance = None
-
-
-
-from datetime import datetime
-
-def format_time_12hr(time_str):
-    """
-    Convert 'HH:MM' or 'HH:MM:SS' 24hr string to 'h:MM AM/PM'
-    """
-    for fmt in ("%H:%M:%S", "%H:%M"):
-        try:
-            dt = datetime.strptime(time_str, fmt)
-            return dt.strftime("%I:%M %p").lstrip("0")  # Removes leading zero
-        except ValueError:
-            continue
-    return time_str  # Return as-is if format unknown
-
-def check_auth(pw):
-    return pw == PASSWORD
-
-def authenticate():
-    return Response(
-        'Login required.', 401,
-        {'WWW-Authenticate': 'Basic realm="Login Required"'}
-    )
-
-def requires_auth(f):
-    def decorated(*args, **kwargs):
-        auth = request.authorization
-        if not auth or not check_auth(auth.password):
-            return authenticate()
-        return f(*args, **kwargs)
-    decorated.__name__ = f.__name__
-    return decorated
-
-@remote_app.route('/')
-def home():
-    app = study_timer_app_instance
-    status = "Unknown"
-    pause_btn = ""
-    start_btn = ""
-    if study_timer_app_instance:
-        if getattr(study_timer_app_instance, "registered", False):
-            if getattr(study_timer_app_instance, "paused", False):
-                status = "<b style='color:red;'>Paused</b>"
-                pause_btn = '<a href="/pause"><button style="font-size:2em;width:120px;height:60px;">Resume</button></a>'
-            else:
-                status = "<b style='color:green;'>Running</b>"
-                pause_btn = '<a href="/pause"><button style="font-size:2em;width:120px;height:60px;">Pause</button></a>'
-        else:
-            status = "<b style='color:gray;'>Not Started</b>"
-            start_btn = '<a href="/start"><button style="font-size:2em;width:120px;height:60px;">Start</button></a>'
-    idx = getattr(study_timer_app_instance, "running_session_index", None)
-    schedule = getattr(study_timer_app_instance, "schedule", [])
-    if idx is not None and isinstance(schedule, list) and idx < len(schedule):
-        # If schedule is a list of tuples (("session name", ...)), use [0]
-        session_name = schedule[idx][0] if isinstance(schedule[idx], (list, tuple)) else str(schedule[idx])
-    else:
-        session_name = "(No session)"        
-
-    def hhmmss_from_seconds(seconds):
-        seconds = int(seconds)
-        h = seconds // 3600
-        m = (seconds % 3600) // 60
-        s = seconds % 60
-        return f"{h:02}:{m:02}:{s:02}"
-
-    session_name = "(No session)"
-    remaining_str = "--:--:--"
-    studied_str = "--:--:--"
-    wastage_str = "--:--:--"
-
-    if study_timer_app_instance:
-        try:
-            idx = getattr(study_timer_app_instance, "active_session_idx", None)
-            schedule = getattr(study_timer_app_instance, "schedule", [])
-            if idx is not None and isinstance(schedule, list) and idx < len(schedule):
-                session_name = schedule[idx][0] if isinstance(schedule[idx], (list, tuple)) else str(schedule[idx])
-            else:
-                session_name = "(No session)"
-        except Exception:
-            session_name = "(No session)"  # or just pass
-
-        try:
-            remaining = getattr(study_timer_app_instance, "session_remaining_seconds", None)
-            if remaining is not None:
-                remaining_str = hhmmss_from_seconds(remaining)
-        except Exception:
-            remaining_str = "--:--:--"
-           
-        # Studied time
-        try:
-            studied = getattr(study_timer_app_instance, "today_study_stopwatch_seconds", 0)
-            studied_str = hhmmss_from_seconds(studied)
-        except Exception:
-            studied_str = "--:--:--"
-
-        # Wastage time
-        try:
-            wastage = study_timer_app_instance.get_today_wastage_seconds()
-        except Exception:
-            wastage = 0
-        wastage_str = hhmmss_from_seconds(wastage)
-        
-        # Break time: shows only if currently in a break session
-        break_time_str = "--:--:--"
-        if study_timer_app_instance:
+    def format_time_12hr(time_str):
+        """Convert 'HH:MM' or 'HH:MM:SS' 24hr string to 'h:MM AM/PM'"""
+        for fmt in ("%H:%M:%S", "%H:%M"):
             try:
-                break_start, break_end = study_timer_app_instance.get_current_break_time()
-                if break_start and break_end:
-                    # Convert to 12-hour format
-                    break_time_str = f"{format_time_12hr(break_start)} – {format_time_12hr(break_end)}"
-                else:
-                    break_time_str = "--:--:--"
-            except Exception:
-                break_time_str = "--:--:--"
+                dt = datetime.strptime(time_str, fmt)
+                return dt.strftime("%I:%M %p").lstrip("0")
+            except ValueError:
+                continue
+        return time_str
 
-    return f"""
-    <div style='display:flex;justify-content:center;align-items:center;height:80vh;'>
-      <div style='
-          border-radius:16px;
-          box-shadow:0 2px 10px #aaa;
-          padding:2em 2.5em;
-          background:#fff;
-          text-align:center;
-          min-width:260px;
-      '>
-        <h2 style='margin-bottom:1em;font-size:1.5em;font-weight:bold;'>Study Timer Remote</h2>
-        <div style='margin-bottom:0.7em;font-size:1.15em;'>
-            Status: {status}<br>
-            Session: {session_name}<br>
-            Remaining: {remaining_str}<br>
-            <span style='display:inline-block;margin-top:0.5em;margin-bottom:0.7em;'>
-                <b>Scheduled Time:</b> {break_time_str}
-            </span><br>
-            Today Studied: {studied_str}<br>
-            Today Wastage: {wastage_str}
-        </div>
-        <div style='margin-top:1.5em;'>{pause_btn}{start_btn}</div>
-      </div>
-    </div>
-"""
-def remote_start():
-    print("Remote START called!")  # Debug
-    if study_timer_app_instance:
-       study_timer_app_instance.start_session()
-    return redirect(url_for('home'))
+    def check_auth(pw):
+        return pw == PASSWORD
 
-@remote_app.route('/pause')
-@requires_auth
-def remote_pause():
-    if study_timer_app_instance:
-        study_timer_app_instance.toggle_pause()
-    return redirect(url_for('home'))
+    def authenticate():
+        return Response(
+            'Login required.', 401,
+            {'WWW-Authenticate': 'Basic realm="Login Required"'}
+        )
+
+    def requires_auth(f):
+        def decorated(*args, **kwargs):
+            auth = request.authorization
+            if not auth or not check_auth(auth.password):
+                return authenticate()
+            return f(*args, **kwargs)
+        decorated.__name__ = f.__name__
+        return decorated
+
+    @remote_app.route('/')
+    def home():
+        # ... all the home() function code ...
+        pass  # (keep your existing code)
+
+    @remote_app.route('/pause')
+    @requires_auth
+    def remote_pause():
+        if study_timer_app_instance:
+            study_timer_app_instance.toggle_pause()
+        return redirect(url_for('home'))
+        
+    @remote_app.route('/start')
+    def remote_start():
+        if study_timer_app_instance:
+            study_timer_app_instance.start_session()
+        return redirect(url_for('home'))
+
+    def run_remote_server():
+        remote_app.run(host='0.0.0.0', port=5000, debug=False)
+
+    def launch_remote_control(app_instance):
+        global study_timer_app_instance
+        study_timer_app_instance = app_instance
+        threading.Thread(target=run_remote_server, daemon=True).start()
+
+else:
+    # Parent process - dummy placeholders
+    remote_app = None
+    study_timer_app_instance = None
     
-@remote_app.route('/start')
-def remote_start():
-    if study_timer_app_instance:
-        study_timer_app_instance.start_session()  # <<--- USE YOUR REAL START LOGIC
-    return redirect(url_for('home'))
-
-def run_remote_server():
-    remote_app.run(host='0.0.0.0', port=5000, debug=False)
-
-def launch_remote_control(app_instance):
-    global study_timer_app_instance
-    study_timer_app_instance = app_instance
-    threading.Thread(target=run_remote_server, daemon=True).start()
-    
+    def launch_remote_control(app_instance):
+        pass  # Do nothing in parent
 
 import traceback
 
@@ -37337,20 +37566,50 @@ def _run_main_app(ready_flag_path=None):
                 pass
 
 
+def _hide_console_window():
+    """
+    Hide the console window on Windows when running as a PyInstaller EXE.
+    Safe no-op on other platforms.
+    """
+    try:
+        if os.name != "nt":
+            return
+
+        import ctypes  # Windows only
+        # Get the handle of the current console window (if any)
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            # 0 = SW_HIDE
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
+    except Exception as e:
+        # Don't crash if hiding fails
+        try:
+            print(f"[SPLASH] Could not hide console window: {e}")
+        except Exception:
+            pass
+            
 def _run_with_embedded_splash():
     """
     PARENT process:
-      - calculates a per-version flag path
-      - if '--child' is present, run main app directly with that flag
-      - otherwise start child process and show a small embedded splash
-        until the child signals that the UI is ready.
-
-    CHILD process:
-      - _run_main_app(ready_flag_path=...) will create the flag when
-        the main Tkinter window is fully initialized.
+      - if running as .py file, skip splash and run directly (no child process)
+      - if running as frozen exe, use splash + child process
     """
+    
+    # 🔒 FOR .PY FILES: Skip splash entirely, run app directly
+    # This avoids the console flash from subprocess
+    if not getattr(sys, "frozen", False):
+        # Running as .py - just run the app directly, no splash
+        _run_main_app(ready_flag_path=None)
+        return
+    
+    # ========== FROZEN EXE ONLY BELOW ==========
+    
+    # Extra safety: hide parent console too if running as EXE
+    if os.name == "nt":
+        _hide_console_window()
+
     import tkinter as tk
-    from tkinter import ttk  # kept in case we need later
+    from tkinter import ttk
     import glob
 
     try:
@@ -37381,22 +37640,41 @@ def _run_with_embedded_splash():
         print(f"[SPLASH] Could not remove old ready flag: {e}")
 
     # ----- Build child command -----
-    if getattr(sys, "frozen", False):
-        # Running from EXE – the exe is already StudyTimer
-        child_cmd = [sys.executable, "--child"]
-        popen_kwargs = {}
-        if os.name == "nt":
-            # In EXE mode there is no console anyway, but keep this just in case
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            popen_kwargs["creationflags"] = creationflags
-    else:
-        # Running from plain Python -> keep console visible for debugging
-        script_path = os.path.abspath(sys.argv[0])
-        child_cmd = [sys.executable, script_path, "--child"]
-        popen_kwargs = {}      # 🔴 no CREATE_NO_WINDOW here
+    is_frozen = getattr(sys, "frozen", False)
 
+    if is_frozen:
+        # Running from packaged EXE – the exe itself is StudyTimer
+        child_cmd = [sys.executable, "--child"]
+    else:
+        # Running from plain Python (dev mode) – use pythonw.exe (no console)
+        script_path = os.path.abspath(sys.argv[0])
+        
+        # Try to use pythonw.exe instead of python.exe
+        python_exe = sys.executable
+        if os.name == "nt" and python_exe.lower().endswith("python.exe"):
+            pythonw_exe = python_exe[:-10] + "pythonw.exe"  # Replace python.exe with pythonw.exe
+            if os.path.exists(pythonw_exe):
+                python_exe = pythonw_exe
+        
+        child_cmd = [python_exe, script_path, "--child"]
+
+    # Common kwargs for Popen
+    popen_kwargs = {}
+
+    # 🔒 ALWAYS hide the child console on Windows
+    if os.name == "nt":
+        CREATE_NO_WINDOW = 0x08000000
+        
+        # STARTUPINFO to hide window
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0  # SW_HIDE
+        popen_kwargs["startupinfo"] = si
+        popen_kwargs["creationflags"] = CREATE_NO_WINDOW
+        
+        
     try:
-        subprocess.Popen(child_cmd, **popen_kwargs)
+        proc = subprocess.Popen(child_cmd, **popen_kwargs)
         print(f"[SPLASH] Started child process: {child_cmd}")
     except Exception as e:
         print(f"[SPLASH] Failed to start child process, running direct: {e}")
@@ -37553,4 +37831,5 @@ def _run_with_embedded_splash():
 
 if __name__ == "__main__":
     _run_with_embedded_splash()
+
 

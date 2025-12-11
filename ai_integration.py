@@ -14,7 +14,7 @@ from pathlib import Path
 # Import your existing AppPaths system
 try:
     from config_paths import app_paths
-    print("✅ Using your AppPaths configuration system")
+    print("[OK] Using your AppPaths configuration system")
 except ImportError:
     print("⚠️  Could not import config_paths. Make sure it's in the same folder!")
     import sys

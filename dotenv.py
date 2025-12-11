@@ -1,3 +1,17 @@
+# dotenv.py
+import sys
+import os
+
+# 🔒 Hide console immediately
+if os.name == "nt":
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
+    except Exception:
+        pass
+
 import requests
 import os
 

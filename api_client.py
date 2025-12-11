@@ -1,8 +1,14 @@
+# api_client.py - Hide console FIRST
+import sys, os
+if os.name == "nt":
+    try:
+        import ctypes
+        ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
+    except: pass
+
 """
 API Client for Study Timer Backend
-Connects to your Firebase Cloud Functions
 """
-import os
 import requests
 import json
 

@@ -1245,8 +1245,6 @@ def add_auto_update_to_app(app_instance, current_version="1.0", profile_path=Non
             import traceback
             traceback.print_exc()
     
-    # Add menu after a short delay to ensure app is fully initialized
-    app_instance.after(100, add_update_menu)
     
     # NEW: Check profile and decide whether to show update on startup
     def startup_check():

@@ -750,8 +750,12 @@ class UnifiedAuthSystem:
             print(f"Error getting user from sheet: {e}")
             return None
     
-    def save_user_to_sheet(self):
-        """Save user with auto-generated machine fingerprint"""
+    def save_user_to_sheet(self, update_only: bool = False):
+        """Save user with auto-generated machine fingerprint.
+
+        Args:
+            update_only: When True, update an existing row but do not append a new one.
+        """
         try:
             client = self.get_gspread_client()
             if not client:
@@ -770,7 +774,7 @@ class UnifiedAuthSystem:
             # Check if user exists
             records = worksheet.get_all_records()
             user_row = None
-            
+
             for i, record in enumerate(records, start=2):
                 if record.get('email') == self.user_data.get('email'):
                     user_row = i
@@ -799,6 +803,10 @@ class UnifiedAuthSystem:
                 for i, value in enumerate(row_data[:-1], start=1):
                     worksheet.update_cell(user_row, i, value)
                 print(f"✓ Updated user with real machine fingerprint: {real_machine_fp}")
+            elif update_only:
+                # Respect login-only creation rule
+                print("[AUTH] Skipping user creation (update-only mode)")
+                return True
             else:
                 # Add new row
                 worksheet.append_row(row_data)
