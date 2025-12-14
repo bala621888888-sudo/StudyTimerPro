@@ -447,8 +447,14 @@ except AttributeError:  # pragma: no cover - compatibility shim
     ft.colors = _Colors()  # type: ignore[attr-defined]
 
 
-ONESIGNAL_APP_ID = "6bb7df1b-6014-498a-ac2e-67abb63e4751"
-ONESIGNAL_REST_API_KEY = "os_v2_app_no356g3acreyvlbom6v3mpshkfhgnobysxhevlnrhod3lblmkqwvqbbz2dcmqxfpl2e737sruw6uensyik6jfcyntvpmbz677qfb72i" 
+import os
+
+ONESIGNAL_REST_API_KEY = (os.getenv("ONESIGNAL_REST_API_KEY") or "").strip()
+ONESIGNAL_APP_ID = (os.getenv("ONESIGNAL_APP_ID") or "").strip()  # if you use it
+
+if not ONESIGNAL_REST_API_KEY:
+    print("⚠️ ONESIGNAL_REST_API_KEY not set. Push notifications will be disabled.")
+
 
 PUSH_DEBUG = True
 
@@ -2948,6 +2954,8 @@ class FirebaseDatabase:
     
     def send_onesignal_notification(self, receiver_user_id, title, message, data=None):
         """Send notification via OneSignal using External User ID"""
+        if not ONESIGNAL_REST_API_KEY:
+            return False  # or just skip
         
         print(f"\n[NOTIFICATION] ===== START =====")
         print(f"[NOTIFICATION] Receiver User ID: {receiver_user_id}")
