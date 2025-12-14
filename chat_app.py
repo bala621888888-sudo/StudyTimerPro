@@ -33,8 +33,187 @@ import random
 import smtplib
 import traceback
 import queue
+
+def _safe_get_user_profile(db_obj, user_id):
+    """Compatibility helper to fetch a user's profile dict from /users/<uid>.
+
+    Fixes crashes if an older FirebaseDatabase class is missing get_user_profile().
+    """
+    try:
+
+        # Custom promoter pseudo-users: id like "cp_<promoterId>"
+        if isinstance(user_id, str) and user_id.startswith("cp_"):
+            pid = user_id[3:]
+            database_url = getattr(db_obj, "database_url", None)
+            auth_token = getattr(db_obj, "auth_token", None)
+            if database_url and auth_token:
+                url = f"{database_url}/custom_promoters/{pid}.json?auth={auth_token}"
+                r = requests.get(url, timeout=10)
+                if r.status_code == 200:
+                    pdata = r.json() or {}
+                    if isinstance(pdata, dict):
+                        if "username" not in pdata and pdata.get("name"):
+                            pdata["username"] = pdata.get("name")
+                        return pdata
+        fn = getattr(db_obj, "get_user_profile", None)
+        if callable(fn):
+            return fn(user_id)
+
+        fn2 = getattr(db_obj, "get_user_by_id", None)
+        if callable(fn2):
+            return fn2(user_id)
+
+        database_url = getattr(db_obj, "database_url", None)
+        auth_token = getattr(db_obj, "auth_token", None)
+        if database_url and auth_token:
+            url = f"{database_url}/users/{user_id}.json?auth={auth_token}"
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                return r.json()
+    except Exception:
+        pass
+    return None
+
 # ⚡ LAZY IMPORT - Only load when needed, not at startup!
 _secrets_util = None
+
+def _safe_store_user_token(db_obj, user_id, email, username, refresh_token):
+    """Compatibility helper to store refresh token in /user_tokens/<uid>.
+    Avoids crashes if FirebaseDatabase is missing store_user_token()."""
+    try:
+        fn = getattr(db_obj, "store_user_token", None)
+        if callable(fn):
+            return fn(user_id, email, username, refresh_token)
+
+        database_url = getattr(db_obj, "database_url", None)
+        auth_token = getattr(db_obj, "auth_token", None)
+        if database_url and auth_token:
+            url = f"{database_url}/user_tokens/{user_id}.json?auth={auth_token}"
+            token_data = {
+                "email": email,
+                "username": username,
+                "refresh_token": refresh_token,
+                "updated_at": int(time.time() * 1000),
+            }
+            r = requests.put(url, json=token_data, timeout=10)
+            return r.status_code == 200
+    except Exception:
+        pass
+    return False
+
+
+
+
+# ----------------------------
+# Custom Promoter Messaging (threads)
+# ----------------------------
+def _safe_db_get(db_obj, rel_path):
+    """GET <database_url>/<rel_path>.json?auth=..."""
+    try:
+        database_url = getattr(db_obj, "database_url", None)
+        auth_token = getattr(db_obj, "auth_token", None)
+        if not database_url or not auth_token:
+            return None
+        url = f"{database_url}/{rel_path}.json?auth={auth_token}"
+        r = requests.get(url, timeout=12)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def _safe_db_get_shallow(db_obj, rel_path):
+    """GET shallow keys only: <database_url>/<rel_path>.json?auth=...&shallow=true
+
+    Useful to fetch only child keys (no full data) for fast inbox loading.
+    """
+    try:
+        database_url = getattr(db_obj, "database_url", None)
+        auth_token = getattr(db_obj, "auth_token", None)
+        if not database_url or not auth_token:
+            return None
+        url = f"{database_url}/{rel_path}.json?auth={auth_token}&shallow=true"
+        r = requests.get(url, timeout=12)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+def _safe_db_put(db_obj, rel_path, data):
+    try:
+        database_url = getattr(db_obj, "database_url", None)
+        auth_token = getattr(db_obj, "auth_token", None)
+        if not database_url or not auth_token:
+            return False
+        url = f"{database_url}/{rel_path}.json?auth={auth_token}"
+        r = requests.put(url, json=data, timeout=12)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def _safe_db_patch(db_obj, rel_path, data):
+    try:
+        database_url = getattr(db_obj, "database_url", None)
+        auth_token = getattr(db_obj, "auth_token", None)
+        if not database_url or not auth_token:
+            return False
+        url = f"{database_url}/{rel_path}.json?auth={auth_token}"
+        r = requests.patch(url, json=data, timeout=12)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def _safe_db_post(db_obj, rel_path, data):
+    try:
+        database_url = getattr(db_obj, "database_url", None)
+        auth_token = getattr(db_obj, "auth_token", None)
+        if not database_url or not auth_token:
+            return None
+        url = f"{database_url}/{rel_path}.json?auth={auth_token}"
+        r = requests.post(url, json=data, timeout=12)
+        if r.status_code == 200:
+            js = r.json()
+            if isinstance(js, dict):
+                return js.get("name")
+        return None
+    except Exception:
+        return None
+
+def _ensure_custom_promoter_thread(db_obj, promoter_id, promoter_name, promoter_pic, user_id, user_name, user_pic, group_id=None):
+    """Ensure /custom_promoter_threads/<promoterId>/<userId>/info exists."""
+    try:
+        info_path = f"custom_promoter_threads/{promoter_id}/{user_id}/info"
+        existing = _safe_db_get(db_obj, info_path)
+        now_ms = int(time.time() * 1000)
+        base = {
+            "promoter_id": promoter_id,
+            "promoter_name": promoter_name or "Promoter",
+            "promoter_pic": promoter_pic or "",
+            "user_id": user_id,
+            "user_name": user_name or "User",
+            "user_pic": user_pic or "",
+            "created_at": now_ms,
+            "last_message_at": existing.get("last_message_at", 0) if isinstance(existing, dict) else 0,
+            "last_message": existing.get("last_message", "") if isinstance(existing, dict) else "",
+            "last_group_id": group_id or (existing.get("last_group_id") if isinstance(existing, dict) else None),
+        }
+        if not isinstance(existing, dict):
+            _safe_db_put(db_obj, info_path, base)
+        else:
+            # Keep existing created_at but update display names/pics
+            _safe_db_patch(db_obj, info_path, {
+                "promoter_name": base["promoter_name"],
+                "promoter_pic": base["promoter_pic"],
+                "user_name": base["user_name"],
+                "user_pic": base["user_pic"],
+                "last_group_id": base["last_group_id"],
+            })
+        return True
+    except Exception:
+        return False
+
 
 def _get_secrets_util():
     """Lazy load secrets_util - only when actually needed"""
@@ -53,6 +232,189 @@ def get_encrypted_gspread_client():
     return _get_secrets_util().get_encrypted_gspread_client()
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+
+def _safe_get_all_users(db_obj):
+    """Compatibility helper to fetch all users from /users.
+    Returns a list of dicts each containing at least {'id': <uid>}."
+    """
+    try:
+        fn = getattr(db_obj, "get_all_users", None)
+        if callable(fn):
+            return fn() or []
+
+        database_url = getattr(db_obj, "database_url", None)
+        auth_token = getattr(db_obj, "auth_token", None)
+        if not (database_url and auth_token):
+            return []
+
+        url = f"{database_url}/users.json?auth={auth_token}"
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            return []
+
+        data = r.json() or {}
+        out = []
+        seen = set()
+
+        if isinstance(data, dict):
+            for uid, udata in data.items():
+                if not uid or uid in seen:
+                    continue
+                seen.add(uid)
+                if isinstance(udata, dict):
+                    d = dict(udata)
+                else:
+                    d = {"username": str(udata)}
+                d["id"] = uid
+                out.append(d)
+            return out
+
+        if isinstance(data, list):
+            for i, udata in enumerate(data):
+                if isinstance(udata, dict):
+                    uid = udata.get("id") or udata.get("uid") or str(i)
+                    if uid in seen:
+                        continue
+                    seen.add(uid)
+                    d = dict(udata)
+                    d["id"] = uid
+                    out.append(d)
+            return out
+
+        return out
+    except Exception:
+        return []
+
+
+
+def _safe_get_chat_status(db_obj, chat_id):
+    """Compatibility helper to fetch a chat's status from /chats/<chatId>/status.
+    Returns 'pending' if missing/unknown."""
+    # Custom promoter threads are NOT stored under /chats, so treat them as accepted
+    if isinstance(chat_id, str) and chat_id.startswith("CP__"):
+        return "accepted"
+
+    try:
+        fn = getattr(db_obj, "get_chat_status", None)
+        if callable(fn):
+            return fn(chat_id)
+
+        database_url = getattr(db_obj, "database_url", None)
+        auth_token = getattr(db_obj, "auth_token", None)
+        if database_url and auth_token:
+            url = f"{database_url}/chats/{chat_id}/status.json?auth={auth_token}"
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                s = r.json()
+                return s if s else "pending"
+    except Exception:
+        pass
+    return "pending"
+
+def _safe_get_custom_promoters(db_obj):
+    """Compatibility helper to fetch root custom promoters list from /custom_promoters."""
+    try:
+        fn = getattr(db_obj, "get_custom_promoters", None)
+        if callable(fn):
+            return fn() or []
+
+        database_url = getattr(db_obj, "database_url", None)
+        auth_token = getattr(db_obj, "auth_token", None)
+        if not (database_url and auth_token):
+            return []
+
+        url = f"{database_url}/custom_promoters.json?auth={auth_token}"
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            return []
+
+        data = r.json() or {}
+        out = []
+        if isinstance(data, dict):
+            for pid, pdata in data.items():
+                if isinstance(pdata, dict):
+                    d = dict(pdata)
+                    d["id"] = pid
+                    out.append(d)
+        elif isinstance(data, list):
+            for i, pdata in enumerate(data):
+                if isinstance(pdata, dict):
+                    d = dict(pdata)
+                    d["id"] = d.get("id") or str(i)
+                    out.append(d)
+        return out
+    except Exception:
+        return []
+
+
+def _safe_add_custom_promoter(db_obj, *, name, amount, profile_image_url, created_by):
+    """Compatibility helper to add a root custom promoter under /custom_promoters."""
+    try:
+        fn = getattr(db_obj, "add_custom_promoter", None)
+        if callable(fn):
+            return fn(
+                name=name,
+                amount=amount,
+                profile_image_url=profile_image_url,
+                created_by=created_by,
+            )
+
+        database_url = getattr(db_obj, "database_url", None)
+        auth_token = getattr(db_obj, "auth_token", None)
+        if not (database_url and auth_token):
+            raise AttributeError("FirebaseDatabase missing database_url/auth_token")
+
+        url = f"{database_url}/custom_promoters.json?auth={auth_token}"
+        payload = {
+            "name": name,
+            "amount": amount,
+            "profile_image_url": profile_image_url,
+            "created_by": created_by,
+            "created_at": int(time.time() * 1000),
+        }
+        r = requests.post(url, json=payload, timeout=20)
+        if r.status_code == 200:
+            # Firebase returns {"name": "<new_key>"}
+            j = r.json() or {}
+            return j.get("name")
+        return None
+    except Exception as e:
+        # Re-raise so caller prints same error path
+        raise
+
+
+def _safe_update_custom_promoter(db_obj, *, promoter_id, name, amount, profile_image_url, updated_by):
+    """Compatibility helper to update /custom_promoters/<id>."""
+    try:
+        fn = getattr(db_obj, "update_custom_promoter", None)
+        if callable(fn):
+            return fn(
+                promoter_id=promoter_id,
+                name=name,
+                amount=amount,
+                profile_image_url=profile_image_url,
+                updated_by=updated_by,
+            )
+
+        database_url = getattr(db_obj, "database_url", None)
+        auth_token = getattr(db_obj, "auth_token", None)
+        if not (database_url and auth_token):
+            return False
+
+        url = f"{database_url}/custom_promoters/{promoter_id}.json?auth={auth_token}"
+        payload = {
+            "name": name,
+            "amount": amount,
+            "profile_image_url": profile_image_url,
+            "updated_by": updated_by,
+            "updated_at": int(time.time() * 1000),
+        }
+        r = requests.patch(url, json=payload, timeout=20)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -86,7 +448,7 @@ except AttributeError:  # pragma: no cover - compatibility shim
 
 
 ONESIGNAL_APP_ID = "6bb7df1b-6014-498a-ac2e-67abb63e4751"
-ONESIGNAL_REST_API_KEY = "os_v2_app_no356g3acreyvlbom6v3mpshkgsqs54zgyeuoxv6jkcmhcemp5x64wi3ulleqo4ykcl4b3vxomf5gs2mcs6p6y5eeai6quwkg7pxooa" 
+ONESIGNAL_REST_API_KEY = "os_v2_app_no356g3acreyvlbom6v3mpshkfhgnobysxhevlnrhod3lblmkqwvqbbz2dcmqxfpl2e737sruw6uensyik6jfcyntvpmbz677qfb72i" 
 
 PUSH_DEBUG = True
 
@@ -1637,21 +1999,45 @@ class FirebaseDatabase:
                     groups_list = []
                     for group_id, group_data in groups_data.items():
                         info = group_data.get('info', {})
-                        members = group_data.get('members', {})
+
+                        members = group_data.get('members', {}) or {}
+
+                        custom_promoters = group_data.get('custom_promoters', {}) or {}
+
+                        try:
+
+                            custom_count = len(custom_promoters) if isinstance(custom_promoters, (dict, list)) else 0
+
+                        except Exception:
+
+                            custom_count = 0
+
 
                         groups_list.append({
+
                             'id': group_id,
+
                             'name': info.get('name', 'Unnamed Group'),
+
                             'description': info.get('description', ''),
+
                             'icon': info.get('icon', '👥'),
+
                             'icon_url': info.get('icon_url'),
+
                             'created_by': info.get('created_by'),
+
                             'created_at': info.get('created_at', 0),
-                            'member_count': len(members),
+
+                            'member_count': len(members) + custom_count,
+
                             'members': members,
+
+                            'custom_promoters': custom_promoters,
+
                             'category': info.get('category', 'None')
+
                         })
-                    
                     groups_list.sort(key=lambda x: x.get('created_at', 0), reverse=True)
                     return groups_list
                 return []
@@ -1692,6 +2078,79 @@ class FirebaseDatabase:
             return []
         except:
             return []
+
+
+    def get_group_custom_promoters_by_id(self, group_id):
+        """Get custom promoters stored under a specific group at:
+        /groups/<groupId>/custom_promoters
+
+        Returns:
+            List[dict] sorted by amount (desc). Each item includes 'id'.
+        """
+        url = f"{self.database_url}/groups/{group_id}/custom_promoters.json?auth={self.auth_token}"
+
+        last_err = None
+        for attempt in range(3):
+            try:
+                response = requests.get(url, timeout=10)
+                if response.status_code == 200:
+                    data = response.json() or {}
+                    items = []
+                    for pid, pdata in (data or {}).items():
+                        if isinstance(pdata, dict):
+                            row = dict(pdata)
+                            row["id"] = pid
+                            # normalize amount
+                            try:
+                                row["amount"] = float(row.get("amount", 0) or 0)
+                            except Exception:
+                                row["amount"] = 0.0
+                            items.append(row)
+
+                    items.sort(key=lambda x: x.get("amount", 0) or 0, reverse=True)
+                    return items
+
+                # non-200: treat as empty (don't retry auth/permission issues)
+                return []
+            except Exception as e:
+                last_err = e
+                # brief backoff (helps transient SSL EOF errors)
+                try:
+                    time.sleep(0.6 * (attempt + 1))
+                except Exception:
+                    pass
+
+        print(f"[CUSTOM PROMOTER] get_group_custom_promoters_by_id error: {last_err}")
+        return []
+
+    def update_group_custom_promoter(self, group_id, promoter_id, updates):
+        # Update /groups/<groupId>/custom_promoters/<promoterId> (PATCH)
+        if not group_id or not promoter_id:
+            return False
+        if not isinstance(updates, dict) or not updates:
+            return False
+
+        url = f"{self.database_url}/groups/{group_id}/custom_promoters/{promoter_id}.json?auth={self.auth_token}"
+        try:
+            r = requests.patch(url, json=updates, timeout=10)
+            return r.status_code == 200
+        except Exception as e:
+            print(f"[CUSTOM PROMOTER] update_group_custom_promoter error: {e}")
+            return False
+
+    def remove_group_custom_promoter(self, group_id, promoter_id):
+        # Remove from /groups/<groupId>/custom_promoters/<promoterId>
+        if not group_id or not promoter_id:
+            return False
+
+        url = f"{self.database_url}/groups/{group_id}/custom_promoters/{promoter_id}.json?auth={self.auth_token}"
+        try:
+            r = requests.delete(url, timeout=10)
+            return r.status_code in (200, 204)
+        except Exception as e:
+            print(f"[CUSTOM PROMOTER] remove_group_custom_promoter error: {e}")
+            return False
+
 
     def get_group_messages_by_id(self, group_id, limit=50, joined_after=None):
         """Get messages for a specific group.
@@ -1902,46 +2361,111 @@ class FirebaseDatabase:
         
    
     def get_messages(self, chat_id, limit=20):
-        url = f"{self.database_url}/chats/{chat_id}/messages.json?auth={self.auth_token}&orderBy=\"timestamp\"&limitToLast={limit}"
-        
+        """Get messages for a private chat OR a custom-promoter thread.
+
+        - Normal private chat: /chats/<chatId>/messages
+        - Custom promoter thread: chat_id starts with 'CP__<promoterId>__<userId>'
+        """
         try:
-            response = requests.get(url)
+            if isinstance(chat_id, str) and chat_id.startswith("CP__"):
+                # CP__<promoterId>__<userId>
+                parts = chat_id.split("__", 2)
+                promoter_id = parts[1] if len(parts) > 1 else ""
+                user_id = parts[2] if len(parts) > 2 else ""
+                url = f"{self.database_url}/custom_promoter_threads/{promoter_id}/{user_id}/messages.json?auth={self.auth_token}&orderBy=\"timestamp\"&limitToLast={limit}"
+            else:
+                url = f"{self.database_url}/chats/{chat_id}/messages.json?auth={self.auth_token}&orderBy=\"timestamp\"&limitToLast={limit}"
+
+            response = requests.get(url, timeout=15)
             if response.status_code == 200:
                 messages = response.json()
                 if messages:
                     message_list = []
                     for msg_id, msg_data in messages.items():
-                        msg_data['id'] = msg_id
-                        message_list.append(msg_data)
+                        if isinstance(msg_data, dict):
+                            msg_data['id'] = msg_id
+                            message_list.append(msg_data)
                     message_list.sort(key=lambda x: x.get('timestamp', 0))
                     return message_list
                 return []
             return []
-        except:
+        except Exception:
             return []
 
+
     def send_message(self, chat_id, sender_id, sender_username, message_text, is_admin=False, file_url=None, file_name=None, file_size=None, seen=False):
-        url = f"{self.database_url}/chats/{chat_id}/messages.json?auth={self.auth_token}"
+        """Send message to:
+        - /chats/<chatId>/messages   (normal)
+        - /custom_promoter_threads/<promoterId>/<userId>/messages  (custom promoter thread, chat_id starts CP__)
+        """
+        ts = int(time.time() * 1000)
         message_data = {
             "sender_id": sender_id,
             "sender_username": sender_username,
             "text": message_text,
-            "timestamp": int(time.time() * 1000),
+            "timestamp": ts,
             "is_admin": is_admin,
             "seen": seen
         }
-        
         if file_url:
             message_data["file_url"] = file_url
-            message_data["file_name"] = file_name
-            message_data["file_size"] = file_size
-        
+            if file_name:
+                message_data["file_name"] = file_name
+            if file_size is not None:
+                message_data["file_size"] = file_size
+
         try:
-            response = requests.post(url, json=message_data)
-            if response.status_code == 200:
-                return True
-            return False
-        except:
+            # Custom promoter thread routing
+            if isinstance(chat_id, str) and chat_id.startswith("CP__"):
+                parts = chat_id.split("__", 2)
+                promoter_id = parts[1] if len(parts) > 1 else ""
+                user_id = parts[2] if len(parts) > 2 else ""
+                url = f"{self.database_url}/custom_promoter_threads/{promoter_id}/{user_id}/messages.json?auth={self.auth_token}"
+
+                # Add metadata so creator can see clearly later (from / to)
+                message_data.update({
+                    "to_promoter_id": promoter_id,
+                    "thread_user_id": user_id,
+                })
+
+                response = requests.post(url, json=message_data, timeout=15)
+
+                # Update thread info for sorting/inbox view later
+                try:
+                    info_url = f"{self.database_url}/custom_promoter_threads/{promoter_id}/{user_id}/info.json?auth={self.auth_token}"
+                    requests.patch(info_url, json={
+                        "last_message_at": ts,
+                        "last_message": message_text,
+                        "last_sender_id": sender_id,
+                        "last_sender_name": sender_username,
+                    }, timeout=10)
+                except Exception:
+                    pass
+
+                return response.status_code == 200
+
+            # Normal private chat
+            url = f"{self.database_url}/chats/{chat_id}/messages.json?auth={self.auth_token}"
+            response = requests.post(url, json=message_data, timeout=15)
+            ok = (response.status_code == 200)
+
+            # ✅ Maintain chat inbox metadata (fast list loading)
+            if ok:
+                try:
+                    info_url = f"{self.database_url}/chats/{chat_id}/info.json?auth={self.auth_token}"
+                    last_text = message_text if message_text else (file_name or "📎 Attachment")
+                    requests.patch(info_url, json={
+                        "last_message_at": ts,
+                        "last_message": last_text,
+                        "last_sender_id": sender_id,
+                        "last_sender_name": sender_username,
+                    }, timeout=10)
+                except Exception:
+                    pass
+
+            return ok
+
+        except Exception:
             return False
 
     def get_chat_status(self, chat_id):
@@ -1989,26 +2513,63 @@ class FirebaseDatabase:
         except:
             return False
     
-    def get_messages(self, chat_id):
-        url = f"{self.database_url}/chats/{chat_id}/messages.json?auth={self.auth_token}"
-        
+    def get_messages(self, chat_id, limit=200):
+        """Get messages for:
+        - normal private chat: /chats/<chatId>/messages
+        - custom promoter thread: chat_id = CP__<promoterId>__<threadUserKey>
+          stored at /custom_promoter_threads/<promoterId>/<threadUserKey>/messages
+        Supports both dict(pushId->msg) and list([msg,...]) formats.
+        """
         try:
-            response = requests.get(url)
-            if response.status_code == 200:
-                messages = response.json()
-                if messages:
-                    message_list = []
-                    for msg_id, msg_data in messages.items():
-                        msg_data['id'] = msg_id
-                        message_list.append(msg_data)
-                    message_list.sort(key=lambda x: x.get('timestamp', 0))
-                    return message_list
+            is_cp = isinstance(chat_id, str) and chat_id.startswith("CP__")
+            if is_cp:
+                parts = str(chat_id).split("__", 2)
+                promoter_id = parts[1] if len(parts) > 1 else ""
+                thread_user_key = parts[2] if len(parts) > 2 else ""
+                url = (
+                    f"{self.database_url}/custom_promoter_threads/{promoter_id}/{thread_user_key}/messages.json"
+                    f"?auth={self.auth_token}&orderBy=\"timestamp\"&limitToLast={int(limit)}"
+                )
+            else:
+                url = (
+                    f"{self.database_url}/chats/{chat_id}/messages.json"
+                    f"?auth={self.auth_token}&orderBy=\"timestamp\"&limitToLast={int(limit)}"
+                )
+
+            resp = requests.get(url, timeout=15)
+            if resp.status_code != 200:
+                try:
+                    print(f"[GET_MESSAGES] status={resp.status_code} chat_id={chat_id} url={url}")
+                    print(f"[GET_MESSAGES] body={str(resp.text)[:200]}")
+                except Exception:
+                    pass
                 return []
+
+            data = resp.json() or {}
+            message_list = []
+
+            if isinstance(data, dict):
+                for msg_id, msg_data in data.items():
+                    if isinstance(msg_data, dict):
+                        d = dict(msg_data)
+                        d["id"] = msg_id
+                        message_list.append(d)
+            elif isinstance(data, list):
+                for i, msg_data in enumerate(data):
+                    if isinstance(msg_data, dict):
+                        d = dict(msg_data)
+                        d["id"] = d.get("id") or str(i)
+                        message_list.append(d)
+
+            message_list.sort(key=lambda x: x.get("timestamp", 0))
+            return message_list
+        except Exception as ex:
+            try:
+                print(f"[GET_MESSAGES] error for chat_id={chat_id}: {ex}")
+            except Exception:
+                pass
             return []
-        except:
-            return []
-    
-    
+
     def create_user_profile(self, user_id, email, username, profile_image_url=None):
         url = f"{self.database_url}/users/{user_id}.json?auth={self.auth_token}"
         profile_data = {
@@ -2106,24 +2667,250 @@ class FirebaseDatabase:
             print(f"Error fetching users: {e}")
             return []
     
-    def mark_messages_as_seen(self, chat_id, user_id):
-        """Mark all messages in a chat as seen by the user"""
-        url = f"{self.database_url}/chats/{chat_id}/messages.json?auth={self.auth_token}"
-        
+
+    # ============================
+    # CUSTOM PROMOTERS (Hall of Fame)
+    # Firebase node: /custom_promoters
+    # ============================
+
+    def add_custom_promoter(self, name, amount, profile_image_url=None, created_by=None):
+        """Add a custom promoter under /custom_promoters (POST = auto id)
+
+        Returns:
+            - Firebase push-id string (truthy) on success, OR True if id couldn't be read
+            - False on failure
+        """
+        url = f"{self.database_url}/custom_promoters.json?auth={self.auth_token}"
+        payload = {
+            "name": str(name or "").strip(),
+            "amount": amount,
+            "profile_image_url": profile_image_url or "",
+            "created_by": created_by or "",
+            "created_at": int(time.time() * 1000),
+        }
+
         try:
-            response = requests.get(url)
-            if response.status_code == 200:
-                messages = response.json()
-                if messages:
-                    for msg_id, msg_data in messages.items():
-                        # Mark as seen if message is not from current user and not already seen
-                        if msg_data.get('sender_id') != user_id and not msg_data.get('seen', False):
-                            seen_url = f"{self.database_url}/chats/{chat_id}/messages/{msg_id}/seen.json?auth={self.auth_token}"
-                            requests.put(seen_url, json=True)
-            return True
-        except:
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code in (200, 201):
+                try:
+                    key = (resp.json() or {}).get("name")
+                except Exception:
+                    key = None
+                return key if key else False
             return False
-    
+        except Exception as e:
+            print(f"[CUSTOM PROMOTER] add_custom_promoter error: {e}")
+            return False
+
+    def get_custom_promoters(self):
+        """Fetch custom promoters list from /custom_promoters"""
+        url = f"{self.database_url}/custom_promoters.json?auth={self.auth_token}"
+
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                return []
+
+            data = resp.json() or {}
+            if not isinstance(data, dict):
+                return []
+
+            out = []
+            for pid, pdata in data.items():
+                if not isinstance(pdata, dict):
+                    continue
+                item = dict(pdata)
+                item["id"] = pid
+                out.append(item)
+            return out
+        except Exception as e:
+            print(f"[CUSTOM PROMOTER] get_custom_promoters error: {e}")
+            return []
+
+
+    def update_custom_promoter(self, promoter_id, name=None, amount=None, profile_image_url=None, updated_by=None):
+        """Patch an existing custom promoter at /custom_promoters/{promoter_id}"""
+        if not promoter_id:
+            return False
+
+        url = f"{self.database_url}/custom_promoters/{promoter_id}.json?auth={self.auth_token}"
+        payload = {}
+        if name is not None:
+            payload["name"] = str(name or "").strip()
+        if amount is not None:
+            payload["amount"] = amount
+        if profile_image_url is not None:
+            payload["profile_image_url"] = profile_image_url or ""
+        if updated_by is not None:
+            payload["updated_by"] = updated_by or ""
+        payload["updated_at"] = int(time.time() * 1000)
+
+        try:
+            resp = requests.patch(url, json=payload, timeout=10)
+            return resp.status_code == 200
+        except Exception as e:
+            print(f"[CUSTOM PROMOTER] update_custom_promoter error: {e}")
+            return False
+
+    def _iter_groups_where_user_can_write(self, actor_user_id):
+        """Yield group_ids where actor_user_id is creator or admin (so group write rule allows)."""
+        if not actor_user_id:
+            return
+
+        url = f"{self.database_url}/groups.json?auth={self.auth_token}"
+        try:
+            resp = requests.get(url, timeout=12)
+            if resp.status_code != 200:
+                return
+            groups = resp.json() or {}
+            if not isinstance(groups, dict):
+                return
+
+            for gid, gdata in groups.items():
+                if not isinstance(gdata, dict):
+                    continue
+                info = gdata.get("info") or {}
+                members = gdata.get("members") or {}
+                created_by = (info.get("created_by") or "")
+                if created_by == actor_user_id:
+                    yield gid
+                    continue
+                me = members.get(actor_user_id) or {}
+                try:
+                    if bool(me.get("is_admin")):
+                        yield gid
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[GROUP] _iter_groups_where_user_can_write error: {e}")
+            return
+
+    def upsert_custom_promoter_into_admin_groups(self, promoter_id, promoter_snapshot, actor_user_id):
+        """Store/Update promoter snapshot under each writable group at /groups/<gid>/custom_promoters/<promoter_id>.
+
+        NOTE: This does NOT add as a real 'member' (rules block that). It stores the promoter under a separate node.
+        """
+        if not promoter_id or not isinstance(promoter_snapshot, dict):
+            return 0
+
+        count = 0
+        now_ms = int(time.time() * 1000)
+        snapshot = {
+            "name": str(promoter_snapshot.get("name", "")),
+            "amount": promoter_snapshot.get("amount", 0),
+            "profile_image_url": promoter_snapshot.get("profile_image_url", "") or "",
+            "added_at": promoter_snapshot.get("added_at", now_ms),
+            "updated_at": now_ms,
+        }
+
+        for gid in self._iter_groups_where_user_can_write(actor_user_id):
+            try:
+                url = f"{self.database_url}/groups/{gid}/custom_promoters/{promoter_id}.json?auth={self.auth_token}"
+                resp = requests.patch(url, json=snapshot, timeout=10)
+                if resp.status_code == 200:
+                    count += 1
+            except Exception as e:
+                print(f"[GROUP] upsert_custom_promoter_into_admin_groups -> {gid} error: {e}")
+                continue
+
+        return count
+
+
+    def upsert_custom_promoter_into_all_groups(self, promoter_id, promoter_snapshot):
+        """Store/Update promoter snapshot under EVERY group at:
+            /groups/<gid>/custom_promoters/<promoter_id>
+
+        This is intended for admin/creator use (e.g., when you want a new custom promoter
+        to appear inside all already-created groups).
+
+        Returns:
+            int: number of groups updated successfully
+        """
+        if not promoter_id or not isinstance(promoter_snapshot, dict):
+            return 0
+
+        now_ms = int(time.time() * 1000)
+        snapshot = {
+            "name": str(promoter_snapshot.get("name", "")),
+            "amount": promoter_snapshot.get("amount", 0),
+            "profile_image_url": promoter_snapshot.get("profile_image_url", "") or "",
+            "added_at": promoter_snapshot.get("added_at", now_ms),
+            "updated_at": now_ms,
+        }
+
+        # 1) List all groups
+        list_url = f"{self.database_url}/groups.json?auth={self.auth_token}"
+        try:
+            resp = requests.get(list_url, timeout=12)
+            if resp.status_code != 200:
+                print(f"[GROUP] upsert_custom_promoter_into_all_groups list failed: status={resp.status_code}")
+                return 0
+            groups = resp.json() or {}
+            if not isinstance(groups, dict):
+                return 0
+        except Exception as e:
+            print(f"[GROUP] upsert_custom_promoter_into_all_groups list error: {e}")
+            return 0
+
+        # 2) Patch into each group
+        count = 0
+        for gid in list(groups.keys()):
+            try:
+                url = f"{self.database_url}/groups/{gid}/custom_promoters/{promoter_id}.json?auth={self.auth_token}"
+                r = requests.patch(url, json=snapshot, timeout=10)
+                if r.status_code == 200:
+                    count += 1
+                else:
+                    # Helpful debug for permission issues
+                    if r.status_code in (401, 403):
+                        print(f"[GROUP] custom_promoter write denied for group={gid} status={r.status_code} (check RTDB rules)")
+            except Exception as e:
+                print(f"[GROUP] upsert_custom_promoter_into_all_groups -> {gid} error: {e}")
+
+        return count
+
+    def mark_messages_as_seen(self, chat_id, user_id):
+        """Mark all messages in a chat as seen by the user
+
+        Supports:
+          - Normal private chat: /chats/<chatId>/messages
+          - Custom promoter thread: chat_id starts with CP__<promoterId>__<threadUserId>
+        """
+        try:
+            # Route CP threads correctly
+            if isinstance(chat_id, str) and chat_id.startswith("CP__"):
+                parts = chat_id.split("__", 2)
+                promoter_id = parts[1] if len(parts) > 1 else ""
+                thread_user_id = parts[2] if len(parts) > 2 else ""
+                if not promoter_id or not thread_user_id:
+                    return False
+                base = f"{self.database_url}/custom_promoter_threads/{promoter_id}/{thread_user_id}/messages"
+                url = f"{base}.json?auth={self.auth_token}"
+            else:
+                base = f"{self.database_url}/chats/{chat_id}/messages"
+                url = f"{base}.json?auth={self.auth_token}"
+
+            response = requests.get(url, timeout=15)
+            if response.status_code != 200:
+                return False
+
+            messages = response.json()
+            if not isinstance(messages, dict) or not messages:
+                return True
+
+            for msg_id, msg_data in messages.items():
+                if not isinstance(msg_data, dict):
+                    continue
+                # Mark as seen if message is not from current user and not already seen
+                if str(msg_data.get("sender_id", "")) != str(user_id) and not msg_data.get("seen", False):
+                    seen_url = f"{base}/{msg_id}/seen.json?auth={self.auth_token}"
+                    try:
+                        requests.put(seen_url, json=True, timeout=10)
+                    except Exception:
+                        pass
+            return True
+        except Exception:
+            return False
     def store_user_token(self, user_id, email, username, refresh_token):
         """Store user refresh token in database for OTP login"""
         url = f"{self.database_url}/user_tokens/{user_id}.json?auth={self.auth_token}"
@@ -3990,12 +4777,16 @@ def main(page: ft.Page):
     group_icon_file_picker = ft.FilePicker()
     private_chat_file_picker = ft.FilePicker()
     group_chat_file_picker = ft.FilePicker()
+    custom_promoter_file_picker = ft.FilePicker()  # ✅ NEW: for Settings → Add Promoter
+    custom_promoter_edit_file_picker = ft.FilePicker()  # ✅ NEW: for Settings → Edit Promoter
 
     page.overlay.extend([
         profile_file_picker,
         group_icon_file_picker,
         private_chat_file_picker,
-        group_chat_file_picker
+        group_chat_file_picker,
+        custom_promoter_file_picker,
+        custom_promoter_edit_file_picker
     ])
         
     # OTP Views for Sign In and Sign Up
@@ -4154,7 +4945,7 @@ def main(page: ft.Page):
                             db = FirebaseDatabase(FIREBASE_CONFIG['databaseURL'], auth.id_token)
                             storage = FirebaseStorage(FIREBASE_CONFIG['storageBucket'], auth.id_token)
                             db.create_user_profile(auth.user_id, auth.email, username)
-                            db.store_user_token(auth.user_id, auth.email, username, auth.refresh_token)
+                            _safe_store_user_token(db, auth.user_id, auth.email, username, auth.refresh_token)
 
                             current_username = username
                             is_admin = (auth.email == ADMIN_EMAIL)
@@ -4179,14 +4970,14 @@ def main(page: ft.Page):
                                     storage = FirebaseStorage(FIREBASE_CONFIG['storageBucket'], auth.id_token)
                                     
                                     # Check if profile exists
-                                    profile = db.get_user_profile(auth.user_id)
+                                    profile = _safe_get_user_profile(db, auth.user_id)
                                     if profile and profile.get('username'):
                                         current_username = profile['username']
                                     else:
                                         current_username = username
                                         db.create_user_profile(auth.user_id, auth.email, username)
                                     
-                                    db.store_user_token(auth.user_id, auth.email, current_username, auth.refresh_token)
+                                    _safe_store_user_token(db, auth.user_id, auth.email, current_username, auth.refresh_token)
                                     
                                     is_admin = (auth.email == ADMIN_EMAIL)
                                     user_is_group_admin = False
@@ -4267,14 +5058,14 @@ def main(page: ft.Page):
                             db = FirebaseDatabase(FIREBASE_CONFIG['databaseURL'], auth.id_token)
                             storage = FirebaseStorage(FIREBASE_CONFIG['storageBucket'], auth.id_token)
 
-                            profile = db.get_user_profile(auth.user_id)
+                            profile = _safe_get_user_profile(db, auth.user_id)
                             if profile and profile.get('username'):
                                 current_username = profile['username']
                             else:
                                 current_username = email.split('@')[0]
                                 db.create_user_profile(auth.user_id, auth.email, current_username)
                             
-                            db.store_user_token(auth.user_id, auth.email, current_username, auth.refresh_token)
+                            _safe_store_user_token(db, auth.user_id, auth.email, current_username, auth.refresh_token)
 
                             is_admin = (auth.email == ADMIN_EMAIL)
                             user_is_group_admin = False
@@ -4310,7 +5101,7 @@ def main(page: ft.Page):
                                     # Auto-generate username from email
                                     auto_username = email.split('@')[0]
                                     db.create_user_profile(auth.user_id, auth.email, auto_username)
-                                    db.store_user_token(auth.user_id, auth.email, auto_username, auth.refresh_token)
+                                    _safe_store_user_token(db, auth.user_id, auth.email, auto_username, auth.refresh_token)
 
                                     current_username = auto_username
                                     is_admin = (auth.email == ADMIN_EMAIL)
@@ -4538,7 +5329,7 @@ def main(page: ft.Page):
         if current_username is None or (isinstance(current_username, str) and len(current_username) == 0):
             # Try to get from profile first
             try:
-                temp_profile = db.get_user_profile(auth.user_id)
+                temp_profile = _safe_get_user_profile(db, auth.user_id)
                 if temp_profile and temp_profile.get('username'):
                     current_username = temp_profile['username']
                 else:
@@ -4566,7 +5357,7 @@ def main(page: ft.Page):
         
         # ADD THESE CACHE TRACKING DICTIONARIES HERE:
         members_cache = {"loaded": False}
-        private_chats_cache = {"loaded": False, "data": []}
+        private_chats_cache = {"loaded": False, "data": [], "refresh_running": False, "refresh_pending": False, "refresh_last_ms": 0}
         
         def safe_number(value, default=0):
             """Ensure no NaN or Infinity values"""
@@ -4624,7 +5415,7 @@ def main(page: ft.Page):
         # Load current user profile - WITH DEBUGGING
         print(f"\n[PROFILE LOAD] ===== LOADING PROFILE =====")
         print(f"[PROFILE LOAD] User ID: {auth.user_id}")
-        profile = db.get_user_profile(auth.user_id)
+        profile = _safe_get_user_profile(db, auth.user_id)
         print(f"[PROFILE LOAD] Profile loaded: {profile is not None}")
         
         if profile:
@@ -4810,7 +5601,7 @@ def main(page: ft.Page):
                         if total_unread > 0:
                             unread_private_messages["count"] = total_unread
                             print(f"[NOTIFICATION BADGE] From cache: {total_unread}")
-                            update_notification_badge()
+                            _private_ui(update_notification_badge)
                     
                     if not NetworkChecker.is_online():
                         print("[NOTIFICATION BADGE] Offline, using cache only")
@@ -4819,7 +5610,7 @@ def main(page: ft.Page):
                     print(f"[NOTIFICATION BADGE] Fetching fresh data for user: {auth.user_id}")
                     
                     # ✅ FIX 4: Use same logic as load_private_chats - count unseen messages
-                    all_users = db.get_all_users()
+                    all_users = _safe_get_all_users(db)
                     total_unread = 0
                     chats_with_unread = 0
                     
@@ -4831,7 +5622,7 @@ def main(page: ft.Page):
                         chat_id = create_chat_id(auth.user_id, user['id'])
                         
                         # Check if chat is accepted
-                        status = db.get_chat_status(chat_id)
+                        status = _safe_get_chat_status(db, chat_id)
                         if status != "accepted":
                             continue
                         
@@ -5094,9 +5885,14 @@ def main(page: ft.Page):
             
             # Create chat ID
             chat_id = create_chat_id(auth.user_id, user['id'])
-            
+
+            # Custom promoters are not real accounts; open chat directly (no request/accept flow)
+            if user.get("is_custom_promoter") or str(user.get("id", "")).startswith("cp_"):
+                open_chat(user)
+                return
+
             # Check if chat already exists and is accepted
-            status = db.get_chat_status(chat_id)
+            status = _safe_get_chat_status(db, chat_id)
             requester = db.get_chat_requester(chat_id)
             if status == "rejected":
                 show_snackbar("Your previous message request was rejected.")
@@ -5126,7 +5922,7 @@ def main(page: ft.Page):
                     return
                 
                 # Check again in case status changed
-                current_status = db.get_chat_status(chat_id)
+                current_status = _safe_get_chat_status(db, chat_id)
                 if current_status == "accepted":
                     show_snackbar("Chat already exists!")
                     dialog.open = False
@@ -5299,9 +6095,14 @@ def main(page: ft.Page):
                     group_desc = group.get('description', '')
                     group_icon_url = group.get('icon_url')
                     group_icon_emoji = group.get('icon', '👥')
-                    member_count = group.get('member_count', 0)
                     category = group.get('category', 'None')
                     members = group.get('members', {}) or {}
+                    custom_promoters = group.get('custom_promoters', {}) or {}
+                    try:
+                        custom_count = len(custom_promoters) if isinstance(custom_promoters, (dict, list)) else 0
+                    except Exception:
+                        custom_count = 0
+                    member_count = len(members) + custom_count
                     is_member = auth.user_id in members
 
                     category_styles = {
@@ -5459,23 +6260,238 @@ def main(page: ft.Page):
             
             group_header_text.value = f"{group_info_data.get('name', 'Group')}"
             group_member_count.value = f"{len(members)} members"
+
+            # Custom promoters load async; update member count when available
+            def _update_member_count_with_custom(custom_items):
+                try:
+                    total = len(members) + (len(custom_items) if custom_items else 0)
+                    group_member_count.value = f"{total} members"
+                except Exception:
+                    pass
+
+            # Update count in the chat header immediately (without waiting for user to open Group Info)
+            def _bg_count_refresh():
+                try:
+                    items2 = db.get_group_custom_promoters_by_id(group_id) or []
+                except Exception:
+                    items2 = []
+                _update_member_count_with_custom(items2)
+                try:
+                    page.update()
+                except Exception:
+                    pass
+
+            try:
+                threading.Thread(target=_bg_count_refresh, daemon=True).start()
+            except Exception:
+                pass
             
             # Show group info dialog function
             def show_group_info_dialog(e):
                 members_preview = ft.Column(spacing=5)
-                for member in members[:15]:
-                    uname = member.get("username", "User")
-                    is_admin_badge = " 👑" if member.get("is_admin") else ""
-                    members_preview.controls.append(
-                        ft.Text(f"• {uname}{is_admin_badge}", size=13)
-                    )
                 
-                if len(members) > 15:
-                    members_preview.controls.append(
-                        ft.Text(f"... and {len(members) - 15} more", size=12, color="grey", italic=True)
-                    )
+
                 
+                # Title for members section (value will be updated after custom promoters load)
+                members_title = ft.Text(f"{len(members)} Members", size=15, weight="bold")
+
+                def _rebuild_members_preview(custom_items):
+                    """For non-creator viewers: show custom promoters inside the same members list."""
+                    members_preview.controls.clear()
+
+                    combined = []
+                    for m in members or []:
+                        combined.append(("member", m))
+                    # For non-admin/creator: include custom promoters as members
+                    if not is_admin:
+                        for c in (custom_items or []):
+                            combined.append(("custom", c))
+
+                    MAX_PREVIEW = 30
+                    for typ, item in combined[:MAX_PREVIEW]:
+                        if typ == "member":
+                            uname = item.get("username", "User")
+                            is_admin_badge = " 👑" if item.get("is_admin") else ""
+                            members_preview.controls.append(ft.Text(f"• {uname}{is_admin_badge}", size=13))
+                        else:
+                            pname = item.get("name", "Promoter")
+                            p_admin_badge = " 👑" if item.get("is_admin") else ""
+                            members_preview.controls.append(ft.Text(f"• {pname}{p_admin_badge}", size=13))
+
+                    if len(combined) > MAX_PREVIEW:
+                        members_preview.controls.append(
+                            ft.Text(f"... and {len(combined) - MAX_PREVIEW} more", size=12, color="grey", italic=True)
+                        )
+
+                _rebuild_members_preview([])
+# Custom promoters preview (loaded async)
+                custom_promoters_preview = ft.Column(spacing=6)
+                custom_promoters_preview.controls.append(
+                    ft.Text("Loading custom promoters...", size=12, color="grey")
+                )
+
+                # Show custom promoters as a separate section ONLY for creator (admin email).
+                custom_section_controls = []
+                custom_title = None
+                if is_admin:
+                    custom_title = ft.Text("🏆 Custom Promoters", size=15, weight="bold")
+                    custom_section_controls = [
+                        ft.Container(height=15),
+                        custom_title,
+                        ft.Container(height=5),
+                        ft.Container(
+                            content=custom_promoters_preview,
+                            height=200,
+                            padding=10,
+                            border=ft.border.all(1, "#E0E0E0"),
+                            border_radius=8
+                        ),
+                    ]
+
+
+                def _format_amount(val):
+                    try:
+                        return f"₹{int(float(val)):,}"
+                    except Exception:
+                        return "₹0"
+
+                def _build_custom_promoter_row(item):
+                    name = (item.get("name") or "").strip() or "Promoter"
+                    amt = _format_amount(item.get("amount", 0))
+                    photo_url = item.get("profile_image_url")
+
+                    avatar = None
+                    if photo_url:
+                        cached = ImageCache.get_cached_image(photo_url, "custom_promoter")
+                        avatar_src = cached or photo_url
+                        avatar = ft.CircleAvatar(
+                            foreground_image_src=avatar_src,
+                            radius=16,
+                        )
+                    else:
+                        avatar = ft.CircleAvatar(
+                            content=ft.Text(name[:1].upper(), size=14, weight="bold"),
+                            radius=16,
+                        )
+
+                    return ft.Container(
+                        content=ft.Row(
+                            [
+                                avatar,
+                                ft.Column(
+                                    [
+                                        ft.Text(name, size=13, weight="bold"),
+                                    ],
+                                    spacing=0,
+                                    expand=True,
+                                ),
+                                ft.Text(amt, size=13, weight="bold"),
+                            ],
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                        padding=ft.padding.symmetric(vertical=4, horizontal=2),
+                    )
+
+                def _load_group_custom_promoters():
+                    # NOTE: this runs in a background thread. Do NOT update UI directly here.
+                    try:
+                        items = db.get_group_custom_promoters_by_id(group_id) or []
+                    except Exception as ex:
+                        print(f"[CUSTOM PROMOTER] load group custom promoters failed: {ex}")
+                        items = []
+
+                    def _apply_ui_update():
+                        try:
+                            # Update header member count (members + custom promoters)
+                            _update_member_count_with_custom(items)
+
+                            # Update members section title + list
+                            if is_admin:
+                                # Keep members title as real members only; update custom title with count
+                                try:
+                                    if custom_title is not None:
+                                        custom_title.value = f"🏆 Custom Promoters ({len(items)})"
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    members_title.value = f"{len(members) + len(items)} Members"
+                                except Exception:
+                                    pass
+                                try:
+                                    _rebuild_members_preview(items)
+                                except Exception:
+                                    pass
+
+                            custom_promoters_preview.controls.clear()
+                            if not items:
+                                custom_promoters_preview.controls.append(
+                                    ft.Text("No custom promoters in this group.", size=12, color="grey")
+                                )
+                            else:
+                                # Show up to 30 for readability
+                                for item in items[:30]:
+                                    custom_promoters_preview.controls.append(_build_custom_promoter_row(item))
+                                if len(items) > 30:
+                                    custom_promoters_preview.controls.append(
+                                        ft.Text(f"... and {len(items) - 30} more", size=12, color="grey", italic=True)
+                                    )
+
+                            page.update()
+                        except Exception as ex2:
+                            # Don't crash silently — print the real reason
+                            print(f"[CUSTOM PROMOTER] UI update failed: {type(ex2).__name__}: {ex2!r}")
+                            try:
+                                traceback.print_exc()
+                            except Exception:
+                                pass
+
+                    # Run UI update on the main/UI thread (Flet requires it)
+                    try:
+                        if hasattr(page, "call_from_thread"):
+                            page.call_from_thread(_apply_ui_update)
+                        elif hasattr(page, "invoke_later"):
+                            page.invoke_later(_apply_ui_update)
+                        else:
+                            # Fallback (older Flet) – may still work
+                            _apply_ui_update()
+                    except Exception:
+                        try:
+                            _apply_ui_update()
+                        except Exception:
+                            pass
+
+                threading.Thread(target=_load_group_custom_promoters, daemon=True).start()
+
                 # Admin buttons
+
+                def _open_edit_group_info_from_info(ev):
+                    try:
+                        dialog.open = False
+                        page.update()
+                        show_edit_specific_group_info(group_id)
+                    except Exception as ex:
+                        print(f"[GROUP INFO] Edit Group Info open error: {type(ex).__name__}: {ex!r}")
+                        traceback.print_exc()
+                        try:
+                            show_snackbar(f"Edit Group Info error: {type(ex).__name__}: {ex}")
+                        except Exception:
+                            pass
+
+                def _open_manage_members_from_info(ev):
+                    try:
+                        dialog.open = False
+                        page.update()
+                        show_specific_group_management(group_id)
+                    except Exception as ex:
+                        print(f"[GROUP INFO] Manage Members open error: {type(ex).__name__}: {ex!r}")
+                        traceback.print_exc()
+                        try:
+                            show_snackbar(f"Manage Members error: {type(ex).__name__}: {ex}")
+                        except Exception:
+                            pass
+
                 admin_buttons = []
                 if is_admin or user_is_group_admin:
                     # Edit group info
@@ -5483,14 +6499,14 @@ def main(page: ft.Page):
                         ft.Container(height=15),
                         ft.ElevatedButton(
                             "✏️ Edit Group Info",
-                            on_click=lambda e: (setattr(dialog, 'open', False), page.update(), show_edit_specific_group_info(group_id)),
+                            on_click=_open_edit_group_info_from_info,
                             bgcolor="#FF9800",
                             color="white"
                         ),
                         ft.Container(height=10),
                         ft.ElevatedButton(
                             "👥 Manage Members",
-                            on_click=lambda e: (setattr(dialog, 'open', False), page.update(), show_specific_group_management(group_id)),
+                            on_click=_open_manage_members_from_info,
                             bgcolor="#9C27B0",
                             color="white"
                         ),
@@ -5566,7 +6582,7 @@ def main(page: ft.Page):
                             ft.Text(group_info_data.get("name", "Group"), size=20, weight="bold", text_align="center"),
                             ft.Text(group_info_data.get("description", ""), size=13, color="grey", text_align="center"),
                             ft.Container(height=15),
-                            ft.Text(f"{len(members)} Members", size=15, weight="bold"),
+                            members_title,
                             ft.Container(height=5),
                             ft.Container(
                                 content=members_preview,
@@ -5574,7 +6590,7 @@ def main(page: ft.Page):
                                 padding=10,
                                 border=ft.border.all(1, "#E0E0E0"),
                                 border_radius=8
-                            ),
+                            ),                            *custom_section_controls,
                             *admin_buttons
                         ], horizontal_alignment="center", scroll="auto"),
                         width=350,
@@ -5639,7 +6655,7 @@ def main(page: ft.Page):
 
                 if not messages:
                     group_messages_list.controls.append(
-                        ft.Container(content=ft.Text(""), padding=20)
+                        ft.Container(content=ft.Text("No messages yet", size=12, color="grey", text_align="center"), padding=20)
                     )
                 else:
                     for msg in messages:
@@ -6002,19 +7018,51 @@ def main(page: ft.Page):
                 print(f"Error getting group members: {ex}")
                 members = []
 
+            # Fetch custom promoters stored inside this group
+            try:
+                custom_promoters = db.get_group_custom_promoters_by_id(group_id) or []
+            except Exception as ex:
+                print(f"Error getting group custom promoters: {ex}")
+                custom_promoters = []
+
             members_column = ft.Column(scroll="auto", expand=True, spacing=5)
 
             def reload_members():
-                """Reload member list from DB and refresh UI"""
-                nonlocal members
+                """Reload member + custom promoter lists from DB and refresh UI"""
+                nonlocal members, custom_promoters
                 try:
                     members = db.get_group_members_by_id(group_id) or []
                 except Exception as ex:
                     print(f"Error refreshing members: {ex}")
+                    members = []
+                try:
+                    custom_promoters = db.get_group_custom_promoters_by_id(group_id) or []
+                except Exception as ex:
+                    print(f"Error refreshing group custom promoters: {ex}")
+                    custom_promoters = []
                 build_members_ui()
 
             def build_members_ui():
                 members_column.controls.clear()
+
+                # Summary / counts
+                total_count = len(members) + (len(custom_promoters) if custom_promoters else 0)
+                members_column.controls.append(
+                    ft.Container(
+                        content=ft.Text(f"Total shown: {total_count}", size=12, color="grey"),
+                        padding=ft.padding.only(left=10, right=10, top=5, bottom=5),
+                    )
+                )
+
+                # ------------------------------
+                # REAL MEMBERS SECTION
+                # ------------------------------
+                members_column.controls.append(
+                    ft.Container(
+                        content=ft.Text(f"👥 Members ({len(members)})", size=16, weight="bold"),
+                        padding=ft.padding.only(left=10, right=10, top=10, bottom=5),
+                    )
+                )
 
                 if not members:
                     members_column.controls.append(
@@ -6087,7 +7135,7 @@ def main(page: ft.Page):
                                             ),
                                             actions=[
                                                 ft.TextButton("Cancel", on_click=cancel),
-                                                ft.ElevatedButton("Remove", on_click=do_remove, bgcolor="red", color="white"),
+                                                ft.ElevatedButton("Remove", on_click=do_remove, bgcolor="#D32F2F", color="white"),
                                             ],
                                             actions_alignment=ft.MainAxisAlignment.END,
                                         )
@@ -6111,23 +7159,173 @@ def main(page: ft.Page):
                                         ft.Column(
                                             [
                                                 ft.Text(uname, size=14, weight="bold"),
-                                                ft.Text(uid, size=11, color="grey"),
+                                                ft.Row([role_chip], spacing=6),
                                             ],
-                                            spacing=0,
+                                            spacing=2,
                                             expand=True,
                                         ),
-                                        role_chip,
-                                        *actions,
+                                        ft.Row(actions, spacing=5),
                                     ],
                                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                                 ),
-                                padding=10,
+                                padding=ft.padding.symmetric(horizontal=10, vertical=8),
+                                border=ft.border.all(1, "#E0E0E0"),
+                                border_radius=8,
+                            )
+                        )
+
+                # ------------------------------
+                # CUSTOM PROMOTERS SECTION
+                # ------------------------------
+                members_column.controls.append(ft.Divider(height=20))
+                members_column.controls.append(
+                    ft.Container(
+                        content=ft.Text(f"🏆 Custom Promoters ({len(custom_promoters)})", size=16, weight="bold"),
+                        padding=ft.padding.only(left=10, right=10, top=5, bottom=5),
+                    )
+                )
+                members_column.controls.append(
+                    ft.Container(
+                        content=ft.Text(
+                            "These are non-login profiles (added by creator) stored under the group.",
+                            size=12,
+                            color="grey",
+                        ),
+                        padding=ft.padding.only(left=10, right=10, bottom=5),
+                    )
+                )
+
+                if not custom_promoters:
+                    members_column.controls.append(
+                        ft.Container(
+                            content=ft.Text("No custom promoters in this group.", size=14, color="grey"),
+                            padding=20
+                        )
+                    )
+                else:
+                    for p in custom_promoters:
+                        pname = p.get("name") or p.get("username") or "Promoter"
+                        pid = p.get("id") or p.get("pid") or ""
+                        p_admin = bool(p.get("is_admin", False))
+                        pic_url = p.get("profile_image_url") or p.get("photo_url") or ""
+                        try:
+                            amt = int(float(p.get("amount", 0) or 0))
+                        except Exception:
+                            amt = 0
+
+                        role_chip = ft.Container(
+                            content=ft.Text(
+                                "PROMOTER ADMIN" if p_admin else "PROMOTER",
+                                size=10,
+                                color="white"
+                            ),
+                            bgcolor="#6A1B9A" if p_admin else "#8E24AA",
+                            padding=ft.padding.symmetric(horizontal=8, vertical=2),
+                            border_radius=10
+                        )
+
+                        actions = []
+                        if user_is_group_admin or is_admin:
+                            # Toggle promoter admin (group-local)
+                            def make_toggle_promoter_admin_handler(target_pid, current_is_admin):
+                                def handler(e):
+                                    new_val = not current_is_admin
+                                    ok = db.update_group_custom_promoter(group_id, target_pid, {"is_admin": new_val})
+                                    if ok:
+                                        show_snackbar("Promoter admin status updated")
+                                        reload_members()
+                                    else:
+                                        show_snackbar("Failed to update promoter admin status")
+                                return handler
+
+                            toggle_admin_btn = ft.TextButton(
+                                "Make Admin" if not p_admin else "Remove Admin",
+                                on_click=make_toggle_promoter_admin_handler(pid, p_admin),
+                            )
+
+                            # Remove promoter from this group only
+                            def make_remove_promoter_handler(target_pid, target_name):
+                                def handler(e):
+                                    def do_remove(ev):
+                                        confirm_dialog.open = False
+                                        page.update()
+                                        ok = db.remove_group_custom_promoter(group_id, target_pid)
+                                        if ok:
+                                            show_snackbar(f"Removed {target_name} from group")
+                                            reload_members()
+                                        else:
+                                            show_snackbar("Failed to remove promoter from group")
+
+                                    def cancel(ev):
+                                        confirm_dialog.open = False
+                                        page.update()
+
+                                    confirm_dialog = ft.AlertDialog(
+                                        title=ft.Text("Remove custom promoter?", size=18, weight="bold"),
+                                        content=ft.Text(
+                                            f"Remove {target_name} from this group only? (This will NOT delete it from Settings.)",
+                                            size=14
+                                        ),
+                                        actions=[
+                                            ft.TextButton("Cancel", on_click=cancel),
+                                            ft.ElevatedButton("Remove", on_click=do_remove, bgcolor="#D32F2F", color="white"),
+                                        ],
+                                        actions_alignment=ft.MainAxisAlignment.END,
+                                    )
+                                    page.dialog = confirm_dialog
+                                    confirm_dialog.open = True
+                                    page.update()
+                                return handler
+
+                            remove_btn = ft.TextButton(
+                                "Remove",
+                                on_click=make_remove_promoter_handler(pid, pname),
+                            )
+                            actions.extend([toggle_admin_btn, remove_btn])
+
+                        # Avatar: image if available, else initials
+                        if pic_url:
+                            avatar = ft.CircleAvatar(foreground_image_src=pic_url, radius=18)
+                        else:
+                            avatar = ft.CircleAvatar(content=ft.Text(pname[:1].upper()), radius=18)
+
+                        members_column.controls.append(
+                            ft.Container(
+                                content=ft.Row(
+                                    [
+                                        avatar,
+                                        ft.Column(
+                                            [
+                                                ft.Row(
+                                                    [
+                                                        ft.Text(pname, size=14, weight="bold"),
+                                                        ft.Text(" 👑" if p_admin else "", size=12),
+                                                    ],
+                                                    spacing=0,
+                                                ),
+                                                ft.Row(
+                                                    [
+                                                        role_chip,
+                                                        ft.Text(f"₹{amt:,}", size=12, color="grey"),
+                                                    ],
+                                                    spacing=8,
+                                                ),
+                                            ],
+                                            spacing=2,
+                                            expand=True,
+                                        ),
+                                        ft.Row(actions, spacing=5),
+                                    ],
+                                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                                ),
+                                padding=ft.padding.symmetric(horizontal=10, vertical=8),
                                 border=ft.border.all(1, "#E0E0E0"),
                                 border_radius=8,
                             )
                         )
 
                 page.update()
+
 
             # Build initial members list
             build_members_ui()
@@ -7696,6 +8894,27 @@ def main(page: ft.Page):
                                     # If user is admin in any group, mark them as admin
                                     members_dict[user_id]['is_admin'] = True
                     
+                            # Include custom promoters as pseudo-users (so they appear in Members tab with chat icon)
+                            fn_cp = getattr(db, "get_group_custom_promoters_by_id", None)
+                            group_promoters = fn_cp(group_id) if callable(fn_cp) else []
+                            for p in (group_promoters or []):
+                                pid = p.get("id")
+                                if not pid:
+                                    continue
+                                cp_uid = f"cp_{pid}"
+                                if cp_uid not in members_dict:
+                                    members_dict[cp_uid] = {
+                                        "id": cp_uid,
+                                        "username": p.get("name") or p.get("username") or "Promoter",
+                                        "email": "",
+                                        "is_admin": bool(p.get("is_admin", False)),
+                                        "profile_image_url": p.get("profile_image_url") or p.get("profile_pic_url") or "",
+                                        "is_custom_promoter": True,
+                                        "promoter_id": pid,
+                                        "amount": p.get("amount", 0),
+                                    }
+                                elif p.get("is_admin", False):
+                                    members_dict[cp_uid]["is_admin"] = True
                     members = list(members_dict.values())
                     
                     # Save to cache
@@ -7811,35 +9030,53 @@ def main(page: ft.Page):
                 if user['id'] == auth.user_id:
                     continue
                 
+                is_custom = user.get("is_custom_promoter") or str(user.get("id", "")).startswith("cp_")
                 uname = user.get("username") or user.get("email", "User").split("@")[0]
                 is_admin_badge = user.get("is_admin", False)
-                
+                subtitle_text = user.get("email", "") or ""
+
                 # Avatar
                 avatar = ft.Container(
                     content=ft.Text(uname[0].upper(), size=16, color="white"),
                     width=40, height=40, bgcolor="#2196F3", border_radius=20,
                     alignment=ft.alignment.center
                 )
-                
+
                 # Load profile image from cache
-                user_profile = db.get_user_profile(user['id'])
-                if user_profile and user_profile.get('profile_image_url'):
-                    cached_path = ImageCache.get_cached_image(user_profile['profile_image_url'], "profile")
+                # - Normal users: pull from /users/<uid>/profile_image_url (if available)
+                # - Custom promoters: use their stored profile_image_url directly
+                profile_url = ""
+                if is_custom:
+                    profile_url = user.get("profile_image_url") or ""
+                else:
+                    user_profile = _safe_get_user_profile(db, user['id'])
+                    if user_profile:
+                        profile_url = user_profile.get("profile_image_url") or ""
+
+                if profile_url:
+                    cached_path = ImageCache.get_cached_image(profile_url, "profile")
                     if cached_path:
                         avatar = ft.Image(
                             src=cached_path, width=40, height=40,
                             fit=ft.ImageFit.COVER, border_radius=20
                         )
-                
+                    else:
+                        # Fallback: show remote image directly (fixes custom promoter pics in Members tab)
+                        try:
+                            avatar = ft.CircleAvatar(foreground_image_src=profile_url, radius=20)
+                        except Exception:
+                            # If CircleAvatar API differs, still keep the letter avatar
+                            pass
+
                 member_row = ft.Container(
                     content=ft.Row([
                         avatar,
                         ft.Column([
                             ft.Row([
                                 ft.Text(uname, size=14, weight="bold"),
-                                ft.Text(" 👑", size=12) if is_admin_badge else ft.Container()
+                                                                ft.Text(" 👑", size=12) if is_admin_badge else ft.Container()
                             ], spacing=5),
-                            ft.Text(user.get("email", ""), size=11, color="grey")
+                            ft.Text(subtitle_text, size=11, color="grey") if subtitle_text else ft.Container()
                         ], spacing=2, expand=True),
                         ft.IconButton(
                             icon=ft.Icons.MESSAGE,
@@ -7863,6 +9100,20 @@ def main(page: ft.Page):
             private_chats_cache["loaded"] = True 
             
             private_chats_column.controls.clear()
+
+            # ✅ Thread-safe UI updates for background refresh (prevents duplicate/unstable rendering)
+            def _private_ui(fn):
+                try:
+                    if hasattr(page, "call_from_thread"):
+                        page.call_from_thread(fn)
+                    else:
+                        fn()
+                except Exception:
+                    try:
+                        fn()
+                    except Exception:
+                        pass
+
             
             # Step 1: Load from cache immediately
             cached_chats = CacheManager.load_from_cache('private_chats')
@@ -7890,66 +9141,301 @@ def main(page: ft.Page):
                     if not NetworkChecker.is_online():
                         print("Offline - using cache only")
                         if not cached_chats:
-                            private_chats_column.controls.clear()
-                            private_chats_column.controls.append(
-                                ft.Container(
-                                    content=ft.Column([
-                                        ft.Icon(ft.Icons.CLOUD_OFF, size=50, color="orange"),
-                                        ft.Text("You're offline", size=16, weight="bold"),
-                                    ], horizontal_alignment="center", spacing=10),
-                                    padding=40
+                            def _show_offline():
+                                private_chats_column.controls.clear()
+                                private_chats_column.controls.append(
+                                    ft.Container(
+                                        content=ft.Column([
+                                            ft.Icon(ft.Icons.CLOUD_OFF, size=50, color="orange"),
+                                            ft.Text("You're offline", size=16, weight="bold"),
+                                        ], horizontal_alignment="center", spacing=10),
+                                        padding=40
+                                    )
                                 )
-                            )
-                            page.update()
+                                page.update()
+                            _private_ui(_show_offline)
                         return
 
-                    all_users = db.get_all_users()
                     accepted_chats = []
+                    
+                    # ✅ FAST: Only load chats that actually exist (instead of looping all users)
+                    chat_keys = _safe_db_get_shallow(db, "chats") or {}
+                    if not isinstance(chat_keys, dict):
+                        chat_keys = {}
 
-                    for user in all_users:
-                        if user['id'] == auth.user_id:
+                    my_chat_pairs = []   # (chat_id, other_uid)
+                    other_uids = set()
+
+                    for chat_id in chat_keys.keys():
+                        if not isinstance(chat_id, str) or "_" not in chat_id:
                             continue
 
-                        chat_id = create_chat_id(auth.user_id, user['id'])
-                        status = db.get_chat_status(chat_id)
+                        parts = chat_id.split("_")
+                        if len(parts) < 2:
+                            continue
+
+                        uid1 = parts[0]
+                        uid2 = "_".join(parts[1:])  # safe if any extra underscores
+                        if str(auth.user_id) not in (str(uid1), str(uid2)):
+                            continue
+
+                        other_uid = uid2 if str(uid1) == str(auth.user_id) else uid1
+                        my_chat_pairs.append((chat_id, other_uid))
+                        other_uids.add(other_uid)
+
+                    # ✅ Fetch only needed user profiles (not all users)
+                    user_map = {}
+                    for uid in other_uids:
+                        prof = _safe_get_user_profile(db, uid) or {}
+                        uname = (prof.get("username") or prof.get("name") or prof.get("email") or "User")
+                        user_map[uid] = {
+                            "id": uid,
+                            "username": str(uname).strip(),
+                            "email": prof.get("email", "") or "",
+                            "profile_image_url": prof.get("profile_image_url", "") or "",
+                        }
+
+                    for chat_id, other_uid in my_chat_pairs:
+                        status = _safe_get_chat_status(db, chat_id)
                         requester = db.get_chat_requester(chat_id)
 
                         include_chat = False
                         is_request = False
 
-                        # Show accepted chats for both sides
                         if status == "accepted":
                             include_chat = True
-                        # Show pending chats only to the receiver as a 'request'
                         elif status == "pending" and requester and requester != auth.user_id:
                             include_chat = True
                             is_request = True
 
-                        if include_chat:
-                            messages = db.get_messages(chat_id)
+                        if not include_chat:
+                            continue
+
+                        user = user_map.get(other_uid, {"id": other_uid, "username": "User"})
+
+                        # ✅ Prefer tiny /info (no messages download)
+                        info = _safe_db_get(db, f"chats/{chat_id}/info") or {}
+                        last_msg = None
+
+                        try:
+                            ts = int(info.get("last_message_at") or 0) if isinstance(info, dict) else 0
+                        except Exception:
+                            ts = 0
+
+                        if isinstance(info, dict) and (ts or info.get("last_message")):
+                            last_msg = {
+                                "text": str(info.get("last_message") or "No messages yet"),
+                                "timestamp": ts,
+                                "sender_id": str(info.get("last_sender_id") or ""),
+                                "sender_username": str(info.get("last_sender_name") or ""),
+                                "seen": True,
+                            }
+                            # keep unread from last cache (fast)
+                            try:
+                                unread_count = int(private_unread_counts.get(chat_id, 0) or 0)
+                            except Exception:
+                                unread_count = 0
+                        else:
+                            # Fallback for old chats that don't have /info yet (read only recent)
+                            messages = db.get_messages(chat_id, limit=50)
                             last_msg = messages[-1] if messages else None
 
-                            # ✅ DEBUG: Log message details for unread calculation
                             unread_count = 0
                             for msg in messages:
-                                sender_id = msg.get('sender_id', '')
-                                seen = msg.get('seen', False)
-                                is_from_other = sender_id != auth.user_id
-                                is_unseen = not seen
+                                try:
+                                    sender_id = str(msg.get("sender_id", ""))
+                                    seen = bool(msg.get("seen", False))
+                                    if sender_id != str(auth.user_id) and not seen:
+                                        unread_count += 1
+                                except Exception:
+                                    continue
 
-                                if is_from_other and is_unseen:
-                                    unread_count += 1
+                            # ✅ Seed /info so next time list is instant
+                            if last_msg:
+                                try:
+                                    _safe_db_patch(db, f"chats/{chat_id}/info", {
+                                        "last_message_at": int(last_msg.get("timestamp") or 0),
+                                        "last_message": str(last_msg.get("text") or ""),
+                                        "last_sender_id": str(last_msg.get("sender_id") or ""),
+                                        "last_sender_name": str(last_msg.get("sender_username") or ""),
+                                    })
+                                except Exception:
+                                    pass
 
-                            print(f"[UNREAD DEBUG] Chat {chat_id}: total_msgs={len(messages)}, unread={unread_count}")
+                        accepted_chats.append({
+                            "user": user,
+                            "last_msg": last_msg,
+                            "unread": unread_count,
+                            "chat_id": chat_id,
+                            "status": status,
+                            "is_request": is_request,
+                        })
+
+                    # ✅ ALSO include Custom Promoter threads inside Private Chats
+                    try:
+                        cp_root = _safe_db_get(db, "custom_promoter_threads") or {}
+                    except Exception:
+                        cp_root = {}
+
+                    try:
+                        existing_chat_ids = set()
+                        for _c in accepted_chats:
+                            if isinstance(_c, dict):
+                                existing_chat_ids.add(_c.get("chat_id"))
+                    except Exception:
+                        existing_chat_ids = set()
+
+                    # Only if structure looks like dict(promoter_id -> dict(user_id -> {info, messages}))
+                    if isinstance(cp_root, dict):
+                        # candidates: UID is the normal key; keep fallbacks for older builds
+                        candidates = []
+                        try:
+                            if auth.user_id:
+                                candidates.append(str(auth.user_id))
+                        except Exception:
+                            pass
+                        try:
+                            if current_username:
+                                candidates.append(str(current_username))
+                        except Exception:
+                            pass
+                        try:
+                            if getattr(auth, "email", None):
+                                candidates.append(str(auth.email))
+                        except Exception:
+                            pass
+
+                        for promoter_id, user_map in cp_root.items():
+                            if not isinstance(user_map, dict):
+                                continue
+
+                            block = None
+                            block_key = None
+                            for k in candidates:
+                                if k in user_map and isinstance(user_map.get(k), dict):
+                                    block = user_map.get(k)
+                                    block_key = k
+                                    break
+                            if not isinstance(block, dict):
+                                continue
+
+                            info = block.get("info") if isinstance(block.get("info"), dict) else {}
+
+                            # Build pseudo-user for the promoter
+                            promoter_profile = _safe_db_get(db, f"custom_promoters/{promoter_id}") or {}
+                            if not isinstance(promoter_profile, dict):
+                                promoter_profile = {}
+                            promoter_name = (
+                                promoter_profile.get("name")
+                                or promoter_profile.get("username")
+                                or info.get("promoter_name")
+                                or info.get("last_sender_name")
+                                or "Promoter"
+                            )
+                            promoter_pic = (
+                                promoter_profile.get("profile_image_url")
+                                or promoter_profile.get("profile_pic_url")
+                                or promoter_profile.get("photo_url")
+                                or ""
+                            )
+
+                            cp_uid = f"cp_{promoter_id}"
+                            cp_user = {
+                                "id": cp_uid,
+                                "username": promoter_name,
+                                "email": "",
+                                "profile_image_url": promoter_pic,
+                                "is_custom_promoter": True,
+                                "promoter_id": promoter_id,
+                            }
+
+                            # chat_id must match the exact key used under:
+                            #   /custom_promoter_threads/<promoter_id>/<thread_user_key>/...
+                            # Prefer the matched key (UID/username/email), fallback to auth.user_id.
+                            thread_user_key = str(block_key or "")
+                            if not thread_user_key:
+                                thread_user_key = str(auth.user_id or "")
+                            cp_user["thread_user_id"] = thread_user_key
+
+                            cp_chat_id = f"CP__{promoter_id}__{thread_user_key}"
+                            if cp_chat_id in existing_chat_ids:
+                                continue
+
+                            # Fetch messages via unified router
+                            messages = db.get_messages(cp_chat_id)
+                            last_msg = messages[-1] if messages else None
+
+                            # If messages missing but info exists, fabricate a last_msg for sorting/display
+                            if not last_msg and info:
+                                try:
+                                    ts = int(info.get("last_message_at") or 0)
+                                except Exception:
+                                    ts = 0
+                                last_msg = {
+                                    "text": str(info.get("last_message") or "No messages yet"),
+                                    "timestamp": ts,
+                                    "sender_id": str(info.get("last_sender_id") or ""),
+                                    "sender_username": str(info.get("last_sender_name") or ""),
+                                    "seen": True,
+                                }
+
+                            # Include only if there is *some* activity
+                            if not messages and not (info.get("last_message_at") or info.get("last_message")):
+                                continue
+
+                            # Unread count
+                            unread_count = 0
+                            for msg in (messages or []):
+                                try:
+                                    sender_id = str(msg.get("sender_id", ""))
+                                    seen = bool(msg.get("seen", False))
+                                    if sender_id != str(auth.user_id) and not seen:
+                                        unread_count += 1
+                                except Exception:
+                                    continue
 
                             accepted_chats.append({
-                                'user': user,
-                                'last_msg': last_msg,
-                                'unread': unread_count,
-                                'chat_id': chat_id,
-                                'status': status,
-                                'is_request': is_request,
+                                "user": cp_user,
+                                "last_msg": last_msg,
+                                "unread": unread_count,
+                                "chat_id": cp_chat_id,
+                                "status": "accepted",
+                                "is_request": False,
                             })
+                            existing_chat_ids.add(cp_chat_id)
+
+
+                    # ✅ De-duplicate by chat_id (prevents double listing if refresh overlaps)
+                    try:
+                        _dedup = {}
+                        for _it in accepted_chats:
+                            _cid = (_it or {}).get("chat_id")
+                            if not _cid:
+                                continue
+                            _ts = 0
+                            _lm = (_it or {}).get("last_msg") or {}
+                            if isinstance(_lm, dict):
+                                try:
+                                    _ts = int(_lm.get("timestamp") or 0)
+                                except Exception:
+                                    _ts = 0
+                            _prev = _dedup.get(_cid)
+                            if not _prev:
+                                _dedup[_cid] = _it
+                            else:
+                                _pts = 0
+                                _plm = (_prev or {}).get("last_msg") or {}
+                                if isinstance(_plm, dict):
+                                    try:
+                                        _pts = int(_plm.get("timestamp") or 0)
+                                    except Exception:
+                                        _pts = 0
+                                if _ts >= _pts:
+                                    _dedup[_cid] = _it
+                        if _dedup:
+                            accepted_chats = list(_dedup.values())
+                    except Exception:
+                        pass
 
                     # Save to cache
                     CacheManager.save_to_cache('private_chats', accepted_chats)
@@ -7968,19 +9454,51 @@ def main(page: ft.Page):
                     update_notification_badge()
 
                     # Display
-                    display_private_chats_from_cache(accepted_chats)
+                    _private_ui(lambda: display_private_chats_from_cache(accepted_chats))
 
                 except Exception as e:
                     print(f"Chats refresh error: {e}")
                     if not cached_chats:
-                        private_chats_column.controls.clear()
-                        private_chats_column.controls.append(
-                            ft.Container(content=ft.Text("Error loading chats", color="red"), padding=20)
-                        )
-                        page.update()
+                        def _show_error():
+                            private_chats_column.controls.clear()
+                            private_chats_column.controls.append(
+                                ft.Container(content=ft.Text("Error loading chats", color="red"), padding=20)
+                            )
+                            page.update()
+                        _private_ui(_show_error)
 
             # Run refresh in background so the UI isn't blocked on slow loads
-            threading.Thread(target=refresh_chats, daemon=True).start()
+
+            # Run refresh in background so the UI isn't blocked on slow loads
+            # ✅ Guard: prevent overlapping refresh threads + throttle spam tab refresh
+            now_ms = int(time.time() * 1000)
+            if private_chats_cache.get("refresh_running"):
+                private_chats_cache["refresh_pending"] = True
+                return
+
+            last_ms = int(private_chats_cache.get("refresh_last_ms", 0) or 0)
+            if force_refresh and (now_ms - last_ms) < 3000:
+                return
+
+            private_chats_cache["refresh_running"] = True
+            private_chats_cache["refresh_last_ms"] = now_ms
+
+            def _run_refresh_safe():
+                try:
+                    refresh_chats()
+                finally:
+                    def _done():
+                        private_chats_cache["refresh_running"] = False
+                        if private_chats_cache.get("refresh_pending"):
+                            private_chats_cache["refresh_pending"] = False
+                            # start one more refresh (without clearing UI)
+                            private_chats_cache["refresh_running"] = True
+                            private_chats_cache["refresh_last_ms"] = int(time.time() * 1000)
+                            threading.Thread(target=_run_refresh_safe, daemon=True).start()
+                    _private_ui(_done)
+
+            threading.Thread(target=_run_refresh_safe, daemon=True).start()
+
 
 
         def display_private_chats_from_cache(accepted_chats):
@@ -8074,7 +9592,7 @@ def main(page: ft.Page):
 
                     # Avatar from cache
                     cached_path = None
-                    user_profile = db.get_user_profile(user['id'])
+                    user_profile = _safe_get_user_profile(db, user['id'])
                     if user_profile and user_profile.get('profile_image_url'):
                         cached_path = ImageCache.get_cached_image(user_profile['profile_image_url'], "profile")
 
@@ -8332,7 +9850,7 @@ def main(page: ft.Page):
                 print(f"[HOF] Matching {len(promoters_data)} promoters with Firebase...")
                 
                 # Get all users from Firebase
-                all_users = db.get_all_users()
+                all_users = _safe_get_all_users(db)
                 
                 if not all_users:
                     print("[HOF] No users found in Firebase")
@@ -8396,25 +9914,76 @@ def main(page: ft.Page):
             try:
                 hof_state["loading"] = True
                 hof_state["scope"] = scope
-                
+
                 print("[HOF] Loading real data...")
-                
-                # Get top promoters from sheets
+
+                # 1) Base list from Sheets (referral_id + earnings)
                 promoters_data = get_top_promoters_from_sheets()
-                
-                # Match with Firebase for names and profile pics
-                entries = match_promoters_with_firebase(promoters_data)
-                
+                base_entries = match_promoters_with_firebase(promoters_data) or []
+
+                # 2) Custom promoters from Firebase node: /custom_promoters
+                custom_entries = []
+                try:
+                    custom_promoters = _safe_get_custom_promoters(db) or []
+                    for item in custom_promoters:
+                        if not isinstance(item, dict):
+                            continue
+
+                        name = item.get("name") or item.get("username") or "Promoter"
+                        amount = item.get("amount", item.get("earnings", 0))
+
+                        try:
+                            amount = float(str(amount).replace(",", ""))
+                        except Exception:
+                            amount = 0
+
+                        custom_entries.append({
+                            "rank": 0,
+                            "name": str(name),
+                            "referral_id": "CUSTOM",
+                            "earnings": amount,
+                            "profile_image_url": item.get("profile_image_url") or "",
+                            "highlight": "",
+                            "source": "custom",
+                            "custom_id": item.get("id"),
+                        })
+
+                    if custom_entries:
+                        print(f"[HOF] Loaded {len(custom_entries)} custom promoters")
+                except Exception as ce:
+                    print(f"[HOF] Could not load custom promoters: {ce}")
+
+                # 3) Merge + re-rank by earnings (descending)
+                entries = base_entries + custom_entries
+
+                def _earn(x):
+                    try:
+                        return float(x.get("earnings", 0) or 0)
+                    except Exception:
+                        return 0.0
+
                 if entries:
+                    entries.sort(key=_earn, reverse=True)
+                    for i, en in enumerate(entries, start=1):
+                        en["rank"] = i
+                        if i == 1:
+                            en["highlight"] = "gold"
+                        elif i == 2:
+                            en["highlight"] = "silver"
+                        elif i == 3:
+                            en["highlight"] = "bronze"
+                        else:
+                            en["highlight"] = ""
+
                     hof_state["entries"] = entries
                     hof_state["initialized"] = True
                     hof_state["last_refresh"] = datetime.now()
-                    print(f"[HOF] Loaded {len(entries)} entries successfully")
+                    print(f"[HOF] Loaded {len(entries)} total entries (base={len(base_entries)}, custom={len(custom_entries)})")
                 else:
                     print("[HOF] No entries found, keeping previous data")
-                
+
                 hof_state["loading"] = False
-                
+
             except Exception as e:
                 print(f"[HOF] Error loading data: {e}")
                 hof_state["loading"] = False
@@ -8852,9 +10421,455 @@ def main(page: ft.Page):
 
         # TAB 5 → SETTINGS (with Create Group button for admin)
         # ✅ FIX 5: Only create settings content for admin
+
+        # ========== ADMIN TOOL: ADD PROMOTER (shows in Hall of Fame) ==========
+        # Saves to Firebase Realtime DB node: /custom_promoters
+        custom_promoter_name_field = ft.TextField(label="Promoter Name", width=320)
+        custom_promoter_amount_field = ft.TextField(
+            label="Amount (₹)",
+            width=320,
+            keyboard_type=getattr(ft.KeyboardType, "NUMBER", None),
+        )
+        custom_promoter_image_preview = ft.Image(
+            width=120, height=120, fit=ft.ImageFit.COVER, border_radius=60, visible=False
+        )
+        selected_custom_promoter = {"url": None}
+
+        def pick_custom_promoter_image(e):
+            try:
+                custom_promoter_file_picker.pick_files(
+                    allowed_extensions=["jpg", "jpeg", "png", "gif", "webp"],
+                    allow_multiple=False
+                )
+            except Exception as ex:
+                show_snackbar(f"File picker error: {ex}")
+
+        def on_custom_promoter_image_selected(e: ft.FilePickerResultEvent):
+            if e.files and len(e.files) > 0:
+                try:
+                    file = e.files[0]
+
+                    if file.size > MAX_FILE_SIZE:
+                        show_snackbar(f"File too large! Max size: {format_file_size(MAX_FILE_SIZE)}")
+                        return
+
+                    with open(file.path, "rb") as f:
+                        file_data = f.read()
+
+                    show_snackbar("Uploading promoter photo...")
+                    file_path = f"custom_promoters/{auth.user_id}_{int(time.time())}_{file.name}"
+                    success, result = storage.upload_file(file_path, file.name, file_data)
+
+                    if success:
+                        selected_custom_promoter["url"] = result
+                        custom_promoter_image_preview.src = result
+                        custom_promoter_image_preview.visible = True
+                        show_snackbar("Photo uploaded!")
+                        page.update()
+                    else:
+                        show_snackbar(f"Upload failed: {result}")
+                except Exception as ex:
+                    show_snackbar(f"Error: {str(ex)}")
+
+        # (Re)bind picker callback each time main menu is built
+        try:
+            custom_promoter_file_picker.on_result = on_custom_promoter_image_selected
+        except Exception:
+            pass
+
+        def show_add_promoter_dialog():
+            # Reset fields
+            custom_promoter_name_field.value = ""
+            custom_promoter_amount_field.value = ""
+            selected_custom_promoter["url"] = None
+            custom_promoter_image_preview.visible = False
+            custom_promoter_image_preview.src = None
+
+            def _close_dialog(ev=None):
+                try:
+                    dialog.open = False
+                    page.update()
+                except Exception:
+                    pass
+
+            def _save_promoter(ev):
+                name = (custom_promoter_name_field.value or "").strip()
+                amt_raw = (custom_promoter_amount_field.value or "").strip()
+
+                if not name:
+                    show_snackbar("Enter promoter name")
+                    return
+                if not amt_raw:
+                    show_snackbar("Enter amount")
+                    return
+
+                try:
+                    amount = float(amt_raw.replace(",", ""))
+                except Exception:
+                    show_snackbar("Amount must be a number")
+                    return
+
+                photo_url = selected_custom_promoter.get("url") or ""
+
+                show_snackbar("Saving promoter...")
+                new_pid = None
+                try:
+                    new_pid = _safe_add_custom_promoter(db, 
+                        name=name,
+                        amount=amount,
+                        profile_image_url=photo_url,
+                        created_by=auth.user_id
+                    )
+                except Exception as ex:
+                    print(f"[CUSTOM PROMOTER] Save error: {ex}")
+
+                if new_pid:
+                    # ✅ Also copy this promoter into all groups where YOU are creator/admin
+                    # Stored under /groups/<gid>/custom_promoters/<new_pid>
+                    try:
+                        snap = {"name": name, "amount": amount, "profile_image_url": photo_url}
+                        threading.Thread(
+                            target=lambda: db.upsert_custom_promoter_into_all_groups(new_pid if isinstance(new_pid, str) else None, snap),
+                            daemon=True
+                        ).start()
+                    except Exception as ex:
+                        print(f"[GROUP] propagate custom promoter error: {ex}")
+
+                    show_snackbar("✅ Promoter added! Refreshing Hall of Fame...")
+                    # Reload Hall of Fame data (now includes custom_promoters)
+                    try:
+                        hof_state["loading"] = True
+                        refresh_hof_view()
+                        load_hof_data_async()
+                    except Exception as ex:
+                        print(f"[HOF] refresh after add promoter error: {ex}")
+                    _close_dialog()
+                else:
+                    show_snackbar("❌ Failed to add promoter (check internet / DB rules)")
+
+            dialog = ft.AlertDialog(
+                title=ft.Text("Add Promoter", size=18, weight="bold"),
+                content=ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Text("Saved in Firebase: /custom_promoters", size=11, color="grey"),
+                            ft.Container(height=8),
+                            ft.Container(content=custom_promoter_image_preview, alignment=ft.alignment.center),
+                            ft.Container(height=6),
+                            ft.ElevatedButton(
+                                "Choose Photo",
+                                icon=ft.Icons.IMAGE,
+                                on_click=pick_custom_promoter_image,
+                            ),
+                            ft.Container(height=10),
+                            custom_promoter_name_field,
+                            custom_promoter_amount_field,
+                        ],
+                        width=360,
+                        scroll="auto",
+                        spacing=10,
+                    ),
+                    width=380,
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=_close_dialog),
+                    ft.ElevatedButton(
+                        "Save",
+                        icon=ft.Icons.SAVE,
+                        bgcolor="#4CAF50",
+                        color="white",
+                        on_click=_save_promoter,
+                    ),
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+
+            if dialog not in page.overlay:
+                page.overlay.append(dialog)
+            page.dialog = dialog
+            dialog.open = True
+            page.update()
+
+        # ========== ADMIN TOOL: EDIT CUSTOM PROMOTER (update later) ==========
+        # Edits /custom_promoters/<id> and also mirrors into groups/<gid>/custom_promoters/<id>
+        edit_promoter_dropdown = ft.Dropdown(label="Select Custom Promoter", width=340, options=[])
+        edit_promoter_name_field = ft.TextField(label="Promoter Name", width=340)
+        edit_promoter_amount_field = ft.TextField(
+            label="Amount (₹)",
+            width=340,
+            keyboard_type=getattr(ft.KeyboardType, "NUMBER", None),
+        )
+        edit_custom_promoter_image_preview = ft.Image(
+            width=120, height=120, fit=ft.ImageFit.COVER, border_radius=60, visible=False
+        )
+        edit_promoter_state = {"id": None, "url": None, "items": []}
+
+        def _format_amt(x):
+            try:
+                v = float(str(x).replace(",", ""))
+                return v
+            except Exception:
+                return 0.0
+
+        def _fill_edit_fields_by_id(pid):
+            item = None
+            for it in (edit_promoter_state.get("items") or []):
+                if it.get("id") == pid:
+                    item = it
+                    break
+            if not item:
+                return
+            edit_promoter_state["id"] = pid
+            edit_promoter_name_field.value = str(item.get("name") or "")
+            try:
+                edit_promoter_amount_field.value = str(_format_amt(item.get("amount", 0)))
+            except Exception:
+                edit_promoter_amount_field.value = "0"
+            url = item.get("profile_image_url") or ""
+            edit_promoter_state["url"] = None  # reset "new" url until you upload
+            if url:
+                edit_custom_promoter_image_preview.src = url
+                edit_custom_promoter_image_preview.visible = True
+            else:
+                edit_custom_promoter_image_preview.visible = False
+                edit_custom_promoter_image_preview.src = None
+
+        def _load_custom_promoters_for_edit():
+            try:
+                items = _safe_get_custom_promoters(db) or []
+            except Exception:
+                items = []
+            edit_promoter_state["items"] = items
+
+            # Build dropdown options
+            opts = []
+            for it in items:
+                pid = it.get("id")
+                if not pid:
+                    continue
+                nm = str(it.get("name") or "Unknown")
+                amt = it.get("amount", 0)
+                try:
+                    amt_num = _format_amt(amt)
+                    amt_txt = f"₹{amt_num:,.0f}"
+                except Exception:
+                    amt_txt = f"₹{amt}"
+                opts.append(ft.dropdown.Option(key=pid, text=f"{nm}  •  {amt_txt}"))
+
+            edit_promoter_dropdown.options = opts
+
+            if opts:
+                # Keep current selection if still exists, else select first
+                current = edit_promoter_dropdown.value
+                valid_ids = {o.key for o in opts}
+                if current not in valid_ids:
+                    edit_promoter_dropdown.value = opts[0].key
+                _fill_edit_fields_by_id(edit_promoter_dropdown.value)
+            else:
+                edit_promoter_dropdown.value = None
+                edit_custom_promoter_image_preview.visible = False
+                edit_custom_promoter_image_preview.src = None
+
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        def on_edit_promoter_changed(e):
+            try:
+                _fill_edit_fields_by_id(edit_promoter_dropdown.value)
+                page.update()
+            except Exception:
+                pass
+
+        edit_promoter_dropdown.on_change = on_edit_promoter_changed
+
+        def pick_edit_promoter_image(e):
+            try:
+                custom_promoter_edit_file_picker.pick_files(
+                    allowed_extensions=["jpg", "jpeg", "png", "gif", "webp"],
+                    allow_multiple=False
+                )
+            except Exception as ex:
+                show_snackbar(f"File picker error: {ex}")
+
+        def on_custom_promoter_edit_image_selected(e: ft.FilePickerResultEvent):
+            if e.files and len(e.files) > 0:
+                try:
+                    file = e.files[0]
+
+                    if file.size > MAX_FILE_SIZE:
+                        show_snackbar(f"File too large! Max size: {format_file_size(MAX_FILE_SIZE)}")
+                        return
+
+                    with open(file.path, "rb") as f:
+                        file_data = f.read()
+
+                    show_snackbar("Uploading new photo...")
+                    file_path = f"custom_promoters/edit_{auth.user_id}_{int(time.time())}_{file.name}"
+                    success, result = storage.upload_file(file_path, file.name, file_data)
+
+                    if success:
+                        edit_promoter_state["url"] = result
+                        edit_custom_promoter_image_preview.src = result
+                        edit_custom_promoter_image_preview.visible = True
+                        show_snackbar("✅ New photo uploaded!")
+                        page.update()
+                    else:
+                        show_snackbar(f"Upload failed: {result}")
+                except Exception as ex:
+                    show_snackbar(f"Error: {str(ex)}")
+
+        # Bind edit picker callback
+        try:
+            custom_promoter_edit_file_picker.on_result = on_custom_promoter_edit_image_selected
+        except Exception:
+            pass
+
+        def show_edit_promoter_dialog():
+            # Load list fresh (background)
+            show_snackbar("Loading custom promoters...")
+            threading.Thread(target=_load_custom_promoters_for_edit, daemon=True).start()
+
+            def _close_dialog(ev=None):
+                try:
+                    dialog.open = False
+                    page.update()
+                except Exception:
+                    pass
+
+            def _save_changes(ev):
+                pid = edit_promoter_dropdown.value
+                if not pid:
+                    show_snackbar("No custom promoter selected")
+                    return
+
+                name = (edit_promoter_name_field.value or "").strip()
+                amt_raw = (edit_promoter_amount_field.value or "").strip()
+
+                if not name:
+                    show_snackbar("Enter promoter name")
+                    return
+                if not amt_raw:
+                    show_snackbar("Enter amount")
+                    return
+
+                try:
+                    amount = float(amt_raw.replace(",", ""))
+                except Exception:
+                    show_snackbar("Amount must be a number")
+                    return
+
+                # If you didn't upload a new photo, keep existing one
+                existing_url = ""
+                for it in (edit_promoter_state.get("items") or []):
+                    if it.get("id") == pid:
+                        existing_url = it.get("profile_image_url") or ""
+                        break
+
+                photo_url = edit_promoter_state.get("url") or existing_url or ""
+
+                show_snackbar("Saving changes...")
+                ok = False
+                try:
+                    ok = _safe_update_custom_promoter(db, 
+                        promoter_id=pid,
+                        name=name,
+                        amount=amount,
+                        profile_image_url=photo_url,
+                        updated_by=auth.user_id
+                    )
+                except Exception as ex:
+                    print(f"[CUSTOM PROMOTER] update error: {ex}")
+                    ok = False
+
+                if ok:
+                    show_snackbar("✅ Updated! Refreshing Hall of Fame...")
+                    # Mirror into groups where you can write (creator/admin)
+                    try:
+                        snap = {"name": name, "amount": amount, "profile_image_url": photo_url}
+                        threading.Thread(
+                            target=lambda: db.upsert_custom_promoter_into_all_groups(pid, snap),
+                            daemon=True
+                        ).start()
+                    except Exception as ex:
+                        print(f"[GROUP] propagate updated promoter error: {ex}")
+
+                    try:
+                        hof_state["loading"] = True
+                        refresh_hof_view()
+                        load_hof_data_async()
+                    except Exception as ex:
+                        print(f"[HOF] refresh after edit promoter error: {ex}")
+
+                    _close_dialog()
+                else:
+                    show_snackbar("❌ Failed to update promoter (check internet / DB rules)")
+
+            dialog = ft.AlertDialog(
+                title=ft.Text("Edit Custom Promoter", size=18, weight="bold"),
+                content=ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Text("Edits Firebase: /custom_promoters/<id>", size=11, color="grey"),
+                            ft.Container(height=8),
+                            edit_promoter_dropdown,
+                            ft.Container(height=6),
+                            ft.Container(content=edit_custom_promoter_image_preview, alignment=ft.alignment.center),
+                            ft.Container(height=6),
+                            ft.ElevatedButton(
+                                "Change Photo",
+                                icon=ft.Icons.IMAGE,
+                                on_click=pick_edit_promoter_image
+                            ),
+                            ft.Container(height=6),
+                            edit_promoter_name_field,
+                            edit_promoter_amount_field,
+                        ],
+                        tight=True,
+                        spacing=10
+                    ),
+                    width=380
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=_close_dialog),
+                    ft.ElevatedButton("Save", on_click=_save_changes),
+                ],
+            )
+
+            page.overlay.append(dialog)
+            page.dialog = dialog
+            dialog.open = True
+            page.update()
+
+
         settings_buttons = []
         
         if is_admin:
+            settings_buttons.append(
+                ft.ElevatedButton(
+                    "➕ Add Promoter",
+                    icon=ft.Icons.PERSON_ADD,
+                    on_click=lambda e: show_add_promoter_dialog(),
+                    width=250,
+                    bgcolor="#1976D2",
+                    color="white"
+                )
+            )
+
+            settings_buttons.append(ft.Container(height=10))
+            settings_buttons.append(
+                ft.ElevatedButton(
+                    "✏️ Edit Custom Promoter",
+                    icon=ft.Icons.EDIT,
+                    on_click=lambda e: show_edit_promoter_dialog(),
+                    width=250,
+                    bgcolor="#5E35B1",
+                    color="white"
+                )
+            )
+
+            settings_buttons.append(ft.Container(height=10))
             settings_buttons.append(
                 ft.ElevatedButton(
                     "➕ Create New Group",
@@ -8871,11 +10886,403 @@ def main(page: ft.Page):
             ft.TextButton("Logout", on_click=lambda e: handle_logout())
         )
         
+
+        # ============================
+        # CUSTOM TAB (Creator Inbox)
+        # ============================
+        # Shows all conversations to/from custom promoters across all users.
+        # Stored at: /custom_promoter_threads/<promoterId>/<userId>/{info,messages}
+
+        custom_state = {"view": "list", "thread": None, "threads": []}
+
+        custom_threads_column = ft.Column([], expand=True, scroll="auto", spacing=0)
+        custom_messages_list = ft.ListView(expand=True, spacing=8, auto_scroll=True)
+        custom_reply_input = ft.TextField(
+            hint_text="Type reply...",
+            expand=True,
+            multiline=True,
+            min_lines=1,
+            max_lines=4,
+        )
+
+        custom_root_container = ft.Container(expand=True)
+
+        def _custom_ui(fn):
+            """Run UI updates safely even when called from background threads."""
+            try:
+                if hasattr(page, "call_from_thread"):
+                    page.call_from_thread(fn)
+                else:
+                    fn()
+            except Exception:
+                try:
+                    fn()
+                except Exception:
+                    pass
+
+        def _fmt_custom_time(ms):
+            try:
+                ms = int(ms or 0)
+                if ms <= 0:
+                    return ""
+                dt = datetime.fromtimestamp(ms / 1000)
+                return dt.strftime("%d-%m %I:%M %p")
+            except Exception:
+                return ""
+
+        def _render_custom_list_loading():
+            custom_threads_column.controls.clear()
+            custom_threads_column.controls.append(
+                ft.Container(content=ft.Text("Loading custom messages...", color="grey"), padding=20)
+            )
+            custom_root_container.content = ft.Column(
+                [
+                    ft.Container(
+                        content=ft.Row(
+                            [
+                                ft.Text("Custom", size=20, weight="bold", expand=True),
+                                ft.IconButton(
+                                    icon=ft.Icons.REFRESH,
+                                    tooltip="Refresh",
+                                    on_click=lambda e: load_custom_inbox(force_refresh=True),
+                                ),
+                            ],
+                            alignment="spaceBetween",
+                        ),
+                        padding=15,
+                    ),
+                    ft.Container(content=custom_threads_column, expand=True),
+                ],
+                expand=True,
+                spacing=0,
+            )
+            page.update()
+
+        def _render_custom_empty():
+            custom_threads_column.controls.clear()
+            custom_threads_column.controls.append(
+                ft.Container(content=ft.Text("No custom messages yet"), padding=20)
+            )
+            page.update()
+
+        def _render_custom_threads(threads):
+            custom_threads_column.controls.clear()
+
+            if not threads:
+                _render_custom_empty()
+                return
+
+            for t in threads:
+                promoter_name = t.get("promoter_name") or "Promoter"
+                user_name = t.get("user_name") or "User"
+                last_msg = (t.get("last_message") or "").strip()
+                last_at = _fmt_custom_time(t.get("last_message_at") or 0)
+
+                # Prefer promoter pic; fallback to user pic; else initial
+                pic = (t.get("promoter_pic") or t.get("user_pic") or "").strip()
+                avatar = ft.CircleAvatar(content=ft.Text((promoter_name[:1] or "P").upper()))
+                if pic:
+                    try:
+                        avatar = ft.CircleAvatar(foreground_image_src=pic, radius=20)
+                    except Exception:
+                        pass
+
+                title = f"{user_name} → {promoter_name}"
+                subtitle = last_msg if last_msg else "Tap to open"
+
+                row = ft.Container(
+                    content=ft.Row(
+                        [
+                            avatar,
+                            ft.Column(
+                                [
+                                    ft.Text(title, size=14, weight="bold"),
+                                    ft.Text(subtitle, size=12, color="grey"),
+                                ],
+                                spacing=2,
+                                expand=True,
+                            ),
+                            ft.Text(last_at, size=10, color="grey"),
+                        ],
+                        spacing=10,
+                        alignment="spaceBetween",
+                    ),
+                    padding=12,
+                    border=ft.border.only(bottom=ft.border.BorderSide(1, "#E0E0E0")),
+                    on_click=lambda e, tt=t: open_custom_thread(tt),
+                )
+                custom_threads_column.controls.append(row)
+
+            page.update()
+
+        def load_custom_inbox(force_refresh=False):
+            """Creator-only inbox: list all custom promoter threads."""
+            if not is_admin:
+                return
+
+            _custom_ui(_render_custom_list_loading)
+
+            def worker():
+                try:
+                    data = _safe_db_get(db, "custom_promoter_threads")
+                    threads = []
+                    if isinstance(data, dict):
+                        for promoter_id, user_map in data.items():
+                            if not isinstance(user_map, dict):
+                                continue
+                            for user_id, block in user_map.items():
+                                if not isinstance(block, dict):
+                                    continue
+                                info = block.get("info") or {}
+                                if not isinstance(info, dict):
+                                    info = {}
+                                threads.append({
+                                    "promoter_id": promoter_id,
+                                    "user_id": user_id,
+                                    "promoter_name": info.get("promoter_name") or "Promoter",
+                                    "promoter_pic": info.get("promoter_pic") or "",
+                                    "user_name": info.get("user_name") or "User",
+                                    "user_pic": info.get("user_pic") or "",
+                                    "last_message_at": info.get("last_message_at") or 0,
+                                    "last_message": info.get("last_message") or "",
+                                })
+                    threads.sort(key=lambda x: int(x.get("last_message_at") or 0), reverse=True)
+                    custom_state["threads"] = threads
+                    _custom_ui(lambda: _render_custom_threads(threads))
+                except Exception as ex:
+                    print(f"[CUSTOM TAB] Inbox load error: {ex}")
+                    _custom_ui(_render_custom_empty)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _render_custom_thread_layout(thread):
+            promoter_name = thread.get("promoter_name") or "Promoter"
+            user_name = thread.get("user_name") or "User"
+
+            header = ft.Container(
+                content=ft.Row(
+                    [
+                        ft.IconButton(
+                            icon=ft.Icons.ARROW_BACK,
+                            tooltip="Back",
+                            on_click=lambda e: open_custom_inbox_view(),
+                        ),
+                        ft.Column(
+                            [
+                                ft.Text("Custom Chat", size=16, weight="bold"),
+                                ft.Text(f"{user_name} ↔ {promoter_name}", size=12, color="grey"),
+                            ],
+                            spacing=0,
+                            expand=True,
+                        ),
+                        ft.IconButton(
+                            icon=ft.Icons.REFRESH,
+                            tooltip="Refresh",
+                            on_click=lambda e: load_custom_thread_messages(force_refresh=True),
+                        ),
+                    ],
+                    alignment="spaceBetween",
+                ),
+                padding=10,
+                bgcolor="#F5F5F5",
+            )
+
+            composer = ft.Container(
+                content=ft.Row(
+                    [
+                        custom_reply_input,
+                        ft.IconButton(
+                            icon=ft.Icons.SEND,
+                            tooltip="Send",
+                            on_click=lambda e: send_custom_reply(),
+                        ),
+                    ],
+                    spacing=8,
+                ),
+                padding=10,
+            )
+
+            custom_root_container.content = ft.Column(
+                [
+                    header,
+                    ft.Container(content=custom_messages_list, expand=True, padding=10),
+                    composer,
+                ],
+                expand=True,
+                spacing=0,
+            )
+            page.update()
+
+        def open_custom_inbox_view():
+            custom_state["view"] = "list"
+            custom_state["thread"] = None
+            custom_reply_input.value = ""
+            _custom_ui(_render_custom_list_loading)
+            # Re-render using existing cached threads if available
+            threads = custom_state.get("threads") or []
+            if threads:
+                _custom_ui(lambda: _render_custom_threads(threads))
+            else:
+                load_custom_inbox(force_refresh=True)
+
+        def open_custom_thread(thread):
+            if not is_admin:
+                return
+            custom_state["view"] = "thread"
+            custom_state["thread"] = thread
+            custom_reply_input.value = ""
+            custom_messages_list.controls.clear()
+            _custom_ui(lambda: _render_custom_thread_layout(thread))
+            load_custom_thread_messages(force_refresh=True)
+
+        def _render_custom_messages(thread, messages):
+            custom_messages_list.controls.clear()
+
+            promoter_id = thread.get("promoter_id") or ""
+            promoter_name = thread.get("promoter_name") or "Promoter"
+            user_name = thread.get("user_name") or "User"
+
+            if not messages:
+                custom_messages_list.controls.append(
+                    ft.Container(content=ft.Text("No messages yet"), padding=20)
+                )
+                page.update()
+                return
+
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                sender_id = str(msg.get("sender_id", ""))
+                sender_name = str(msg.get("sender_username", "")) or ("Promoter" if sender_id.startswith("cp_") else "User")
+                text = str(msg.get("text", "") or "")
+                ts = msg.get("timestamp") or 0
+
+                # Determine direction for clear From/To display
+                if sender_id == f"cp_{promoter_id}" or sender_id.startswith("cp_"):
+                    from_name = promoter_name
+                    to_name = user_name
+                    align = "end"
+                    bubble_bg = "#E3F2FD"
+                else:
+                    from_name = user_name
+                    to_name = promoter_name
+                    align = "start"
+                    bubble_bg = "#FFFFFF"
+
+                meta = ft.Text(f"{from_name} → {to_name} • {_fmt_custom_time(ts)}", size=10, color="grey")
+                bubble = ft.Container(
+                    content=ft.Text(text, size=13),
+                    padding=10,
+                    bgcolor=bubble_bg,
+                    border_radius=10,
+                )
+
+                custom_messages_list.controls.append(
+                    ft.Row(
+                        [ft.Column([meta, bubble], spacing=2)],
+                        alignment=align,
+                    )
+                )
+
+            page.update()
+
+        def load_custom_thread_messages(force_refresh=False):
+            """Load messages for currently opened custom thread."""
+            if not is_admin:
+                return
+            thread = custom_state.get("thread")
+            if not thread:
+                return
+
+            promoter_id = thread.get("promoter_id") or ""
+            user_id = thread.get("user_id") or ""
+
+            def worker():
+                try:
+                    # Read directly from /custom_promoter_threads/<promoterId>/<userId>/messages
+                    raw = _safe_db_get(db, f"custom_promoter_threads/{promoter_id}/{user_id}/messages")
+                    messages = []
+
+                    if isinstance(raw, dict):
+                        for msg_id, msg_data in raw.items():
+                            if isinstance(msg_data, dict):
+                                d = dict(msg_data)
+                                d["id"] = msg_id
+                                messages.append(d)
+                    elif isinstance(raw, list):
+                        for i, msg_data in enumerate(raw):
+                            if isinstance(msg_data, dict):
+                                d = dict(msg_data)
+                                d["id"] = str(i)
+                                messages.append(d)
+
+                    messages.sort(key=lambda x: (x.get("timestamp") or 0))
+                    _custom_ui(lambda: _render_custom_messages(thread, messages))
+                except Exception as ex:
+                    print(f"[CUSTOM TAB] Thread load error: {ex}")
+                    _custom_ui(lambda: _render_custom_messages(thread, []))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def send_custom_reply():
+            """Creator replies as the selected promoter (sender_id = cp_<promoterId>)."""
+            if not is_admin:
+                return
+            thread = custom_state.get("thread")
+            if not thread:
+                return
+
+            text = (custom_reply_input.value or "").strip()
+            if not text:
+                return
+
+            promoter_id = thread.get("promoter_id") or ""
+            user_id = thread.get("user_id") or ""
+            promoter_name = thread.get("promoter_name") or "Promoter"
+            chat_id = f"CP__{promoter_id}__{user_id}"
+
+            # Optimistically clear input
+            custom_reply_input.value = ""
+            page.update()
+
+            def worker():
+                try:
+                    ok = db.send_message(
+                        chat_id=chat_id,
+                        sender_id=f"cp_{promoter_id}",
+                        sender_username=promoter_name,
+                        message_text=text,
+                        is_admin=True
+                    )
+                    if not ok:
+                        print("[CUSTOM TAB] Send failed")
+                    # Refresh thread + inbox list
+                    load_custom_thread_messages(force_refresh=True)
+                    load_custom_inbox(force_refresh=True)
+                except Exception as ex:
+                    print(f"[CUSTOM TAB] Send error: {ex}")
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        # Initial placeholder (creator will load on tab open)
+        if is_admin:
+            open_custom_inbox_view()
+        else:
+            custom_root_container.content = ft.Container()
+
+        screen_custom = ft.Container(content=custom_root_container, expand=True)
+
         screen_settings = ft.Container(
             content=ft.Column(
                 [
                     ft.Container(
-                        content=ft.Text("Settings", size=20, weight="bold"),
+                        content=ft.Column(
+                            [
+                                ft.Text("Settings", size=20, weight="bold"),
+                                ft.Text(f"Creator: {ADMIN_EMAIL}", size=11, color="grey"),
+                            ],
+                            spacing=2,
+                        ),
                         padding=15
                     ),
                     ft.Container(height=20),
@@ -8894,9 +11301,9 @@ def main(page: ft.Page):
         page_controller = page_controller_cls(initial_page=selected_index) if page_controller_cls else None
 
         # ✅ FIX 5: Determine number of tabs based on admin status
-        # Admin: 6 tabs (Promoter, Hall of Fame, Groups, Members, Private, Settings)
+        # Admin: 7 tabs (Promoter, Hall of Fame, Groups, Members, Private, Custom, Settings)
         # Non-admin: 5 tabs (Promoter, Hall of Fame, Groups, Members, Private) - no Settings
-        num_tabs = 6 if is_admin else 5
+        num_tabs = 7 if is_admin else 5
 
         # SELECT WHICH SCREEN TO SHOW (with optimized lazy loading)
 
@@ -8946,7 +11353,15 @@ def main(page: ft.Page):
                     update_notification_badge()
                 except Exception as ex:
                     print(f"[PRIVATE TAB AUTO-LOAD ERROR] {ex}")
-            # ✅ FIX 5: Tab 5 (Settings) only exists for admin
+            elif selected_index == 5 and is_admin:
+                # Custom (creator inbox)
+                try:
+                    load_custom_inbox(force_refresh=True)
+                except Exception as ex:
+                    print(f"[CUSTOM TAB] Load error: {ex}")
+            elif selected_index == 6 and is_admin:
+                # Settings tab
+                pass
             page.update()
 
         def switch_tab(e):
@@ -8998,8 +11413,15 @@ def main(page: ft.Page):
                 ),
             ]
 
-            # ✅ FIX 5: Only add Settings tab for admin
+            # ✅ FIX 5: Only add Custom + Settings tabs for admin
             if is_admin:
+                nav_destinations.append(
+                    ft.NavigationBarDestination(
+                        icon=ft.Icons.INBOX_OUTLINED if hasattr(ft.Icons, "INBOX_OUTLINED") else ft.Icons.MAIL_OUTLINED,
+                        selected_icon=ft.Icons.INBOX if hasattr(ft.Icons, "INBOX") else ft.Icons.MAIL,
+                        label="Custom"
+                    )
+                )
                 nav_destinations.append(
                     ft.NavigationBarDestination(
                         icon=ft.Icons.SETTINGS_OUTLINED,
@@ -9050,6 +11472,12 @@ def main(page: ft.Page):
                         print(f"[PULL REFRESH PRIVATE] {ex}")
                 # ✅ FIX 5: Only handle Settings tab refresh if admin
                 elif selected_index == 5 and is_admin:
+                    # Custom tab
+                    try:
+                        load_custom_inbox(force_refresh=True)
+                    except Exception as ex:
+                        print(f"[CUSTOM TAB REFRESH] {ex}")
+                elif selected_index == 6 and is_admin:
                     # Settings tab - nothing to refresh yet
                     pass
             except Exception as ex:
@@ -9137,8 +11565,9 @@ def main(page: ft.Page):
             ft.Container(content=screen_private_chat, expand=True),  # ✅ Changed from chat_list_view
         ]
 
-        # ✅ FIX 5: Only add Settings tab for admin
+        # ✅ FIX 5: Only add Custom + Settings tabs for admin
         if is_admin:
+            tab_pages.append(ft.Container(content=screen_custom, expand=True))
             tab_pages.append(ft.Container(content=screen_settings, expand=True))
 
         page_view_cls = getattr(ft, "PageView", None)
@@ -9269,6 +11698,74 @@ def main(page: ft.Page):
                     ft.Text(f"... and {len(members) - 10} more", size=12, color="grey", italic=True)
                 )
             
+
+            # Group custom promoters (loaded async)
+            group_id = group_data.get("id")
+            custom_promoters_preview = ft.Column(spacing=6)
+            custom_promoters_preview.controls.append(
+                ft.Text("Loading custom promoters...", size=12, color="grey")
+            )
+
+            def _format_amount_cp(val):
+                try:
+                    return f"₹{int(float(val)):,}"
+                except Exception:
+                    return "₹0"
+
+            def _build_cp_row_details(item):
+                name = (item.get("name") or "").strip() or "Promoter"
+                amt = _format_amount_cp(item.get("amount", 0))
+                photo_url = item.get("profile_image_url")
+
+                if photo_url:
+                    cached = ImageCache.get_cached_image(photo_url, "custom_promoter")
+                    avatar_src = cached or photo_url
+                    avatar = ft.Image(src=avatar_src, width=32, height=32, fit=ft.ImageFit.COVER, border_radius=16)
+                else:
+                    avatar = ft.CircleAvatar(content=ft.Text(name[:1].upper(), size=14, weight="bold"), radius=16)
+
+                return ft.Container(
+                    content=ft.Row(
+                        [
+                            avatar,
+                            ft.Column([ft.Text(name, size=13, weight="bold")], spacing=0, expand=True),
+                            ft.Text(amt, size=13, weight="bold"),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    padding=ft.padding.symmetric(vertical=4, horizontal=2),
+                )
+
+            def _load_group_custom_promoters_details():
+                if not group_id:
+                    custom_promoters_preview.controls.clear()
+                    custom_promoters_preview.controls.append(ft.Text("No group id.", size=12, color="grey"))
+                    page.update()
+                    return
+
+                try:
+                    items = db.get_group_custom_promoters_by_id(group_id) or []
+                except Exception as ex:
+                    print(f"[CUSTOM PROMOTER] load group custom promoters (details) failed: {ex}")
+                    items = []
+
+                custom_promoters_preview.controls.clear()
+                if not items:
+                    custom_promoters_preview.controls.append(ft.Text("No custom promoters in this group.", size=12, color="grey"))
+                else:
+                    for item in items[:30]:
+                        custom_promoters_preview.controls.append(_build_cp_row_details(item))
+                    if len(items) > 30:
+                        custom_promoters_preview.controls.append(ft.Text(f"... and {len(items) - 30} more", size=12, color="grey", italic=True))
+
+                try:
+                    page.update()
+                except Exception:
+                    pass
+
+            threading.Thread(target=_load_group_custom_promoters_details, daemon=True).start()
+
             # Action buttons
             action_buttons = [
                 ft.ElevatedButton(
@@ -9330,8 +11827,20 @@ def main(page: ft.Page):
                                 border=ft.border.all(1, "#E0E0E0"),
                                 border_radius=10,
                                 bgcolor="#F5F5F5"
+
+                            ),
+                            ft.Container(height=20),
+                            ft.Text("🏆 Custom Promoters", size=16, weight="bold"),
+                            ft.Container(height=10),
+                            ft.Container(
+                                content=custom_promoters_preview,
+                                padding=15,
+                                border=ft.border.all(1, "#E0E0E0"),
+                                border_radius=10,
+                                bgcolor="#F5F5F5"
                             ),
                             ft.Container(height=30),
+
                             *action_buttons
                         ], horizontal_alignment="center", scroll="auto"),
                         padding=20,
@@ -9562,7 +12071,7 @@ def main(page: ft.Page):
             CredentialsManager.save_credentials(auth.email, auth.refresh_token, current_username)
             
             # Update token storage
-            db.store_user_token(auth.user_id, auth.email, current_username, auth.refresh_token)
+            _safe_store_user_token(db, auth.user_id, auth.email, current_username, auth.refresh_token)
             
             show_snackbar("Profile updated!")
             show_main_menu()
@@ -9575,7 +12084,7 @@ def main(page: ft.Page):
         page.clean()
         
         # Load current profile
-        profile = db.get_user_profile(auth.user_id)
+        profile = _safe_get_user_profile(db, auth.user_id)
         edit_username_field.value = current_username
         
         if profile and profile.get('profile_image_url'):
@@ -9795,7 +12304,28 @@ def main(page: ft.Page):
                     }
                 }
             }
-            
+
+            # ✅ Auto-add ALL custom promoters to every NEW group at creation time
+            # Stored under: /groups/<groupId>/custom_promoters/<custom_id>
+            # (This is separate from /members to avoid RTDB rules blocking non-user ids)
+            try:
+                cps = _safe_get_custom_promoters(db) or []
+                if cps:
+                    now_ms = int(time.time() * 1000)
+                    group_data["custom_promoters"] = {}
+                    for cp in cps:
+                        cid = cp.get("id")
+                        if not cid:
+                            continue
+                        group_data["custom_promoters"][cid] = {
+                            "name": cp.get("name") or "",
+                            "amount": cp.get("amount") or 0,
+                            "profile_image_url": cp.get("profile_image_url") or "",
+                            "added_at": now_ms
+                        }
+            except Exception as ex:
+                print(f"[GROUP] Could not attach custom promoters: {ex}")
+
             try:
                 response = requests.put(url, json=group_data, timeout=10)
                 
@@ -9896,17 +12426,57 @@ def main(page: ft.Page):
     
     def open_chat(user_data):
         nonlocal current_chat_id, current_chat_user  # ← Make sure this is here!
-        
+
         print(f'[DEBUG] open_chat() called with user_data: {user_data}')
-        
+
         current_chat_user = user_data  # ← This MUST be set
-        current_chat_id = create_chat_id(auth.user_id, user_data['id'])
-        
+
+        # ✅ Custom promoter thread chat (goes to /custom_promoter_threads)
+        try:
+            is_custom = user_data.get("is_custom_promoter") or str(user_data.get("id", "")).startswith("cp_")
+        except Exception:
+            is_custom = False
+
+        if is_custom:
+            cp_uid = str(user_data.get("id", ""))
+            promoter_id = cp_uid[3:] if cp_uid.startswith("cp_") else cp_uid
+            thread_user_key = user_data.get("thread_user_id") or user_data.get("thread_user_key") or auth.user_id
+            thread_user_key = str(thread_user_key or "")
+            if not thread_user_key:
+                thread_user_key = str(auth.user_id or "")
+            current_chat_id = f"CP__{promoter_id}__{thread_user_key}"
+
+            # Ensure thread info exists (for creator inbox later)
+            try:
+                promoter_profile = _safe_get_user_profile(db, cp_uid) or {}
+                my_profile = _safe_get_user_profile(db, auth.user_id) or {}
+
+                promoter_name = promoter_profile.get("name") or promoter_profile.get("username") or user_data.get("username") or "Promoter"
+                promoter_pic = promoter_profile.get("profile_image_url") or user_data.get("profile_image_url") or ""
+                my_pic = my_profile.get("profile_image_url") if isinstance(my_profile, dict) else ""
+
+                _ensure_custom_promoter_thread(
+                    db_obj=db,
+                    promoter_id=promoter_id,
+                    promoter_name=promoter_name,
+                    promoter_pic=promoter_pic,
+                    user_id=auth.user_id,
+                    user_name=current_username,
+                    user_pic=my_pic or "",
+                    group_id=None
+                )
+            except Exception as ex:
+                print(f"[CUSTOM PROMOTER CHAT] ensure thread info error: {ex}")
+
+        else:
+            # Normal user-to-user private chat
+            current_chat_id = create_chat_id(auth.user_id, user_data['id'])
+
         print(f'[DEBUG] Set current_chat_user: {current_chat_user}')
         print(f'[DEBUG] Set current_chat_id: {current_chat_id}')
-        
+
         show_chat_screen()
-    
+
     def load_users():
         users_list.controls.clear()
         
@@ -10040,7 +12610,7 @@ def main(page: ft.Page):
     def fetch_and_display_users():
         """Fetch users from Firebase and update cache"""
         try:
-            all_users = db.get_all_users()
+            all_users = _safe_get_all_users(db)
             
             # Save to cache
             try:
@@ -10072,7 +12642,7 @@ def main(page: ft.Page):
     def refresh_users_background():
         """Silently refresh users in background"""
         try:
-            all_users = db.get_all_users()
+            all_users = _safe_get_all_users(db)
             
             # Update cache
             cache_data = {
@@ -10228,8 +12798,9 @@ def main(page: ft.Page):
                     messages = db.get_messages(current_chat_id)
                     is_first_message = len(messages) == 0
                     print(f'[DEBUG-THREAD] is_first_message: {is_first_message}')
-                
-                    if is_first_message:
+                    is_custom_cp = isinstance(current_chat_id, str) and current_chat_id.startswith("CP__")
+
+                    if is_first_message and not is_custom_cp:
                         print('[DEBUG-THREAD] First message, setting requester and status')
                         db.set_chat_requester(current_chat_id, auth.user_id)
                         db.update_chat_status(current_chat_id, "pending")
@@ -10263,7 +12834,7 @@ def main(page: ft.Page):
                             if receiver_id:
                                 print(f'[DEBUG-THREAD] Receiver ID exists: {receiver_id}')
                                 
-                                if receiver_id != auth.user_id:
+                                if (receiver_id != auth.user_id) and (not is_custom_cp):
                                     print('[DEBUG-THREAD] Receiver is not sender (good)')
                                     
                                     print('[DEBUG-THREAD] Preparing notification...')
@@ -10509,9 +13080,14 @@ def main(page: ft.Page):
     def display_messages_ui(messages):
         """Display messages (separated from loading logic)"""
         try:
-            # Get chat status
-            chat_status = db.get_chat_status(current_chat_id)
-            chat_requester = db.get_chat_requester(current_chat_id)
+            # Get chat status (CP__ threads are not stored under /chats)
+            is_custom_cp = isinstance(current_chat_id, str) and current_chat_id.startswith("CP__")
+            if is_custom_cp:
+                chat_status = "accepted"
+                chat_requester = auth.user_id
+            else:
+                chat_status = _safe_get_chat_status(db, current_chat_id)
+                chat_requester = db.get_chat_requester(current_chat_id)
             current_chat_status["status"] = chat_status
             
             current_ids = {msg['id'] for msg in messages}
@@ -10560,7 +13136,7 @@ def main(page: ft.Page):
                 if not messages:
                     if chat_status != "pending" or chat_requester == auth.user_id:
                         messages_list.controls.append(
-                            ft.Container(content=ft.Text(""), padding=20)
+                            ft.Container(content=ft.Text("No messages yet", size=12, color="grey", text_align="center"), padding=20)
                         )
                 else:
                     for msg in messages:
@@ -10759,7 +13335,7 @@ def main(page: ft.Page):
         
         if current_chat_user:
             # Get user profile for avatar
-            user_profile = db.get_user_profile(current_chat_user['id'])
+            user_profile = _safe_get_user_profile(db, current_chat_user['id'])
             
             # Create avatar with caching
             if user_profile and user_profile.get('profile_image_url'):
