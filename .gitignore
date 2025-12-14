@@ -6,6 +6,7 @@ dist/
 *.aab
 android/app/google-services.json
 .env
+*.env
 credentials.json
 *.pkl
 .flet/
