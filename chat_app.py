@@ -1035,6 +1035,14 @@ class CacheManager:
                 return CacheManager.sanitize_data(data)
         except Exception as e:
             print(f"Cache load error ({cache_type}): {e}")
+            # If cache is corrupted, delete it so next run rebuilds cleanly
+            try:
+                _cf = CacheManager.get_cache_file(cache_type)
+                if _cf and _cf.exists():
+                    _cf.unlink()
+                    print(f"[CACHE] Corrupted cache deleted: {_cf}")
+            except Exception:
+                pass
         return None
 
 # ============================================
@@ -1551,6 +1559,14 @@ class CacheManager:
                 return CacheManager.sanitize_data(data)
         except Exception as e:
             print(f"Cache load error ({cache_type}): {e}")
+            # If cache is corrupted, delete it so next run rebuilds cleanly
+            try:
+                _cf = CacheManager.get_cache_file(cache_type)
+                if _cf and _cf.exists():
+                    _cf.unlink()
+                    print(f"[CACHE] Corrupted cache deleted: {_cf}")
+            except Exception:
+                pass
         return None
 
 # ============================================
@@ -2085,6 +2101,23 @@ class FirebaseDatabase:
         except:
             return []
 
+    def get_group_member_record(self, group_id, user_id):
+        """Rules-safe: read ONLY this user's membership record for a group.
+
+        Many RTDB rules allow /members/<uid> reads but block listing /members.
+        This helper avoids false 'not a member' errors when list reads are denied.
+        """
+        url = f"{self.database_url}/groups/{group_id}/members/{user_id}.json?auth={self.auth_token}"
+        try:
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                return data if isinstance(data, dict) else None
+            return None
+        except Exception:
+            return None
+
+
 
     def get_group_custom_promoters_by_id(self, group_id):
         """Get custom promoters stored under a specific group at:
@@ -2233,6 +2266,38 @@ class FirebaseDatabase:
             print(f"[DEBUG] send_group_message_by_id exception: {e}")
             return False
 
+
+    def get_group_pinned_message_by_id(self, group_id):
+        """Get pinned message for a specific group (stored at /groups/<gid>/info/pinned)"""
+        url = f"{self.database_url}/groups/{group_id}/info/pinned.json?auth={self.auth_token}"
+        try:
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+        except Exception as e:
+            print(f"Error fetching pinned message: {e}")
+        return None
+
+    def set_group_pinned_message_by_id(self, group_id, pinned_data):
+        """Set pinned message for a group (creator-only on UI side)"""
+        url = f"{self.database_url}/groups/{group_id}/info/pinned.json?auth={self.auth_token}"
+        try:
+            response = requests.put(url, json=pinned_data, timeout=10)
+            return response.status_code == 200
+        except Exception as e:
+            print(f"Error setting pinned message: {e}")
+            return False
+
+    def clear_group_pinned_message_by_id(self, group_id):
+        """Clear pinned message for a group"""
+        url = f"{self.database_url}/groups/{group_id}/info/pinned.json?auth={self.auth_token}"
+        try:
+            response = requests.delete(url, timeout=10)
+            return response.status_code == 200
+        except Exception as e:
+            print(f"Error clearing pinned message: {e}")
+            return False
+
     def update_group_info_by_id(self, group_id, name, description, icon, icon_url=None, category="None"):
         """Update info for a specific group"""
         url = f"{self.database_url}/groups/{group_id}/info.json?auth={self.auth_token}"
@@ -2328,10 +2393,10 @@ class FirebaseDatabase:
                 except Exception as e:
                     print(f"[DEBUG] add_member_to_group fallback PATCH exception: {e}")
 
-            # --- 4) Final verification: read members and check if we are inside ---
+            # --- 4) Final verification: rules-safe read of our own membership record ---
             try:
-                members = self.get_group_members_by_id(group_id) or []
-                is_member = any(m.get("id") == user_id for m in members)
+                rec = self.get_group_member_record(group_id, user_id)
+                is_member = isinstance(rec, dict) and bool(rec)
                 print(f"[DEBUG] add_member_to_group final membership check → is_member={is_member}")
                 if is_member:
                     return True
@@ -4024,6 +4089,51 @@ def main(page: ft.Page):
     # ============================================
     import math
     
+    # ============================================
+    # 🔔 Auto refresh notification badge (global)
+    # ============================================
+    badge_refresh_stop = threading.Event()
+    badge_refresh_thread = {"t": None}
+    badge_refresh_callback = {"fn": None}  # set later after UI builds
+
+
+    def start_badge_auto_refresh(interval_sec=5):
+        """Periodically refresh unread counts so badge updates without opening Private tab."""
+        try:
+            if badge_refresh_thread["t"] is not None and badge_refresh_thread["t"].is_alive():
+                return
+        except Exception:
+            pass
+        badge_refresh_stop.clear()
+
+        def _loop():
+            while not badge_refresh_stop.is_set():
+                try:
+                    # Compute directly in this thread (no extra thread spawn)
+                    fn = None
+                    try:
+                        fn = badge_refresh_callback.get("fn")
+                    except Exception:
+                        fn = None
+                    if callable(fn):
+                        fn(spawn_thread=False)
+                except Exception as e:
+                    try:
+                        print(f"[BADGE] Auto refresh error: {e}")
+                    except Exception:
+                        pass
+                badge_refresh_stop.wait(interval_sec)
+
+        t = threading.Thread(target=_loop, daemon=True)
+        badge_refresh_thread["t"] = t
+        t.start()
+
+    def stop_badge_auto_refresh():
+        try:
+            badge_refresh_stop.set()
+        except Exception:
+            pass
+
     def sanitize_value(value):
         """Remove NaN/Infinity from any value before passing to Flet"""
         if value is None:
@@ -4328,6 +4438,33 @@ def main(page: ft.Page):
     group_member_count = ft.Text("", size=12)
     group_displayed_message_ids = set()
     group_chat_header = ft.Row(spacing=10)
+
+    # ==============================
+    # Pinned message UI (Group chat)
+    # Only creator (ADMIN_EMAIL) can pin / unpin
+    # ==============================
+    pinned_state = {"data": None}
+    pinned_title = ft.Text("", size=12, weight="bold")
+    pinned_body = ft.Text("", size=12, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS)
+    unpin_pinned_btn = ft.IconButton(ft.Icons.CLOSE, tooltip="Unpin", visible=False)
+
+    pinned_banner = ft.Container(
+        visible=False,
+        padding=10,
+        bgcolor="#FFF9C4",
+        border_radius=10,
+        border=ft.border.all(1, "#FBC02D"),
+        content=ft.Row(
+            [
+                ft.Icon(ft.Icons.PUSH_PIN, size=18),
+                ft.Column([pinned_title, pinned_body], spacing=2, expand=True),
+                unpin_pinned_btn,
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=10,
+        ),
+    )
     
     messages_list = ft.Column(scroll="auto", expand=True, spacing=10, auto_scroll=True)
     message_input = ft.TextField(hint_text="Type a message...", expand=True, multiline=True, max_lines=3)
@@ -4724,6 +4861,87 @@ def main(page: ft.Page):
             print("[BACK] First back press - waiting for second")
             return True  # Handled (do not exit on first press)
     
+
+    # ============================================================
+    # ✅ Android SYSTEM BACK button support (prevent immediate exit)
+    # ============================================================
+    # Flet/Flutter triggers a window "close" attempt when the user presses
+    # Android system back (or swipe-back). If we don't intercept it, the app
+    # closes immediately even when we have internal navigation.
+    #
+    # We route that "close" attempt through handle_back_navigation(), so it
+    # behaves exactly like the in-app back icon.
+    try:
+        if hasattr(page, "window_prevent_close"):
+            # Prevent default close so we can decide whether to exit or navigate back.
+            page.window_prevent_close = True
+    except Exception as ex:
+        print(f"[BACK] window_prevent_close not supported: {ex}")
+
+    def _on_window_event(ev):
+        try:
+            data = getattr(ev, "data", None)
+            # Flet typically sends "close" for window close attempts.
+            if str(data).lower() == "close":
+                should_block_close = handle_back_navigation(None)
+                if should_block_close:
+                    # Navigation handled inside the app; keep window open.
+                    return
+                # User requested exit (double back at root): allow close now.
+                try:
+                    if hasattr(page, "window_prevent_close"):
+                        page.window_prevent_close = False
+                except Exception:
+                    pass
+                # Try best-effort close APIs (varies by Flet version/platform)
+                for fn_name in ("window_close", "window_destroy"):
+                    fn = getattr(page, fn_name, None)
+                    if callable(fn):
+                        try:
+                            fn()
+                            return
+                        except Exception:
+                            pass
+        except Exception as ex:
+            print(f"[BACK] on_window_event error: {ex}")
+
+    try:
+        if hasattr(page, "on_window_event"):
+            page.on_window_event = _on_window_event
+    except Exception as ex:
+        print(f"[BACK] page.on_window_event not supported: {ex}")
+
+    # Desktop fallback (ESC key): also use same navigation logic.
+    def _on_keyboard_event(k: ft.KeyboardEvent):
+        try:
+            key = (k.key or "").lower()
+            if key in ("escape", "backspace"):
+                should_block_close = handle_back_navigation(None)
+                # If user intended to exit, let window close normally.
+                if not should_block_close:
+                    try:
+                        if hasattr(page, "window_prevent_close"):
+                            page.window_prevent_close = False
+                    except Exception:
+                        pass
+                    for fn_name in ("window_close", "window_destroy"):
+                        fn = getattr(page, fn_name, None)
+                        if callable(fn):
+                            try:
+                                fn()
+                                break
+                            except Exception:
+                                pass
+        except Exception as ex:
+            print(f"[BACK] keyboard handler error: {ex}")
+
+    try:
+        if hasattr(page, "on_keyboard_event"):
+            page.on_keyboard_event = _on_keyboard_event
+    except Exception as ex:
+        print(f"[BACK] page.on_keyboard_event not supported: {ex}")
+
+
     # Auto-login check - NON-BLOCKING VERSION
     def check_auto_login():
         """Try auto-login in background - doesn't block UI"""
@@ -5583,7 +5801,7 @@ def main(page: ft.Page):
         load_notification_cache()
 
         # ✅ FIX 4: Load unread private messages count at startup
-        def load_unread_private_messages_count():
+        def load_unread_private_messages_count(spawn_thread=True):
             """Load unread private message count for notification badge"""
             print("[NOTIFICATION BADGE] Starting to load unread count...")
             
@@ -5609,7 +5827,16 @@ def main(page: ft.Page):
                         if total_unread > 0:
                             unread_private_messages["count"] = total_unread
                             print(f"[NOTIFICATION BADGE] From cache: {total_unread}")
-                            _private_ui(update_notification_badge)
+                            try:
+                                if hasattr(page, "call_from_thread"):
+                                    page.call_from_thread(update_notification_badge)
+                                else:
+                                    update_notification_badge()
+                            except Exception:
+                                try:
+                                    update_notification_badge()
+                                except Exception:
+                                    pass
                     
                     if not NetworkChecker.is_online():
                         print("[NOTIFICATION BADGE] Offline, using cache only")
@@ -5617,40 +5844,251 @@ def main(page: ft.Page):
                     
                     print(f"[NOTIFICATION BADGE] Fetching fresh data for user: {auth.user_id}")
                     
-                    # ✅ FIX 4: Use same logic as load_private_chats - count unseen messages
-                    all_users = _safe_get_all_users(db)
+                    # ✅ FIX 4 (REWORKED): Count unseen messages from actual chat threads (normal + CP threads)
                     total_unread = 0
                     chats_with_unread = 0
-                    
-                    for user in all_users:
-                        if user['id'] == auth.user_id:
-                            continue
-                        
-                        # Create chat ID using same logic
-                        chat_id = create_chat_id(auth.user_id, user['id'])
-                        
-                        # Check if chat is accepted
-                        status = _safe_get_chat_status(db, chat_id)
-                        if status != "accepted":
-                            continue
-                        
-                        # Get messages and count unseen ones (same logic as refresh_chats)
-                        messages = db.get_messages(chat_id)
-                        if messages:
-                            unread_count = sum(
-                                1 for msg in messages
-                                if msg.get('sender_id') != auth.user_id
-                                and not msg.get('seen', False)
-                            )
-                            
-                            if unread_count > 0:
-                                total_unread += unread_count
+
+                    # Build chat_id list fast from existing nodes
+                    chat_ids = []
+
+                    # 1) Normal private chats from /chats
+                    try:
+                        chat_keys = _safe_db_get_shallow(db, "chats") or {}
+                        if not isinstance(chat_keys, dict):
+                            chat_keys = {}
+                        for _cid in chat_keys.keys():
+                            try:
+                                if not isinstance(_cid, str):
+                                    continue
+                                # Only consider chats involving me
+                                if str(auth.user_id) not in _cid:
+                                    continue
+                                if _safe_get_chat_status(db, _cid) != "accepted":
+                                    continue
+                                chat_ids.append(_cid)
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+
+                    # 2) Custom Promoter (CP__) threads
+                    try:
+                        is_admin_user = (str(getattr(auth, "email", "") or "").strip().lower() == str(ADMIN_EMAIL).strip().lower())
+                    except Exception:
+                        is_admin_user = False
+
+                    cp_root = {}
+
+
+                    if is_admin_user:
+
+
+                        try:
+
+
+                            cp_root = _safe_db_get(db, "custom_promoter_threads") or {}
+
+
+                        except Exception:
+
+
+                            cp_root = {}
+
+
+                    else:
+
+
+                        # Rules-safe: many Firebase rules block reading the whole /custom_promoter_threads tree for normal users.
+
+
+                        # So we probe only *my* thread under each promoter id.
+
+
+                        try:
+
+
+                            _prom_keys = _safe_db_get_shallow(db, "custom_promoters") or {}
+
+
+                        except Exception:
+
+
+                            _prom_keys = {}
+
+
+                        _promoter_ids = list(_prom_keys.keys()) if isinstance(_prom_keys, dict) else []
+
+
+                        # Candidate keys (uid + fallbacks for older builds)
+
+
+                        _candidates = []
+
+
+                        try:
+
+
+                            _candidates.append(str(auth.user_id or ""))
+
+
+                        except Exception:
+
+
+                            pass
+
+
+                        try:
+
+
+                            _me_prof = _safe_get_user_profile(db, auth.user_id) or {}
+
+
+                            if isinstance(_me_prof, dict):
+
+
+                                if _me_prof.get("username"):
+
+
+                                    _candidates.append(str(_me_prof.get("username")))
+
+
+                                if _me_prof.get("email"):
+
+
+                                    _candidates.append(str(_me_prof.get("email")))
+
+
+                        except Exception:
+
+
+                            pass
+
+
+                        try:
+
+
+                            if getattr(auth, "email", None):
+
+
+                                _candidates.append(str(auth.email))
+
+
+                        except Exception:
+
+
+                            pass
+
+
+                        _candidates = [c for c in _candidates if c]
+
+
+                        _candidates = list(dict.fromkeys(_candidates))
+
+
+                        for _pid in _promoter_ids:
+
+
+                            for _k in _candidates:
+
+
+                                try:
+
+
+                                    _block = _safe_db_get(db, f"custom_promoter_threads/{_pid}/{_k}") or None
+
+
+                                except Exception:
+
+
+                                    _block = None
+
+
+                                if isinstance(_block, dict) and _block:
+
+
+                                    cp_root.setdefault(str(_pid), {})[str(_k)] = _block
+
+
+                                    break
+
+
+                    if isinstance(cp_root, dict) and cp_root:
+                        # candidates (uid/username/email) for non-admin matching
+                        candidates = []
+                        try:
+                            candidates.append(str(auth.user_id or ""))
+                        except Exception:
+                            pass
+                        try:
+                            _me_prof = _safe_get_user_profile(db, auth.user_id) or {}
+                            if isinstance(_me_prof, dict):
+                                if _me_prof.get("username"):
+                                    candidates.append(str(_me_prof.get("username")))
+                                if _me_prof.get("email"):
+                                    candidates.append(str(_me_prof.get("email")))
+                        except Exception:
+                            pass
+                        try:
+                            if getattr(auth, "email", None):
+                                candidates.append(str(auth.email))
+                        except Exception:
+                            pass
+                        candidates = [c for c in candidates if c]
+                        candidates = list(dict.fromkeys(candidates))
+
+                        for _pid, _umap in cp_root.items():
+                            if not isinstance(_umap, dict):
+                                continue
+                            if is_admin_user:
+                                for _k in list(_umap.keys()):
+                                    if _k and isinstance(_umap.get(_k), dict):
+                                        chat_ids.append(f"CP__{_pid}__{_k}")
+                            else:
+                                _found = None
+                                for _c in candidates:
+                                    if _c in _umap and isinstance(_umap.get(_c), dict):
+                                        _found = _c
+                                        break
+                                if _found:
+                                    chat_ids.append(f"CP__{_pid}__{_found}")
+
+                    # De-dup
+                    chat_ids = list(dict.fromkeys(chat_ids))
+
+                    # Count unread by scanning recent messages
+                    for _cid in chat_ids:
+                        try:
+                            perspective_id = str(auth.user_id or "")
+                            if isinstance(_cid, str) and _cid.startswith("CP__") and is_admin_user:
+                                _parts = _cid.split("__", 2)
+                                _pid = _parts[1] if len(_parts) > 1 else ""
+                                if _pid:
+                                    perspective_id = f"cp_{_pid}"
+                            try:
+                                _msgs = db.get_messages(_cid, limit=50)
+                            except TypeError:
+                                _msgs = db.get_messages(_cid) or []
+                            _un = 0
+                            for _m in (_msgs or []):
+                                if not isinstance(_m, dict):
+                                    continue
+                                if str(_m.get("sender_id", "")) != perspective_id and not bool(_m.get("seen", False)):
+                                    _un += 1
+                            if _un > 0:
+                                total_unread += _un
                                 chats_with_unread += 1
-                                print(f"[NOTIFICATION BADGE] Chat with {user.get('username', user['id'])}: {unread_count} unread")
-                    
+                        except Exception:
+                            continue
+
                     unread_private_messages["count"] = total_unread
                     print(f"[NOTIFICATION BADGE] Total: {total_unread} unread messages in {chats_with_unread} chats")
-                    update_notification_badge()
+                    try:
+                        if hasattr(page, "call_from_thread"):
+                            page.call_from_thread(update_notification_badge)
+                        else:
+                            update_notification_badge()
+                    except Exception:
+                        pass
                         
                 except Exception as fetch_ex:
                     print(f"[NOTIFICATION BADGE] Error: {fetch_ex}")
@@ -5658,10 +6096,22 @@ def main(page: ft.Page):
                     traceback.print_exc()
             
             # Run in background thread
-            threading.Thread(target=fetch_unread_count, daemon=True).start()
+            if spawn_thread:
+                threading.Thread(target=fetch_unread_count, daemon=True).start()
+            else:
+                fetch_unread_count()
 
         # ✅ FIX 4: Load unread count immediately when main menu loads
+        # Register badge refresh callback (used by global auto-refresh loop)
+        try:
+            badge_refresh_callback["fn"] = load_unread_private_messages_count
+        except Exception:
+            pass
         load_unread_private_messages_count()
+
+        # ✅ Start global badge auto-refresh (updates even without opening Private tab)
+        start_badge_auto_refresh(interval_sec=5)
+
 
         # ✅ NEW: Check for approved referrals and show notifications
         # Track notified keys to avoid duplicate notifications
@@ -6214,25 +6664,101 @@ def main(page: ft.Page):
             
             # Check if this is the old default group
             # Load group info for new groups
-            group_info_data = db.get_group_info_by_id(group_id)
-            members = db.get_group_members_by_id(group_id)
-            
-            # Check if user is member
-            is_member = any(m['id'] == auth.user_id for m in members)
-            
-            if not is_member:
+            group_info_data = db.get_group_info_by_id(group_id) or {}
+
+            # Global admin bypass (creator account)
+            try:
+                is_global_admin = (str(getattr(auth, "email", "") or "").strip().lower() == str(ADMIN_EMAIL).strip().lower())
+            except Exception:
+                is_global_admin = False
+
+            # ✅ Rules-safe membership check:
+            # Some RTDB rules block listing /members but allow reading /members/<uid>.
+            my_member = None
+            try:
+                my_member = db.get_group_member_record(group_id, auth.user_id)
+            except Exception:
+                my_member = None
+
+            # ✅ Custom promoter membership: allow cp_<pid> accounts if pid is listed under group's custom_promoters
+            if not my_member:
+                try:
+                    uid_str = str(getattr(auth, "user_id", "") or "")
+                    if uid_str.startswith("cp_"):
+                        cp_pid = uid_str[3:]
+                        cps = db.get_group_custom_promoters_by_id(group_id) or []
+                        cp_rec = None
+                        for _cp in cps:
+                            if isinstance(_cp, dict) and str(_cp.get("id")) == str(cp_pid):
+                                cp_rec = _cp
+                                break
+                        if cp_rec:
+                            my_member = {
+                                "username": current_username,
+                                "joined_at": int(cp_rec.get("added_at") or int(time.time() * 1000)),
+                                "is_admin": False,
+                                "is_custom_promoter": True,
+                            }
+                except Exception:
+                    pass
+
+            # If not a member, allow auto-join for BRONZE groups for registered promoters
+            if not my_member:
+                try:
+                    cat = str(group_info_data.get("category", "") or "").lower()
+                    name = str(group_info_data.get("name", "") or "").lower()
+                    is_bronze = ("bronze" in cat) or ("bronze" in name)
+                except Exception:
+                    is_bronze = False
+
+                if is_bronze and is_registered_promoter:
+                    print(f"🟤 Auto-joining Bronze group on open: {group_info_data.get('name', group_id)}")
+                    try:
+                        ok = db.add_member_to_group(group_id, auth.user_id, current_username, is_admin=False)
+                    except Exception:
+                        ok = False
+                    if ok:
+                        try:
+                            my_member = db.get_group_member_record(group_id, auth.user_id)
+                        except Exception:
+                            my_member = None
+
+            # If still not a member (and not a global admin), block entry
+            if not my_member and not is_global_admin:
                 show_snackbar("You are not a member of this group")
                 return
-            
+
+            # Try to load full members list (may be restricted by rules)
+            try:
+                members = db.get_group_members_by_id(group_id) or []
+            except Exception:
+                members = []
+
+            # If we cannot list members, fall back to minimal self record
+            if not members:
+                members = [{
+                    "id": auth.user_id,
+                    "username": current_username,
+                    "joined_at": (my_member or {}).get("joined_at") if isinstance(my_member, dict) else None,
+                    "is_admin": (my_member or {}).get("is_admin", False) if isinstance(my_member, dict) else False,
+                }]
+
             # Capture membership details for current user
             user_is_group_admin_check = False
             current_group_joined_at = None
-            for member in members:
-                if member['id'] == auth.user_id:
-                    user_is_group_admin_check = member.get('is_admin', False)
-                    current_group_joined_at = member.get('joined_at')
-                    break
-            
+            try:
+                for member in members:
+                    if member.get("id") == auth.user_id:
+                        user_is_group_admin_check = bool(member.get("is_admin", False))
+                        current_group_joined_at = member.get("joined_at")
+                        break
+                if current_group_joined_at is None and isinstance(my_member, dict):
+                    current_group_joined_at = my_member.get("joined_at")
+                if (not user_is_group_admin_check) and isinstance(my_member, dict):
+                    user_is_group_admin_check = bool(my_member.get("is_admin", False))
+            except Exception:
+                pass
+
             # Show group chat
             show_specific_group_chat(group_id, group_info_data, members, user_is_group_admin_check)
 
@@ -6636,6 +7162,7 @@ def main(page: ft.Page):
             
             page.clean()
             page.add(group_chat_screen)
+            refresh_group_pinned_banner(group_id)
             
             # Set the callback so file uploads can refresh messages
             nonlocal load_group_messages_callback
@@ -6651,6 +7178,145 @@ def main(page: ft.Page):
             # ✅ Start auto-refresh timer
             start_auto_refresh_messages(interval=5)
             refresh_control["active"] = True  # ✅ Enable refresh just like private chat
+
+        
+        # ------------------------------
+        # Pin / Unpin (creator only)
+        # ------------------------------
+        def _is_creator_account():
+            try:
+                return (str(getattr(auth, "email", "") or "").strip().lower() == str(ADMIN_EMAIL).strip().lower())
+            except Exception:
+                return False
+
+        def refresh_group_pinned_banner(group_id):
+            try:
+                pinned = None
+                getter = getattr(db, "get_group_pinned_message_by_id", None)
+                if callable(getter):
+                    pinned = getter(group_id)
+                if isinstance(pinned, dict) and pinned:
+                    pinned_state["data"] = pinned
+                    sender = pinned.get("sender_username") or "Unknown"
+                    txt = pinned.get("text") or pinned.get("file_name") or ""
+                    if not txt:
+                        txt = "(attachment)"
+                    pinned_title.value = f"Pinned • {sender}" + (" (Admin)" if pinned.get("is_admin") else "")
+                    pinned_body.value = txt
+                    pinned_banner.visible = True
+                    unpin_pinned_btn.visible = _is_creator_account()
+                else:
+                    pinned_state["data"] = None
+                    pinned_banner.visible = False
+                    unpin_pinned_btn.visible = False
+                page.update()
+            except Exception as ex:
+                print(f"[PIN] refresh error: {ex}")
+
+        def unpin_current_group(e=None):
+            try:
+                if not current_group_id:
+                    return
+                if not _is_creator_account():
+                    show_snackbar("Only creator can unpin")
+                    return
+                clearer = getattr(db, "clear_group_pinned_message_by_id", None)
+                ok = False
+                if callable(clearer):
+                    ok = bool(clearer(current_group_id))
+                if ok:
+                    show_snackbar("Unpinned")
+                else:
+                    show_snackbar("Failed to unpin")
+                refresh_group_pinned_banner(current_group_id)
+            except Exception as ex:
+                print(f"[PIN] unpin error: {ex}")
+
+        # Bind unpin click
+        unpin_pinned_btn.on_click = unpin_current_group
+
+        def pin_group_message(group_id, msg):
+            try:
+                if not _is_creator_account():
+                    show_snackbar("Only creator can pin messages")
+                    return
+                if not group_id or not isinstance(msg, dict):
+                    return
+
+                pinned_data = {
+                    "msg_id": msg.get("id"),
+                    "sender_id": msg.get("sender_id"),
+                    "sender_username": msg.get("sender_username"),
+                    "text": msg.get("text") or "",
+                    "file_url": msg.get("file_url") or "",
+                    "file_name": msg.get("file_name") or "",
+                    "file_size": msg.get("file_size") or 0,
+                    "timestamp": msg.get("timestamp") or 0,
+                    "is_admin": bool(msg.get("is_admin")),
+                    "pinned_at": int(time.time() * 1000),
+                    "pinned_by": auth.user_id,
+                    "pinned_by_name": current_username,
+                }
+
+                setter = getattr(db, "set_group_pinned_message_by_id", None)
+                ok = False
+                if callable(setter):
+                    ok = bool(setter(group_id, pinned_data))
+
+                if ok:
+                    show_snackbar("Message pinned")
+                else:
+                    show_snackbar("Failed to pin")
+                refresh_group_pinned_banner(group_id)
+            except Exception as ex:
+                print(f"[PIN] pin error: {ex}")
+
+        def open_pin_dialog(group_id, msg):
+            try:
+                if not _is_creator_account():
+                    return  # creator-only feature
+                preview = msg.get("text") or msg.get("file_name") or ""
+                if not preview:
+                    preview = "(attachment)"
+
+                is_same = False
+                try:
+                    pd = pinned_state.get("data") or {}
+                    is_same = bool(pd.get("msg_id") and msg.get("id") and pd.get("msg_id") == msg.get("id"))
+                except Exception:
+                    is_same = False
+
+                def do_pin(ev):
+                    dialog.open = False
+                    page.update()
+                    pin_group_message(group_id, msg)
+
+                def do_unpin(ev):
+                    dialog.open = False
+                    page.update()
+                    unpin_current_group()
+
+                def cancel(ev):
+                    dialog.open = False
+                    page.update()
+
+                actions = []
+                if is_same:
+                    actions.append(ft.TextButton("Unpin", on_click=do_unpin))
+                else:
+                    actions.append(ft.TextButton("Pin", on_click=do_pin))
+                actions.append(ft.TextButton("Cancel", on_click=cancel))
+
+                dialog = ft.AlertDialog(
+                    title=ft.Text("Message options"),
+                    content=ft.Text(preview, selectable=True),
+                    actions=actions
+                )
+                page.dialog = dialog
+                dialog.open = True
+                page.update()
+            except Exception as ex:
+                print(f"[PIN] dialog error: {ex}")
 
         def load_specific_group_messages(group_id):
             """Load messages for a specific group (always rebuild UI)"""
@@ -6703,6 +7369,8 @@ def main(page: ft.Page):
                             )
                             message_content.append(title_row)
 
+                        if is_me and is_msg_admin:
+                            message_content.append(ft.Text("👑 ADMIN", size=10, color='red', weight='bold'))
 
                         # Main text
                         if msg.get('text'):
@@ -6750,12 +7418,19 @@ def main(page: ft.Page):
                             alignment=ft.alignment.center_left if not is_me else ft.alignment.center_right
                         )
 
+                        # Flet GestureDetector uses on_long_press_start / on_long_press_end (not on_long_press)
+                        wrapped_card = ft.GestureDetector(
+                            content=message_card,
+                            on_long_press_end=lambda e, m=msg, gid=group_id: open_pin_dialog(gid, m),
+                        )
+
                         row = ft.Row(
-                            controls=[message_card],
+                            controls=[wrapped_card],
                             alignment=ft.MainAxisAlignment.END if is_me else ft.MainAxisAlignment.START
                         )
                         group_messages_list.controls.append(row)
 
+                refresh_group_pinned_banner(group_id)
                 page.update()
             except Exception as ex:
                 print(f"Error loading group messages: {ex}")
@@ -7166,8 +7841,10 @@ def main(page: ft.Page):
                                         ft.CircleAvatar(content=ft.Text(uname[:1].upper())),
                                         ft.Column(
                                             [
-                                                ft.Text(uname, size=14, weight="bold"),
-                                                ft.Row([role_chip], spacing=6),
+                                                ft.Row([
+                                                    ft.Text(uname, size=14, weight="bold"),
+                                                    role_chip,
+                                                ], spacing=6),
                                             ],
                                             spacing=2,
                                             expand=True,
@@ -7382,6 +8059,51 @@ def main(page: ft.Page):
         print(f"[PROMOTER CHECK] Referral ID: {promoter_referral_id}")
         print(f"[PROMOTER CHECK] Full Status: {promoter_status}")
         print(f"[PROMOTER CHECK] ===== END =====\n")
+
+        # ✅ Ensure all registered promoters are members of BRONZE groups (rules-safe)
+        def _auto_join_bronze_groups_on_login():
+            """For already-registered promoters, ensure Bronze auto-join still happens.
+
+            Important: some Firebase rules allow reading /members/<uid> but block listing /members,
+            so we must not rely on get_group_members_by_id() for verification.
+            """
+            if not is_registered_promoter:
+                return
+
+            def _worker():
+                try:
+                    all_groups = db.get_all_groups() or []
+                    joined = 0
+                    for g in all_groups:
+                        gid = g.get("id")
+                        if not gid:
+                            continue
+                        cat = str(g.get("category") or "").lower()
+                        name = str(g.get("name") or "").lower()
+                        is_bronze = ("bronze" in cat) or ("bronze" in name)
+                        if not is_bronze:
+                            continue
+
+                        # Rules-safe membership check
+                        if db.get_group_member_record(gid, auth.user_id):
+                            continue
+
+                        ok = db.add_member_to_group(gid, auth.user_id, current_username, is_admin=False)
+                        if ok:
+                            joined += 1
+
+                    if joined:
+                        print(f"🎉 Auto-joined {joined} Bronze group(s) on login")
+                        try:
+                            CacheManager.save_to_cache("groups", db.get_all_groups() or [])
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"⚠ Bronze auto-join (login) error: {e}")
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        _auto_join_bronze_groups_on_login()
 
         # State for showing registration form
         show_registration_form = {"visible": False}
@@ -8549,6 +9271,56 @@ def main(page: ft.Page):
             
             threading.Thread(target=register_thread, daemon=True).start()
         
+        def ensure_current_user_in_bronze_groups():
+            """Ensure the CURRENT user is a member of all Bronze groups (rules-safe)."""
+            try:
+                if not (db and getattr(auth, "user_id", None)):
+                    return
+                if not is_registered_promoter:
+                    return
+
+                try:
+                    groups = db.get_all_groups() or []
+                except Exception:
+                    groups = CacheManager.load_from_cache("groups") or []
+
+                joined = 0
+                if not isinstance(groups, list):
+                    groups = []
+
+                for g in groups:
+                    if not isinstance(g, dict):
+                        continue
+                    gid = g.get("id")
+                    if not gid:
+                        continue
+                    cat = str(g.get("category", "") or "").lower()
+                    name = str(g.get("name", "") or "").lower()
+                    is_bronze = ("bronze" in cat) or ("bronze" in name)
+                    if not is_bronze:
+                        continue
+
+                    # Already a member?
+                    try:
+                        rec = db.get_group_member_record(gid, auth.user_id)
+                        if isinstance(rec, dict) and rec:
+                            continue
+                    except Exception:
+                        pass
+
+                    try:
+                        ok = db.add_member_to_group(gid, auth.user_id, current_username, is_admin=False)
+                    except Exception:
+                        ok = False
+
+                    if ok:
+                        joined += 1
+
+                if joined:
+                    print(f"🟤 Auto-joined {joined} Bronze group(s) for current promoter")
+            except Exception as e:
+                print(f"⚠️ ensure_current_user_in_bronze_groups error: {e}")
+
         def reload_promoter_status():
             """Reload promoter status from Firebase profile - FIXED"""
             nonlocal is_registered_promoter, promoter_referral_id, promoter_status
@@ -8571,6 +9343,8 @@ def main(page: ft.Page):
                             promoter_referral_id = promoter_status.get("referral_id", "")
                             
                             print(f"✅ Reloaded promoter status: registered={is_registered_promoter}, referral_id={promoter_referral_id}")
+                            if is_registered_promoter:
+                                threading.Thread(target=ensure_current_user_in_bronze_groups, daemon=True).start()
                         else:
                             print("⚠️ No promoter_status found in profile")
                             is_registered_promoter = False
@@ -9082,8 +9856,14 @@ def main(page: ft.Page):
                         ft.Column([
                             ft.Row([
                                 ft.Text(uname, size=14, weight="bold"),
-                                                                ft.Text(" 👑", size=12) if is_admin_badge else ft.Container()
-                            ], spacing=5),
+                                ft.Container(
+                                    content=ft.Text("ADMIN", size=10, color="white", weight="bold"),
+                                    bgcolor="#F44336",
+                                    padding=3,
+                                    border_radius=5,
+                                    visible=is_admin_badge,
+                                ),
+                            ], spacing=6),
                             ft.Text(subtitle_text, size=11, color="grey") if subtitle_text else ft.Container()
                         ], spacing=2, expand=True),
                         ft.IconButton(
@@ -9101,6 +9881,8 @@ def main(page: ft.Page):
 
         # TAB 3 → PRIVATE CHATS (FIXED - removed duplicate code)
         private_chats_column = ft.Column(scroll="auto", expand=True, spacing=5)
+
+        private_refresh_state = {"running": False}
 
         def load_private_chats(force_refresh=False):
             """Load private chats - CACHE FIRST"""
@@ -9126,7 +9908,7 @@ def main(page: ft.Page):
             # Step 1: Load from cache immediately
             cached_chats = CacheManager.load_from_cache('private_chats')
             
-            if cached_chats and not force_refresh:
+            if cached_chats:
                 private_chats_cache["data"] = cached_chats  # ADD THIS
                 private_chats_cache["loaded"] = True  # ADD THIS
                 display_private_chats_from_cache(cached_chats)
@@ -9238,9 +10020,19 @@ def main(page: ft.Page):
                                 "sender_username": str(info.get("last_sender_name") or ""),
                                 "seen": True,
                             }
-                            # keep unread from last cache (fast)
+                            # Compute unread from recent messages so badges stay correct (limit fetch for speed)
+                            unread_count = 0
                             try:
-                                unread_count = int(private_unread_counts.get(chat_id, 0) or 0)
+                                try:
+                                    _msgs = db.get_messages(chat_id, limit=50)
+                                except TypeError:
+                                    _msgs = db.get_messages(chat_id) or []
+                                unread_count = sum(
+                                    1 for _m in (_msgs or [])
+                                    if isinstance(_m, dict)
+                                    and str(_m.get("sender_id", "")) != str(auth.user_id)
+                                    and not bool(_m.get("seen", False))
+                                )
                             except Exception:
                                 unread_count = 0
                         else:
@@ -9279,11 +10071,119 @@ def main(page: ft.Page):
                             "is_request": is_request,
                         })
 
-                    # ✅ ALSO include Custom Promoter threads inside Private Chats
+
+                    # ✅ Determine admin/creator once (used for CP thread listing + seen perspective)
                     try:
-                        cp_root = _safe_db_get(db, "custom_promoter_threads") or {}
+                        is_admin_user = (str(getattr(auth, "email", "") or "").strip().lower() == str(ADMIN_EMAIL).strip().lower())
                     except Exception:
-                        cp_root = {}
+                        is_admin_user = False
+
+                    # ✅ ALSO include Custom Promoter threads inside Private Chats
+                    cp_root = {}
+
+                    if is_admin_user:
+
+                        try:
+
+                            cp_root = _safe_db_get(db, "custom_promoter_threads") or {}
+
+                        except Exception:
+
+                            cp_root = {}
+
+                    else:
+
+                        # Rules-safe: many Firebase rules block reading the whole /custom_promoter_threads tree for normal users.
+
+                        # So we probe only *my* thread under each promoter id.
+
+                        try:
+
+                            _prom_keys = _safe_db_get_shallow(db, "custom_promoters") or {}
+
+                        except Exception:
+
+                            _prom_keys = {}
+
+                        _promoter_ids = list(_prom_keys.keys()) if isinstance(_prom_keys, dict) else []
+
+                        # Candidate keys (uid + fallbacks for older builds)
+
+                        _candidates = []
+
+                        try:
+
+                            _candidates.append(str(auth.user_id or ""))
+
+                        except Exception:
+
+                            pass
+
+                        try:
+
+                            _me_prof = _safe_get_user_profile(db, auth.user_id) or {}
+
+                            if isinstance(_me_prof, dict):
+
+                                if _me_prof.get("username"):
+
+                                    _candidates.append(str(_me_prof.get("username")))
+
+                                if _me_prof.get("email"):
+
+                                    _candidates.append(str(_me_prof.get("email")))
+
+                        except Exception:
+
+                            pass
+
+                        try:
+
+                            if getattr(auth, "email", None):
+
+                                _candidates.append(str(auth.email))
+
+                        except Exception:
+
+                            pass
+
+                        _candidates = [c for c in _candidates if c]
+
+                        _candidates = list(dict.fromkeys(_candidates))
+
+                        for _pid in _promoter_ids:
+
+                            for _k in _candidates:
+
+                                try:
+
+                                    _block = _safe_db_get(db, f"custom_promoter_threads/{_pid}/{_k}") or None
+
+                                except Exception:
+
+                                    _block = None
+
+                                if isinstance(_block, dict) and _block:
+
+                                    cp_root.setdefault(str(_pid), {})[str(_k)] = _block
+
+                                    break
+
+
+                    # ------------------------------------------------------------------
+                    # Merge Custom Promoter threads into Private list
+                    #
+                    # Normal users: only include THEIR own CP thread (key = uid/username/email).
+                    # Admin/Creator: include ALL CP threads so messages from ANY user show up.
+                    #
+                    # IMPORTANT: For CP threads, the "seen" perspective depends on viewer:
+                    #   - Normal user: perspective = auth.user_id (incoming from cp_<promoterId>)
+                    #   - Admin/Creator: perspective = cp_<promoterId> (incoming from user)
+                    # ------------------------------------------------------------------
+                    try:
+                        is_admin_user = (str(getattr(auth, "email", "") or "").strip().lower() == str(ADMIN_EMAIL).strip().lower())
+                    except Exception:
+                        is_admin_user = False
 
                     try:
                         existing_chat_ids = set()
@@ -9293,18 +10193,39 @@ def main(page: ft.Page):
                     except Exception:
                         existing_chat_ids = set()
 
-                    # Only if structure looks like dict(promoter_id -> dict(user_id -> {info, messages}))
-                    if isinstance(cp_root, dict):
-                        # candidates: UID is the normal key; keep fallbacks for older builds
+                    def _count_unread_from_messages(msgs, perspective_id):
+                        cnt = 0
+                        for _m in (msgs or []):
+                            if not isinstance(_m, dict):
+                                continue
+                            try:
+                                sender_id = str(_m.get("sender_id", ""))
+                                seen = bool(_m.get("seen", False))
+                                if sender_id != str(perspective_id) and not seen:
+                                    cnt += 1
+                            except Exception:
+                                continue
+                        return cnt
+
+                    # Only if structure looks like dict(promoter_id -> dict(user_key -> {info, messages}))
+                    if isinstance(cp_root, dict) and cp_root:
+                        # For non-admin users, we try to match their key in user_map.
+                        # Keep fallbacks for older builds that used username/email as key.
                         candidates = []
                         try:
-                            if auth.user_id:
-                                candidates.append(str(auth.user_id))
+                            candidates.append(str(auth.user_id or ""))
                         except Exception:
                             pass
                         try:
-                            if current_username:
-                                candidates.append(str(current_username))
+                            me_prof = _safe_get_user_profile(db, auth.user_id) or {}
+                        except Exception:
+                            me_prof = {}
+                        try:
+                            if isinstance(me_prof, dict):
+                                if me_prof.get("username"):
+                                    candidates.append(str(me_prof.get("username")))
+                                if me_prof.get("email"):
+                                    candidates.append(str(me_prof.get("email")))
                         except Exception:
                             pass
                         try:
@@ -9312,140 +10233,155 @@ def main(page: ft.Page):
                                 candidates.append(str(auth.email))
                         except Exception:
                             pass
+                        # de-dup, remove empties
+                        candidates = [c for c in candidates if c]
+                        candidates = list(dict.fromkeys(candidates))
 
                         for promoter_id, user_map in cp_root.items():
                             if not isinstance(user_map, dict):
                                 continue
 
-                            block = None
-                            block_key = None
-                            for k in candidates:
-                                if k in user_map and isinstance(user_map.get(k), dict):
-                                    block = user_map.get(k)
-                                    block_key = k
-                                    break
-                            if not isinstance(block, dict):
-                                continue
-
-                            info = block.get("info") if isinstance(block.get("info"), dict) else {}
-
-                            # Build pseudo-user for the promoter
+                            # Build promoter display info once
                             promoter_profile = _safe_db_get(db, f"custom_promoters/{promoter_id}") or {}
                             if not isinstance(promoter_profile, dict):
                                 promoter_profile = {}
-                            promoter_name = (
+                            promoter_name_base = (
                                 promoter_profile.get("name")
                                 or promoter_profile.get("username")
-                                or info.get("promoter_name")
-                                or info.get("last_sender_name")
                                 or "Promoter"
                             )
-                            promoter_pic = (
+                            promoter_pic_base = (
                                 promoter_profile.get("profile_image_url")
                                 or promoter_profile.get("profile_pic_url")
                                 or promoter_profile.get("photo_url")
                                 or ""
                             )
 
-                            cp_uid = f"cp_{promoter_id}"
-                            cp_user = {
-                                "id": cp_uid,
-                                "username": promoter_name,
-                                "email": "",
-                                "profile_image_url": promoter_pic,
-                                "is_custom_promoter": True,
-                                "promoter_id": promoter_id,
-                            }
-
-                            # chat_id must match the exact key used under:
-                            #   /custom_promoter_threads/<promoter_id>/<thread_user_key>/...
-                            # Prefer the matched key (UID/username/email), fallback to auth.user_id.
-                            thread_user_key = str(block_key or "")
-                            if not thread_user_key:
-                                thread_user_key = str(auth.user_id or "")
-                            cp_user["thread_user_id"] = thread_user_key
-
-                            cp_chat_id = f"CP__{promoter_id}__{thread_user_key}"
-                            if cp_chat_id in existing_chat_ids:
-                                continue
-
-                            # Fetch messages via unified router
-                            messages = db.get_messages(cp_chat_id)
-                            last_msg = messages[-1] if messages else None
-
-                            # If messages missing but info exists, fabricate a last_msg for sorting/display
-                            if not last_msg and info:
-                                try:
-                                    ts = int(info.get("last_message_at") or 0)
-                                except Exception:
-                                    ts = 0
-                                last_msg = {
-                                    "text": str(info.get("last_message") or "No messages yet"),
-                                    "timestamp": ts,
-                                    "sender_id": str(info.get("last_sender_id") or ""),
-                                    "sender_username": str(info.get("last_sender_name") or ""),
-                                    "seen": True,
-                                }
-
-                            # Include only if there is *some* activity
-                            if not messages and not (info.get("last_message_at") or info.get("last_message")):
-                                continue
-
-                            # Unread count
-                            unread_count = 0
-                            for msg in (messages or []):
-                                try:
-                                    sender_id = str(msg.get("sender_id", ""))
-                                    seen = bool(msg.get("seen", False))
-                                    if sender_id != str(auth.user_id) and not seen:
-                                        unread_count += 1
-                                except Exception:
+                            # Decide which thread keys to include
+                            thread_keys = []
+                            if is_admin_user:
+                                # Admin sees all user threads for this promoter
+                                thread_keys = [k for k in user_map.keys() if k and isinstance(user_map.get(k), dict)]
+                            else:
+                                # Non-admin only sees their own thread, matching UID/username/email
+                                found_key = None
+                                for k in candidates:
+                                    if k in user_map and isinstance(user_map.get(k), dict):
+                                        found_key = k
+                                        break
+                                if found_key:
+                                    thread_keys = [found_key]
+                                else:
                                     continue
 
-                            accepted_chats.append({
-                                "user": cp_user,
-                                "last_msg": last_msg,
-                                "unread": unread_count,
-                                "chat_id": cp_chat_id,
-                                "status": "accepted",
-                                "is_request": False,
-                            })
-                            existing_chat_ids.add(cp_chat_id)
+                            for thread_user_key in thread_keys:
+                                block = user_map.get(thread_user_key) or {}
+                                if not isinstance(block, dict):
+                                    continue
+                                info = block.get("info") if isinstance(block.get("info"), dict) else {}
 
+                                # Derive names/pics from info if available
+                                promoter_name = info.get("promoter_name") or promoter_name_base
+                                promoter_pic = info.get("promoter_pic") or promoter_pic_base
+                                user_name = info.get("user_name") or "User"
+                                user_pic = info.get("user_pic") or ""
 
-                    # ✅ De-duplicate by chat_id (prevents double listing if refresh overlaps)
+                                cp_uid = f"cp_{promoter_id}"
+                                cp_user = {
+                                    "id": cp_uid,
+                                    "username": str(promoter_name).strip() if promoter_name else "Promoter",
+                                    "email": "",
+                                    "profile_image_url": str(promoter_pic or ""),
+                                    "is_custom_promoter": True,
+                                    "promoter_id": str(promoter_id),
+                                    # Critical: which user thread this represents
+                                    "thread_user_id": str(thread_user_key),
+                                    "thread_user_key": str(thread_user_key),
+                                }
+
+                                cp_chat_id = f"CP__{promoter_id}__{thread_user_key}"
+                                if cp_chat_id in existing_chat_ids:
+                                    continue
+
+                                # Fetch recent messages (limit) and compute unread from correct perspective
+                                try:
+                                    messages = db.get_messages(cp_chat_id, limit=50)
+                                except TypeError:
+                                    messages = db.get_messages(cp_chat_id) or []
+                                last_msg = messages[-1] if messages else None
+
+                                if not last_msg and isinstance(info, dict) and (info.get("last_message_at") or info.get("last_message")):
+                                    try:
+                                        ts = int(info.get("last_message_at") or 0)
+                                    except Exception:
+                                        ts = 0
+                                    last_msg = {
+                                        "text": str(info.get("last_message") or "No messages yet"),
+                                        "timestamp": ts,
+                                        "sender_id": str(info.get("last_sender_id") or ""),
+                                        "sender_username": str(info.get("last_sender_name") or ""),
+                                        "seen": True,
+                                    }
+
+                                # Skip empty threads
+                                if not messages and not (info.get("last_message_at") or info.get("last_message")):
+                                    continue
+
+                                # Perspective id:
+                                # - Admin acts as cp_<promoterId> for unread/seen
+                                # - Normal user acts as their Firebase uid
+                                perspective_id = f"cp_{promoter_id}" if is_admin_user else str(auth.user_id or "")
+                                unread_count = _count_unread_from_messages(messages, perspective_id)
+
+                                accepted_chats.append({
+                                    "chat_id": cp_chat_id,
+                                    "user": cp_user,
+                                    "last_msg": last_msg,
+                                    "unread": unread_count,
+                                    # Used when marking as seen in CP threads
+                                    "seen_as": perspective_id,
+                                    "is_request": False,
+                                    "is_cp_thread": True,
+                                    "cp_promoter_id": str(promoter_id),
+                                    "cp_thread_user_key": str(thread_user_key),
+                                    # Extra display context (optional)
+                                    "cp_user_name": str(user_name),
+                                    "cp_user_pic": str(user_pic),
+                                })
+
+                    # Deduplicate by chat_id keeping newest
                     try:
                         _dedup = {}
                         for _it in accepted_chats:
                             _cid = (_it or {}).get("chat_id")
                             if not _cid:
                                 continue
-                            _ts = 0
-                            _lm = (_it or {}).get("last_msg") or {}
-                            if isinstance(_lm, dict):
-                                try:
-                                    _ts = int(_lm.get("timestamp") or 0)
-                                except Exception:
-                                    _ts = 0
                             _prev = _dedup.get(_cid)
                             if not _prev:
                                 _dedup[_cid] = _it
-                            else:
-                                _pts = 0
+                                continue
+                            _ts = 0
+                            try:
+                                _lm = (_it or {}).get("last_msg") or {}
+                                if isinstance(_lm, dict):
+                                    _ts = int(_lm.get("timestamp") or 0)
+                            except Exception:
+                                _ts = 0
+                            _pts = 0
+                            try:
                                 _plm = (_prev or {}).get("last_msg") or {}
                                 if isinstance(_plm, dict):
-                                    try:
-                                        _pts = int(_plm.get("timestamp") or 0)
-                                    except Exception:
-                                        _pts = 0
-                                if _ts >= _pts:
-                                    _dedup[_cid] = _it
+                                    _pts = int(_plm.get("timestamp") or 0)
+                            except Exception:
+                                _pts = 0
+                            if _ts >= _pts:
+                                _dedup[_cid] = _it
                         if _dedup:
                             accepted_chats = list(_dedup.values())
                     except Exception:
                         pass
 
-                    # Save to cache
+# Save to cache
                     CacheManager.save_to_cache('private_chats', accepted_chats)
 
                     # Store in cache dict
@@ -9514,6 +10450,44 @@ def main(page: ft.Page):
             print(f"[DISPLAY CHATS] Starting with {len(accepted_chats)} chats")
             private_chats_column.controls.clear()
 
+            # ✅ De-duplicate conversations (prevents duplicate rows and double-counted badges)
+            try:
+                def _conv_key(chat):
+                    u = chat.get("user") or {}
+                    if isinstance(u, dict) and u.get("is_custom_promoter"):
+                        pid = u.get("promoter_id") or str(u.get("id", "")).replace("cp_", "")
+                        return f"CP:{pid}"
+                    uid = u.get("id") if isinstance(u, dict) else str(u)
+                    return f"U:{uid}"
+
+                def _last_ts(chat):
+                    lm = chat.get("last_msg") or {}
+                    if isinstance(lm, dict):
+                        try:
+                            return int(lm.get("timestamp") or 0)
+                        except Exception:
+                            return 0
+                    return 0
+
+                def _pri(chat):
+                    st = (chat.get("status") or "").lower()
+                    if st == "accepted":
+                        return 2
+                    if st == "pending":
+                        return 1
+                    return 0
+
+                best = {}
+                for c in accepted_chats:
+                    k = _conv_key(c)
+                    p = best.get(k)
+                    if (p is None) or ((_pri(c), _last_ts(c)) > (_pri(p), _last_ts(p))):
+                        best[k] = c
+                accepted_chats = list(best.values())
+            except Exception as _dedup_ex:
+                print(f"[PRIVATE LIST] Dedup error: {_dedup_ex}")
+
+
             try:
                 private_unread_counts.clear()
                 for chat in accepted_chats:
@@ -9535,15 +10509,17 @@ def main(page: ft.Page):
                 if c.get('status') == 'pending' and c.get('is_request')
             )
 
-            # Update Private tab icon (index 2)
+            # Update Private tab icon (safe index)
             try:
+                private_idx = 4 if hasattr(bottom_nav, "destinations") and len(bottom_nav.destinations) > 4 else 2
                 if pending_count > 0:
-                    bottom_nav.destinations[2].icon = ft.Icon(ft.Icons.PERSON_OUTLINED, color="red")
+                    bottom_nav.destinations[private_idx].icon = ft.Icon(ft.Icons.PERSON_OUTLINED, color="red")
                 else:
-                    bottom_nav.destinations[2].icon = ft.Icon(ft.Icons.PERSON_OUTLINED)
+                    bottom_nav.destinations[private_idx].icon = ft.Icon(ft.Icons.PERSON_OUTLINED)
                 bottom_nav.update()
             except Exception as e:
                 print(f"Private tab badge update error: {e}")
+
 
             if not accepted_chats:
                 private_chats_column.controls.append(
@@ -9598,15 +10574,32 @@ def main(page: ft.Page):
                     
                     print(f"[PRIVATE CHAT DEBUG] User data: {user.get('id')}, username type: {type(user.get('username'))}, extracted uname: {uname}")
 
-                    # Avatar from cache
-                    cached_path = None
-                    user_profile = _safe_get_user_profile(db, user['id'])
-                    if user_profile and user_profile.get('profile_image_url'):
-                        cached_path = ImageCache.get_cached_image(user_profile['profile_image_url'], "profile")
+                    # Avatar (cache OR direct URL)
+                    profile_url = ""
+                    try:
+                        # Custom promoters may already carry profile_image_url in the chat row
+                        if isinstance(user, dict) and user.get("profile_image_url"):
+                            profile_url = str(user.get("profile_image_url") or "").strip()
+                        else:
+                            user_profile = _safe_get_user_profile(db, user['id'])
+                            if user_profile and user_profile.get('profile_image_url'):
+                                profile_url = str(user_profile.get('profile_image_url') or "").strip()
+                    except Exception:
+                        profile_url = ""
 
-                    if cached_path:
+                    cached_path = None
+                    if profile_url:
+                        try:
+                            cached_path = ImageCache.get_cached_image(profile_url, "profile")
+                        except Exception:
+                            cached_path = None
+
+                    avatar_src = cached_path or profile_url
+
+                    if avatar_src:
+                        # ✅ Works even if cache is empty (loads from URL)
                         avatar = ft.Image(
-                            src=cached_path,
+                            src=avatar_src,
                             width=50,
                             height=50,
                             fit=ft.ImageFit.COVER,
@@ -9808,7 +10801,11 @@ def main(page: ft.Page):
                 referral_idx = find_index(["referral_id", "referral id"], 4)  # Column E
                 earnings_idx = find_index(["total_earnings", "total earnings", "earnings"], 16)  # Column Q
                 
-                print(f"[HOF] Column indexes - Referral: {referral_idx}, Earnings: {earnings_idx}")
+                name_idx = find_index(
+                    ["promoter full name", "promoter_full_name", "promoter name", "promoter_name", "name", "username"],
+                    1,
+                )  # Best-effort name column
+                print(f"[HOF] Column indexes - Referral: {referral_idx}, Earnings: {earnings_idx}, Name: {name_idx}")
                 
                 # Extract promoters with earnings
                 promoters_data = []
@@ -9826,7 +10823,8 @@ def main(page: ft.Page):
                         if referral_id and earnings > 0:
                             promoters_data.append({
                                 "referral_id": referral_id,
-                                "earnings": earnings
+                                "earnings": earnings,
+                                "name": (row[name_idx].strip() if len(row) > name_idx else "") if name_idx is not None else ""
                             })
                     except Exception as row_err:
                         print(f"[HOF] Error parsing row {row_idx}: {row_err}")
@@ -9861,9 +10859,31 @@ def main(page: ft.Page):
                 all_users = _safe_get_all_users(db)
                 
                 if not all_users:
-                    print("[HOF] No users found in Firebase")
-                    return []
-                
+                    # ✅ Fallback for non-admin users / restrictive rules:
+                    # If we can't list all Firebase users, still show Hall of Fame using Sheet names.
+                    print("[HOF] Firebase user list not accessible - using Sheet-only fallback")
+                    matched_entries = []
+                    for rank, promoter in enumerate(promoters_data, start=1):
+                        ref_id = promoter.get("referral_id", "")
+                        earnings = promoter.get("earnings", 0)
+                        name = promoter.get("name") or (f"Promoter {ref_id}" if ref_id else "Promoter")
+                        highlight = None
+                        if rank == 1:
+                            highlight = "gold"
+                        elif rank == 2:
+                            highlight = "silver"
+                        elif rank == 3:
+                            highlight = "bronze"
+                        matched_entries.append({
+                            "rank": rank,
+                            "name": str(name),
+                            "referral_id": str(ref_id),
+                            "earnings": earnings,
+                            "profile_image_url": "",
+                            "highlight": highlight,
+                        })
+                    return matched_entries
+
                 # Create a map of referral_id -> user info
                 referral_to_user = {}
                 for user in all_users:
@@ -9972,6 +10992,7 @@ def main(page: ft.Page):
 
                 if entries:
                     entries.sort(key=_earn, reverse=True)
+                    entries = entries[:10]  # ✅ Limit Hall of Fame to top 10
                     for i, en in enumerate(entries, start=1):
                         en["rank"] = i
                         if i == 1:
@@ -10985,6 +12006,11 @@ def main(page: ft.Page):
                 user_name = t.get("user_name") or "User"
                 last_msg = (t.get("last_message") or "").strip()
                 last_at = _fmt_custom_time(t.get("last_message_at") or 0)
+                unread_n = 0
+                try:
+                    unread_n = int(t.get("unread", 0) or 0)
+                except Exception:
+                    unread_n = 0
 
                 # Prefer promoter pic; fallback to user pic; else initial
                 pic = (t.get("promoter_pic") or t.get("user_pic") or "").strip()
@@ -11010,7 +12036,18 @@ def main(page: ft.Page):
                                 spacing=2,
                                 expand=True,
                             ),
-                            ft.Text(last_at, size=10, color="grey"),
+                            ft.Column([
+                                ft.Text(last_at, size=10, color="grey"),
+                                ft.Container(
+                                    content=ft.Text(str(unread_n), size=11, color="white", weight="bold"),
+                                    bgcolor="red",
+                                    border_radius=12,
+                                    width=24 if unread_n < 10 else 28,
+                                    height=24,
+                                    alignment=ft.alignment.center,
+                                    visible=(unread_n > 0),
+                                ),
+                            ], spacing=4, horizontal_alignment="center"),
                         ],
                         spacing=10,
                         alignment="spaceBetween",
@@ -11044,6 +12081,23 @@ def main(page: ft.Page):
                                 info = block.get("info") or {}
                                 if not isinstance(info, dict):
                                     info = {}
+                                # Unread for creator/admin inbox: count user->promoter messages not yet seen by promoter
+                                unread_count = 0
+                                try:
+                                    cp_chat_id = f"CP__{promoter_id}__{user_id}"
+                                    try:
+                                        _msgs = db.get_messages(cp_chat_id, limit=50)
+                                    except TypeError:
+                                        _msgs = db.get_messages(cp_chat_id) or []
+                                    unread_count = sum(
+                                        1 for _m in (_msgs or [])
+                                        if isinstance(_m, dict)
+                                        and str(_m.get("sender_id", "")) != f"cp_{promoter_id}"
+                                        and not bool(_m.get("seen", False))
+                                    )
+                                except Exception:
+                                    unread_count = 0
+
                                 threads.append({
                                     "promoter_id": promoter_id,
                                     "user_id": user_id,
@@ -11053,6 +12107,7 @@ def main(page: ft.Page):
                                     "user_pic": info.get("user_pic") or "",
                                     "last_message_at": info.get("last_message_at") or 0,
                                     "last_message": info.get("last_message") or "",
+                                    "unread": unread_count,
                                 })
                     threads.sort(key=lambda x: int(x.get("last_message_at") or 0), reverse=True)
                     custom_state["threads"] = threads
@@ -11225,6 +12280,11 @@ def main(page: ft.Page):
                                 messages.append(d)
 
                     messages.sort(key=lambda x: (x.get("timestamp") or 0))
+                    # Mark user->promoter messages as seen from promoter perspective (cp_<promoter_id>)
+                    try:
+                        db.mark_messages_as_seen(f"CP__{promoter_id}__{user_id}", f"cp_{promoter_id}")
+                    except Exception:
+                        pass
                     _custom_ui(lambda: _render_custom_messages(thread, messages))
                 except Exception as ex:
                     print(f"[CUSTOM TAB] Thread load error: {ex}")
@@ -11397,7 +12457,7 @@ def main(page: ft.Page):
                 ft.NavigationBarDestination(
                     icon=ft.Icons.WALLET_OUTLINED,
                     selected_icon=ft.Icons.WALLET,
-                    label="Promoter"
+                    label="Wallet"
                 ),
                 ft.NavigationBarDestination(
                     icon=ft.Icons.EMOJI_EVENTS_OUTLINED,
@@ -11412,7 +12472,7 @@ def main(page: ft.Page):
                 ft.NavigationBarDestination(
                     icon=ft.Icons.PEOPLE_OUTLINED,
                     selected_icon=ft.Icons.PEOPLE,
-                    label="Members"
+                    label="Promoters"
                 ),
                 ft.NavigationBarDestination(
                     icon=ft.Icons.PERSON_OUTLINED,
@@ -12355,6 +13415,53 @@ def main(page: ft.Page):
                     except:
                         pass
                     
+                    # 🟤 BRONZE GROUP: auto-add ALL registered promoters as members (creator-side)
+                    try:
+                        cat_new = str((group_data.get("info", {}) or {}).get("category", "") or "").lower()
+                        name_new = str((group_data.get("info", {}) or {}).get("name", "") or "").lower()
+                        is_bronze_new = ("bronze" in cat_new) or ("bronze" in name_new)
+                    except Exception:
+                        is_bronze_new = False
+
+                    if is_bronze_new:
+                        def _bulk_add_registered_promoters():
+                            try:
+                                users = db.get_all_users() or []
+                            except Exception as e:
+                                print(f"[GROUP][BRONZE] Could not read /users: {e}")
+                                users = []
+
+                            added = 0
+                            for u in users:
+                                try:
+                                    if not isinstance(u, dict):
+                                        continue
+                                    uid = u.get("id")
+                                    if not uid or uid == auth.user_id:
+                                        continue
+
+                                    ps = u.get("promoter_status") or {}
+                                    reg = bool(ps.get("registered")) if isinstance(ps, dict) else False
+                                    if not reg:
+                                        continue
+
+                                    uname = u.get("username")
+                                    if not isinstance(uname, str) or not uname.strip():
+                                        em = u.get("email", "")
+                                        if isinstance(em, str) and "@" in em:
+                                            uname = em.split("@")[0]
+                                        else:
+                                            uname = f"User_{str(uid)[:6]}"
+
+                                    ok = db.add_member_to_group(group_id, uid, str(uname), is_admin=False)
+                                    if ok:
+                                        added += 1
+                                except Exception as ex:
+                                    print(f"[GROUP][BRONZE] add_member error: {ex}")
+
+                            print(f"🟤 [GROUP][BRONZE] Auto-added {added} registered promoters to new Bronze group")
+                        threading.Thread(target=_bulk_add_registered_promoters, daemon=True).start()
+
                     time.sleep(1)
                     show_main_menu()
                 else:
@@ -13226,7 +14333,18 @@ def main(page: ft.Page):
 
                 # Mark as seen if accepted
                 if chat_status == "accepted":
-                    db.mark_messages_as_seen(current_chat_id, auth.user_id)
+                    # For CP threads: creator/admin must mark seen as cp_<promoterId> (NOT their uid),
+                    # otherwise it wrongly clears the user's unread state.
+                    seen_user_id = auth.user_id
+                    try:
+                        if isinstance(current_chat_id, str) and current_chat_id.startswith("CP__"):
+                            parts = current_chat_id.split("__", 2)
+                            _pid = parts[1] if len(parts) > 1 else ""
+                            if _pid and (str(getattr(auth, "email", "") or "").strip().lower() == str(ADMIN_EMAIL).strip().lower()):
+                                seen_user_id = f"cp_{_pid}"
+                    except Exception:
+                        pass
+                    db.mark_messages_as_seen(current_chat_id, seen_user_id)
                     private_unread_counts[current_chat_id] = 0
                     unread_private_messages["count"] = sum(private_unread_counts.values())
                     update_notification_badge()
@@ -13607,6 +14725,7 @@ def main(page: ft.Page):
                 padding=ft.padding.only(left=10, right=10, top=30, bottom=10),
                 bgcolor="#E3F2FD"
             ),
+            pinned_banner,
             ft.Container(content=group_messages_list, padding=20, expand=True),
             ft.Container(
                 content=ft.Row([
