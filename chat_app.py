@@ -2335,6 +2335,8 @@ class FirebaseDatabase:
             "username": username,
             "joined_at": int(time.time() * 1000),
             "is_admin": is_admin,
+            "joined": True,
+            "notify_enabled": True,
         }
 
         def _make_member_url(token):
@@ -7421,7 +7423,9 @@ def main(page: ft.Page):
                         # Flet GestureDetector uses on_long_press_start / on_long_press_end (not on_long_press)
                         wrapped_card = ft.GestureDetector(
                             content=message_card,
-                            on_long_press_end=lambda e, m=msg, gid=group_id: open_pin_dialog(gid, m),
+                            on_long_press_start=lambda e, m=msg, gid=group_id: open_pin_dialog(gid, m),
+                            # Avoid duplicate dialogs on some platforms
+                            on_long_press_end=lambda e: None,
                         )
 
                         row = ft.Row(
@@ -10937,11 +10941,26 @@ def main(page: ft.Page):
                 traceback.print_exc()
                 return []
 
-        def load_hof_data(scope="global"):
+        def load_hof_data(scope="global", force_refresh=False):
             """Load Hall of Fame data from real sources"""
             try:
                 hof_state["loading"] = True
                 hof_state["scope"] = scope
+
+                # Daily cache: refresh at most once per calendar day (persists across restarts)
+                cache_key = f"hof_{scope}"
+                if not force_refresh:
+                    try:
+                        cached = DailyCacheManager.load(cache_key)
+                        if cached is not None:
+                            print("✅ Using DAILY cached Hall of Fame data")
+                            hof_state["entries"] = cached
+                            hof_state["initialized"] = True
+                            hof_state["last_refresh"] = datetime.now()
+                            hof_state["loading"] = False
+                            return
+                    except Exception as _dc_ex:
+                        print(f"[HOF] Daily cache load error: {_dc_ex}")
 
                 print("[HOF] Loading real data...")
 
@@ -11005,6 +11024,12 @@ def main(page: ft.Page):
                             en["highlight"] = ""
 
                     hof_state["entries"] = entries
+
+                    # Save to daily cache (per calendar day)
+                    try:
+                        DailyCacheManager.save(cache_key, entries)
+                    except Exception as _dc_save_ex:
+                        print(f"[HOF] Daily cache save error: {_dc_save_ex}")
                     hof_state["initialized"] = True
                     hof_state["last_refresh"] = datetime.now()
                     print(f"[HOF] Loaded {len(entries)} total entries (base={len(base_entries)}, custom={len(custom_entries)})")
@@ -11349,11 +11374,11 @@ def main(page: ft.Page):
                 import traceback
                 traceback.print_exc()
 
-        def load_hof_data_async():
+        def load_hof_data_async(force_refresh=False):
             """Load Hall of Fame data in background thread"""
             def background_load():
                 try:
-                    load_hof_data("global")
+                    load_hof_data("global", force_refresh=force_refresh)
                     refresh_hof_view()
                 except Exception as e:
                     print(f"[HOF] Background load error: {e}")
@@ -12521,7 +12546,7 @@ def main(page: ft.Page):
                     print("[HOF] Pull refresh - reloading data async...")
                     hof_state["loading"] = True
                     refresh_hof_view()  # Show loading state
-                    load_hof_data_async()
+                    load_hof_data_async(force_refresh=True)
                 elif selected_index == 2:
                     # Groups tab
                     load_groups_list(force_refresh=True)
@@ -14670,7 +14695,15 @@ def main(page: ft.Page):
                         notification_count = 0
                         for member in members:
                             member_id = member.get('id')
-                            if member_id and member_id != auth.user_id:
+                            # Only notify users who are actually joined members
+                            notify_enabled = bool(member.get("notify_enabled", True))
+                            is_joined = bool(
+                                member.get("joined", True)
+                                or member.get("is_joined", False)
+                                or member.get("joined_at")
+                            )
+
+                            if member_id and member_id != auth.user_id and is_joined and notify_enabled:
                                 print(f"[GROUP-NOTIFICATION] Sending to member: {member_id}")
                                 
                                 result = db.send_onesignal_notification(
