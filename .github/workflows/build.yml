@@ -28,7 +28,24 @@ jobs:
           flutter-version: "3.24.0"
 
       - name: Install Flet and Python dependencies
-        run: pip install -r requirements.txt
+        run: |
+          echo "📦 Installing Flet 0.28.3 (compatible with OneSignal)..."
+          
+          # Uninstall any existing versions
+          pip uninstall -y flet flet-cli 2>/dev/null || true
+          
+          # Install exact compatible versions
+          pip install flet==0.28.3 flet-cli==0.28.3
+          
+          # Install other dependencies
+          if [ -f requirements.txt ]; then
+            # Install remaining deps (skip flet if already in requirements.txt)
+            pip install -r requirements.txt
+          fi
+          
+          # Verify versions
+          echo "✅ Installed versions:"
+          pip show flet flet-cli | grep "Name\|Version"
 
       - name: Write Firebase & Google Sheets config files
         env:
