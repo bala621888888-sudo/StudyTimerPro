@@ -37,7 +37,7 @@ module = "chat_app"
 # =========================
 [tool.flet.android]
 package = "com.flet.chat_app"
-min_sdk_version = 23
+min_sdk_version = 21
 target_sdk_version = 34
 compile_sdk_version = 34
 
