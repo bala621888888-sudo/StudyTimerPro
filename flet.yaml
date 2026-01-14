@@ -6,6 +6,7 @@ module: chat_app
 
 android:
   package: com.chatapp.mobile
+  min_sdk_version: 23
   permissions:
     - INTERNET
     - ACCESS_NETWORK_STATE
