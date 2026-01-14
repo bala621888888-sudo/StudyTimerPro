@@ -22,13 +22,19 @@ jobs:
           distribution: "temurin"
           java-version: "17"
 
+      # ✅ FIX: Install Flutter version REQUIRED by Flet
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.24.0"
+          flutter-version: "3.38.5"
+          channel: stable
 
-      - name: Install Flet and Python dependencies
-        run: pip install -r requirements.txt
+      # ✅ FIX: Install flet-cli explicitly
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flet-cli==0.80.1
+          pip install -r requirements.txt
 
       - name: Write Firebase & Google Sheets config files
         env:
@@ -78,7 +84,7 @@ jobs:
           GCP_GSHEET_CREDS: ${{ secrets.GCP_GSHEET_CREDS }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
 
-          # ✅ OneSignal via Secrets (NO hardcode in repo)
+          # ✅ OneSignal via Secrets
           ONESIGNAL_REST_API_KEY: ${{ secrets.ONESIGNAL_REST_API_KEY }}
           ONESIGNAL_APP_ID: ${{ secrets.ONESIGNAL_APP_ID }}
         run: |
