@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.chatapp.mobile">
+    package="com.flet.chat_app">
+    
+    <!-- ✅ Add minSdkVersion here -->
+    <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="34" />
     
     <!-- SMS Auto-read permissions -->
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
@@ -25,7 +28,7 @@
         android:debuggable="true"
         android:icon="@mipmap/ic_launcher">
         <activity
-            android:name="com.flet.MainActivity"
+            android:name="com.flet.chat_app.MainActivity"
             android:exported="true"
             android:launchMode="singleTop">
             <intent-filter>
