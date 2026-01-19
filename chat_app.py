@@ -1169,12 +1169,12 @@ class OTPManager:
                 msg = MIMEMultipart()
                 msg['From'] = EMAIL_CONFIG['sender_email']
                 msg['To'] = email
-                msg['Subject'] = "Your Chat App Login OTP"
+                msg['Subject'] = "Your ST Promoter Login OTP"
                 
                 body = f"""
                 <html>
                     <body style="font-family: Arial, sans-serif; padding: 20px;">
-                        <h2 style="color: #2196F3;">Chat App Login</h2>
+                        <h2 style="color: #2196F3;">ST promoter Login</h2>
                         <p>Your OTP code is:</p>
                         <h1 style="color: #4CAF50; font-size: 48px; letter-spacing: 10px;">{otp}</h1>
                         <p>This code will expire in 5 minutes.</p>
@@ -1693,12 +1693,12 @@ class OTPManager:
                 msg = MIMEMultipart()
                 msg['From'] = EMAIL_CONFIG['sender_email']
                 msg['To'] = email
-                msg['Subject'] = "Your Chat App Login OTP"
+                msg['Subject'] = "Your ST promoter Login OTP"
                 
                 body = f"""
                 <html>
                     <body style="font-family: Arial, sans-serif; padding: 20px;">
-                        <h2 style="color: #2196F3;">Chat App Login</h2>
+                        <h2 style="color: #2196F3;">ST promoter Login</h2>
                         <p>Your OTP code is:</p>
                         <h1 style="color: #4CAF50; font-size: 48px; letter-spacing: 10px;">{otp}</h1>
                         <p>This code will expire in 5 minutes.</p>
@@ -4218,7 +4218,7 @@ def main(page: ft.Page):
     # ============================================
     # CRITICAL: Set page properties FIRST
     # ============================================
-    page.title = "Chat App"
+    page.title = "ST promoter"
     page.padding = 0
 
     # ============================================
@@ -4690,7 +4690,7 @@ def main(page: ft.Page):
                         ft.Container(
                             content=ft.Row([
                                 ft.Icon(ft.Icons.LIGHTBULB, size=16, color="orange"),
-                                ft.Text("Or: Settings → Apps → Chat App → Notifications", 
+                                ft.Text("Or: Settings → Apps → ST promoter → Notifications", 
                                        size=11, color="grey", italic=True, expand=True)
                             ], spacing=5),
                             bgcolor="#FFF3E0",
@@ -6769,6 +6769,9 @@ def main(page: ft.Page):
             """Show chat screen for a specific group"""
             nonlocal current_group_id, group_info, user_is_group_admin, current_group_joined_at
             
+            # State for messaging as fake promoter (creator-only feature)
+            selected_fake_promoter = {"promoter_id": None, "promoter_name": None, "promoter_pic": None}
+            
             active_screen["current"] = "group_chat"
             current_group_id = group_id
             user_is_group_admin = user_is_admin_in_group
@@ -7000,6 +7003,112 @@ def main(page: ft.Page):
 
                 threading.Thread(target=_load_group_custom_promoters, daemon=True).start()
 
+                # Creator-only feature: Message as Fake Promoter
+                fake_promoter_controls = []
+                if is_admin:  # Only for creator (bala6218888@gmail.com)
+                    # Status text showing current selection
+                    promoter_status = ft.Text(
+                        f"Currently messaging as: {selected_fake_promoter['promoter_name'] or 'Yourself'}", 
+                        size=12, 
+                        color="blue" if selected_fake_promoter['promoter_id'] else "grey"
+                    )
+                    
+                    # Dropdown for selecting promoter
+                    promoter_dropdown = ft.Dropdown(
+                        label="Message as Fake Promoter",
+                        hint_text="Select a promoter...",
+                        width=300,
+                        on_change=None  # Will be set below
+                    )
+                    
+                    def update_promoter_dropdown():
+                        """Populate dropdown with available custom promoters"""
+                        try:
+                            items = db.get_group_custom_promoters_by_id(group_id) or []
+                            promoter_dropdown.options = []
+                            
+                            # Add "Reset to yourself" option
+                            promoter_dropdown.options.append(
+                                ft.dropdown.Option(key="RESET", text="✖️ Message as yourself")
+                            )
+                            
+                            # Add each custom promoter
+                            for item in items:
+                                p_id = item.get("id")
+                                p_name = item.get("name", "Promoter")
+                                if p_id:
+                                    promoter_dropdown.options.append(
+                                        ft.dropdown.Option(key=p_id, text=p_name)
+                                    )
+                            
+                            # Set current selection
+                            if selected_fake_promoter['promoter_id']:
+                                promoter_dropdown.value = selected_fake_promoter['promoter_id']
+                            else:
+                                promoter_dropdown.value = "RESET"
+                                
+                            page.update()
+                        except Exception as ex:
+                            print(f"[FAKE PROMOTER] Dropdown update error: {ex}")
+                    
+                    def on_promoter_selected(e):
+                        """Handle promoter selection from dropdown"""
+                        try:
+                            selected_key = e.control.value
+                            
+                            if selected_key == "RESET":
+                                # Reset to messaging as yourself
+                                selected_fake_promoter['promoter_id'] = None
+                                selected_fake_promoter['promoter_name'] = None
+                                selected_fake_promoter['promoter_pic'] = None
+                                promoter_status.value = "Currently messaging as: Yourself"
+                                promoter_status.color = "grey"
+                                show_snackbar("✅ Reset to messaging as yourself")
+                            else:
+                                # Find the selected promoter
+                                items = db.get_group_custom_promoters_by_id(group_id) or []
+                                for item in items:
+                                    if item.get("id") == selected_key:
+                                        selected_fake_promoter['promoter_id'] = item.get("id")
+                                        selected_fake_promoter['promoter_name'] = item.get("name", "Promoter")
+                                        selected_fake_promoter['promoter_pic'] = item.get("profile_image_url", "")
+                                        promoter_status.value = f"Currently messaging as: {selected_fake_promoter['promoter_name']}"
+                                        promoter_status.color = "blue"
+                                        show_snackbar(f"✅ Now messaging as {selected_fake_promoter['promoter_name']}")
+                                        break
+                            
+                            page.update()
+                        except Exception as ex:
+                            print(f"[FAKE PROMOTER] Selection error: {ex}")
+                            show_snackbar(f"Error selecting promoter: {ex}")
+                    
+                    promoter_dropdown.on_change = on_promoter_selected
+                    
+                    # Load promoters into dropdown in background
+                    def load_dropdown():
+                        time.sleep(0.5)  # Wait for dialog to open
+                        try:
+                            if hasattr(page, "call_from_thread"):
+                                page.call_from_thread(update_promoter_dropdown)
+                            else:
+                                update_promoter_dropdown()
+                        except:
+                            pass
+                    
+                    threading.Thread(target=load_dropdown, daemon=True).start()
+                    
+                    fake_promoter_controls = [
+                        ft.Container(height=15),
+                        ft.Divider(),
+                        ft.Container(height=10),
+                        ft.Text("🎭 Message as Fake Promoter", size=15, weight="bold"),
+                        ft.Container(height=5),
+                        promoter_status,
+                        ft.Container(height=8),
+                        promoter_dropdown,
+                        ft.Container(height=10),
+                    ]
+
                 # Admin buttons
 
                 def _open_edit_group_info_from_info(ev):
@@ -7127,6 +7236,7 @@ def main(page: ft.Page):
                                 border=ft.border.all(1, "#E0E0E0"),
                                 border_radius=8
                             ),                            *custom_section_controls,
+                            *fake_promoter_controls,
                             *admin_buttons
                         ], horizontal_alignment="center", scroll="auto"),
                         width=350,
@@ -7420,11 +7530,42 @@ def main(page: ft.Page):
                             alignment=ft.alignment.center_left if not is_me else ft.alignment.center_right
                         )
 
-                        # Flet GestureDetector uses on_long_press_start / on_long_press_end (not on_long_press)
+                        # Add pin button for creator (more reliable than long press)
+                        message_controls = [message_card]
+                        
+                        if _is_creator_account():
+                            # Check if this message is currently pinned
+                            is_currently_pinned = False
+                            try:
+                                pd = pinned_state.get("data") or {}
+                                is_currently_pinned = bool(
+                                    pd.get("msg_id") and 
+                                    msg.get("id") and 
+                                    pd.get("msg_id") == msg.get("id")
+                                )
+                            except:
+                                pass
+                            
+                            pin_btn = ft.IconButton(
+                                icon=ft.Icons.PUSH_PIN if not is_currently_pinned else ft.Icons.PUSH_PIN,
+                                icon_color="grey" if not is_currently_pinned else "red",
+                                tooltip="Pin/Unpin message",
+                                icon_size=18,
+                                on_click=lambda e, m=msg, gid=group_id: open_pin_dialog(gid, m)
+                            )
+                            
+                            if is_me:
+                                message_controls = [pin_btn, message_card]
+                            else:
+                                message_controls = [message_card, pin_btn]
+
+                        # Flet GestureDetector for long press (backup method)
                         wrapped_card = ft.GestureDetector(
-                            content=message_card,
-                            on_long_press_start=lambda e, m=msg, gid=group_id: open_pin_dialog(gid, m),
-                            # Avoid duplicate dialogs on some platforms
+                            content=ft.Row(
+                                controls=message_controls,
+                                alignment=ft.MainAxisAlignment.END if is_me else ft.MainAxisAlignment.START
+                            ),
+                            on_long_press_start=lambda e, m=msg, gid=group_id: open_pin_dialog(gid, m) if _is_creator_account() else None,
                             on_long_press_end=lambda e: None,
                         )
 
@@ -14661,12 +14802,24 @@ def main(page: ft.Page):
             page.update()
         
             def send_in_background():
+                # Check if messaging as fake promoter (creator-only)
+                sender_id_to_use = auth.user_id
+                sender_name_to_use = current_username
+                is_admin_badge = (is_admin or user_is_group_admin)
+                
+                # If creator has selected a fake promoter, use that identity
+                if is_admin and selected_fake_promoter.get('promoter_id'):
+                    sender_id_to_use = f"cp_{selected_fake_promoter['promoter_id']}"
+                    sender_name_to_use = selected_fake_promoter.get('promoter_name', 'Promoter')
+                    is_admin_badge = True  # Fake promoters always show as admin
+                    print(f"[FAKE PROMOTER] Sending message as: {sender_name_to_use} (ID: {sender_id_to_use})")
+                
                 success = db.send_group_message_by_id(
                     current_group_id,
-                    auth.user_id, 
-                    current_username, 
+                    sender_id_to_use, 
+                    sender_name_to_use, 
                     message_text,
-                    is_admin=(is_admin or user_is_group_admin)
+                    is_admin=is_admin_badge
                 )
             
                 if success:
@@ -14680,12 +14833,15 @@ def main(page: ft.Page):
                         members = db.get_group_members_by_id(current_group_id)
                         
                         # Determine notification content
-                        if is_admin or user_is_group_admin:
+                        # Use fake promoter name if messaging as one
+                        actual_sender_name = sender_name_to_use
+                        
+                        if is_admin_badge:
                             notification_title = f"👑 {group_name}"
-                            sender_prefix = f"👑 {current_username}"
+                            sender_prefix = f"👑 {actual_sender_name}"
                         else:
                             notification_title = f"💬 {group_name}"
-                            sender_prefix = current_username
+                            sender_prefix = actual_sender_name
                         
                         notification_body = f"{sender_prefix}: {message_text[:80]}"
                         
