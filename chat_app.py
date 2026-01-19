@@ -2270,32 +2270,57 @@ class FirebaseDatabase:
     def get_group_pinned_message_by_id(self, group_id):
         """Get pinned message for a specific group (stored at /groups/<gid>/info/pinned)"""
         url = f"{self.database_url}/groups/{group_id}/info/pinned.json?auth={self.auth_token}"
+        print(f"[DB-PIN] Getting pinned message from URL: {url}")
         try:
             response = requests.get(url, timeout=10)
+            print(f"[DB-PIN] GET response status: {response.status_code}")
             if response.status_code == 200:
-                return response.json()
+                data = response.json()
+                print(f"[DB-PIN] ✅ Pinned message retrieved: {data}")
+                return data
+            else:
+                print(f"[DB-PIN] No pinned message (status {response.status_code})")
         except Exception as e:
-            print(f"Error fetching pinned message: {e}")
+            print(f"[DB-PIN] ❌ Error fetching pinned message: {e}")
+            import traceback
+            traceback.print_exc()
         return None
 
     def set_group_pinned_message_by_id(self, group_id, pinned_data):
         """Set pinned message for a group (creator-only on UI side)"""
         url = f"{self.database_url}/groups/{group_id}/info/pinned.json?auth={self.auth_token}"
+        print(f"[DB-PIN] Setting pinned message at URL: {url}")
+        print(f"[DB-PIN] Pinned data: {pinned_data}")
         try:
             response = requests.put(url, json=pinned_data, timeout=10)
+            print(f"[DB-PIN] PUT response status: {response.status_code}")
+            if response.status_code == 200:
+                print("[DB-PIN] ✅ Pinned message set successfully")
+            else:
+                print(f"[DB-PIN] ❌ Failed with status {response.status_code}: {response.text}")
             return response.status_code == 200
         except Exception as e:
-            print(f"Error setting pinned message: {e}")
+            print(f"[DB-PIN] ❌ Error setting pinned message: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def clear_group_pinned_message_by_id(self, group_id):
         """Clear pinned message for a group"""
         url = f"{self.database_url}/groups/{group_id}/info/pinned.json?auth={self.auth_token}"
+        print(f"[DB-PIN] Clearing pinned message at URL: {url}")
         try:
             response = requests.delete(url, timeout=10)
+            print(f"[DB-PIN] DELETE response status: {response.status_code}")
+            if response.status_code == 200:
+                print("[DB-PIN] ✅ Pinned message cleared successfully")
+            else:
+                print(f"[DB-PIN] ❌ Failed to clear with status {response.status_code}")
             return response.status_code == 200
         except Exception as e:
-            print(f"Error clearing pinned message: {e}")
+            print(f"[DB-PIN] ❌ Error clearing pinned message: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def update_group_info_by_id(self, group_id, name, description, icon, icon_url=None, category="None"):
@@ -7350,12 +7375,25 @@ def main(page: ft.Page):
                 return False
 
         def refresh_group_pinned_banner(group_id):
+            """Refresh the pinned message banner for the current group.
+            
+            NOTE: Pinned messages are ALWAYS visible to ALL users, including new joiners,
+            because they are stored in /groups/<gid>/info/pinned (not in messages).
+            This is independent of the user's join timestamp.
+            """
             try:
+                print(f"[PIN] refresh_group_pinned_banner called for group={group_id}")
                 pinned = None
                 getter = getattr(db, "get_group_pinned_message_by_id", None)
                 if callable(getter):
+                    print("[PIN] Calling get_group_pinned_message_by_id...")
                     pinned = getter(group_id)
+                    print(f"[PIN] get_group_pinned_message_by_id returned: {pinned}")
+                else:
+                    print("[PIN] ERROR: get_group_pinned_message_by_id not callable")
+                
                 if isinstance(pinned, dict) and pinned:
+                    print("[PIN] Pinned message found, showing banner (visible to ALL users)")
                     pinned_state["data"] = pinned
                     sender = pinned.get("sender_username") or "Unknown"
                     txt = pinned.get("text") or pinned.get("file_name") or ""
@@ -7364,47 +7402,93 @@ def main(page: ft.Page):
                     pinned_title.value = f"Pinned • {sender}" + (" (Admin)" if pinned.get("is_admin") else "")
                     pinned_body.value = txt
                     pinned_banner.visible = True
-                    unpin_pinned_btn.visible = _is_creator_account()
+                    
+                    # Use inline creator check
+                    try:
+                        is_creator = (str(getattr(auth, "email", "") or "").strip().lower() == str(ADMIN_EMAIL).strip().lower())
+                    except:
+                        is_creator = False
+                    
+                    unpin_pinned_btn.visible = is_creator
+                    print(f"[PIN] Banner shown to user, unpin button visible={is_creator}")
                 else:
+                    print("[PIN] No pinned message, hiding banner")
                     pinned_state["data"] = None
                     pinned_banner.visible = False
                     unpin_pinned_btn.visible = False
                 page.update()
             except Exception as ex:
                 print(f"[PIN] refresh error: {ex}")
+                import traceback
+                traceback.print_exc()
 
         def unpin_current_group(e=None):
             try:
+                print(f"[PIN] unpin_current_group called for group={current_group_id}")
                 if not current_group_id:
+                    print("[PIN] No current group ID")
                     return
-                if not _is_creator_account():
+                
+                # Use inline creator check
+                try:
+                    is_creator = (str(getattr(auth, "email", "") or "").strip().lower() == str(ADMIN_EMAIL).strip().lower())
+                except:
+                    is_creator = False
+                
+                if not is_creator:
+                    print("[PIN] Not creator account, unpin blocked")
                     show_snackbar("Only creator can unpin")
                     return
+                
                 clearer = getattr(db, "clear_group_pinned_message_by_id", None)
                 ok = False
                 if callable(clearer):
+                    print("[PIN] Calling clear_group_pinned_message_by_id...")
                     ok = bool(clearer(current_group_id))
-                if ok:
-                    show_snackbar("Unpinned")
+                    print(f"[PIN] clear_group_pinned_message_by_id returned: {ok}")
                 else:
-                    show_snackbar("Failed to unpin")
+                    print("[PIN] ERROR: clear_group_pinned_message_by_id not callable")
+                
+                if ok:
+                    show_snackbar("Unpinned ✅")
+                    # Reload messages to update pin button colors
+                    print("[PIN] Reloading messages after unpin...")
+                    load_specific_group_messages(current_group_id)
+                else:
+                    show_snackbar("Failed to unpin ❌")
+                    print("[PIN] Unpin operation failed")
+                
+                print("[PIN] Refreshing pinned banner after unpin...")
                 refresh_group_pinned_banner(current_group_id)
             except Exception as ex:
                 print(f"[PIN] unpin error: {ex}")
+                import traceback
+                traceback.print_exc()
 
         # Bind unpin click
         unpin_pinned_btn.on_click = unpin_current_group
 
         def pin_group_message(group_id, msg):
             try:
-                if not _is_creator_account():
+                # Use inline creator check
+                try:
+                    is_creator = (str(getattr(auth, "email", "") or "").strip().lower() == str(ADMIN_EMAIL).strip().lower())
+                except:
+                    is_creator = False
+                
+                if not is_creator:
+                    print("[PIN] Not creator account, pin blocked")
                     show_snackbar("Only creator can pin messages")
                     return
                 if not group_id or not isinstance(msg, dict):
+                    print(f"[PIN] Invalid params: group_id={group_id}, msg type={type(msg)}")
                     return
 
+                msg_id = msg.get("id")
+                print(f"[PIN] Pinning message id={msg_id} in group={group_id}")
+                
                 pinned_data = {
-                    "msg_id": msg.get("id"),
+                    "msg_id": msg_id,
                     "sender_id": msg.get("sender_id"),
                     "sender_username": msg.get("sender_username"),
                     "text": msg.get("text") or "",
@@ -7417,24 +7501,47 @@ def main(page: ft.Page):
                     "pinned_by": auth.user_id,
                     "pinned_by_name": current_username,
                 }
+                
+                print(f"[PIN] Pinned data: {pinned_data}")
 
                 setter = getattr(db, "set_group_pinned_message_by_id", None)
                 ok = False
                 if callable(setter):
+                    print("[PIN] Calling set_group_pinned_message_by_id...")
                     ok = bool(setter(group_id, pinned_data))
+                    print(f"[PIN] set_group_pinned_message_by_id returned: {ok}")
+                else:
+                    print("[PIN] ERROR: set_group_pinned_message_by_id not callable")
 
                 if ok:
-                    show_snackbar("Message pinned")
+                    show_snackbar("Message pinned ✅")
+                    # Reload messages to update pin button colors
+                    print("[PIN] Reloading messages...")
+                    load_specific_group_messages(group_id)
                 else:
-                    show_snackbar("Failed to pin")
+                    show_snackbar("Failed to pin ❌")
+                    print("[PIN] Pin operation failed")
+                
+                print("[PIN] Refreshing pinned banner...")
                 refresh_group_pinned_banner(group_id)
             except Exception as ex:
                 print(f"[PIN] pin error: {ex}")
+                import traceback
+                traceback.print_exc()
 
         def open_pin_dialog(group_id, msg):
             try:
-                if not _is_creator_account():
+                # Use inline creator check instead of function
+                try:
+                    is_creator = (str(getattr(auth, "email", "") or "").strip().lower() == str(ADMIN_EMAIL).strip().lower())
+                except:
+                    is_creator = False
+                
+                if not is_creator:
+                    print("[PIN] Not creator account, dialog blocked")
                     return  # creator-only feature
+                
+                print(f"[PIN] Opening dialog for message id={msg.get('id')}")
                 preview = msg.get("text") or msg.get("file_name") or ""
                 if not preview:
                     preview = "(attachment)"
@@ -7443,40 +7550,67 @@ def main(page: ft.Page):
                 try:
                     pd = pinned_state.get("data") or {}
                     is_same = bool(pd.get("msg_id") and msg.get("id") and pd.get("msg_id") == msg.get("id"))
-                except Exception:
+                    print(f"[PIN] is_same={is_same}, pinned_msg_id={pd.get('msg_id')}, current_msg_id={msg.get('id')}")
+                except Exception as ex:
+                    print(f"[PIN] is_same check error: {ex}")
                     is_same = False
 
                 def do_pin(ev):
-                    dialog.open = False
-                    page.update()
+                    print("[PIN] do_pin clicked")
+                    try:
+                        dialog.open = False
+                        page.update()
+                    except Exception as e:
+                        print(f"[PIN] Error closing dialog: {e}")
                     pin_group_message(group_id, msg)
 
                 def do_unpin(ev):
-                    dialog.open = False
-                    page.update()
+                    print("[PIN] do_unpin clicked")
+                    try:
+                        dialog.open = False
+                        page.update()
+                    except Exception as e:
+                        print(f"[PIN] Error closing dialog: {e}")
                     unpin_current_group()
 
                 def cancel(ev):
-                    dialog.open = False
-                    page.update()
+                    print("[PIN] cancel clicked")
+                    try:
+                        dialog.open = False
+                        page.update()
+                    except Exception as e:
+                        print(f"[PIN] Error closing dialog: {e}")
 
                 actions = []
                 if is_same:
                     actions.append(ft.TextButton("Unpin", on_click=do_unpin))
+                    print("[PIN] Showing Unpin button")
                 else:
                     actions.append(ft.TextButton("Pin", on_click=do_pin))
+                    print("[PIN] Showing Pin button")
                 actions.append(ft.TextButton("Cancel", on_click=cancel))
 
                 dialog = ft.AlertDialog(
-                    title=ft.Text("Message options"),
-                    content=ft.Text(preview, selectable=True),
-                    actions=actions
+                    title=ft.Text("Pin Message", size=18, weight="bold"),
+                    content=ft.Container(
+                        content=ft.Text(preview, selectable=True, size=14),
+                        padding=10
+                    ),
+                    actions=actions,
+                    actions_alignment=ft.MainAxisAlignment.END,
                 )
+                
+                # CRITICAL: Must add to overlay first
+                print("[PIN] Adding dialog to page.overlay...")
+                page.overlay.append(dialog)
                 page.dialog = dialog
                 dialog.open = True
                 page.update()
+                print("[PIN] Dialog opened and page updated")
             except Exception as ex:
                 print(f"[PIN] dialog error: {ex}")
+                import traceback
+                traceback.print_exc()
 
         def load_specific_group_messages(group_id):
             """Load messages for a specific group (always rebuild UI)"""
@@ -14791,12 +14925,34 @@ def main(page: ft.Page):
                     success, result = storage.upload_file(file_path, file.name, file_data)
 
                     if success:
+                        # Determine sender based on fake promoter selection
+                        sender_id_to_use = auth.user_id
+                        sender_name_to_use = current_username
+                        is_admin_badge = (is_admin or user_is_group_admin)
+                        
+                        # If creator has selected a fake promoter, use that identity
+                        if is_admin and selected_fake_promoter.get('promoter_id'):
+                            sender_id_to_use = f"cp_{selected_fake_promoter['promoter_id']}"
+                            sender_name_to_use = selected_fake_promoter.get('promoter_name', 'Promoter')
+                            
+                            # Check if this specific promoter is marked as admin
+                            try:
+                                custom_promoters = db.get_group_custom_promoters_by_id(current_group_id) or []
+                                promoter_is_admin = False
+                                for cp in custom_promoters:
+                                    if cp.get("id") == selected_fake_promoter['promoter_id']:
+                                        promoter_is_admin = bool(cp.get("is_admin", False))
+                                        break
+                                is_admin_badge = promoter_is_admin
+                            except Exception:
+                                is_admin_badge = False
+                        
                         db.send_group_message_by_id(
                             current_group_id,
-                            auth.user_id,
-                            current_username,
+                            sender_id_to_use,
+                            sender_name_to_use,
                             "",
-                            is_admin=(is_admin or user_is_group_admin),
+                            is_admin=is_admin_badge,
                             file_url=result,
                             file_name=file.name,
                             file_size=file.size
@@ -14845,19 +15001,39 @@ def main(page: ft.Page):
             
             if is_admin and selected_fake_promoter.get('promoter_id'):
                 display_name = selected_fake_promoter.get('promoter_name', 'Promoter')
-                show_admin_badge = True  # Fake promoters always show admin badge
+                
+                # Check if this specific promoter is marked as admin
+                promoter_is_admin = False
+                try:
+                    custom_promoters = db.get_group_custom_promoters_by_id(current_group_id) or []
+                    for cp in custom_promoters:
+                        if cp.get("id") == selected_fake_promoter['promoter_id']:
+                            promoter_is_admin = bool(cp.get("is_admin", False))
+                            break
+                except Exception as ex:
+                    print(f"[UI] Error checking promoter admin status: {ex}")
+                
+                show_admin_badge = promoter_is_admin
+                
                 # Show sender info for fake promoter (since it's "not me")
-                message_content.append(
-                    ft.Row([
-                        ft.Text(display_name, size=13, weight='bold'),
-                        ft.Container(
-                            content=ft.Text('ADMIN', size=10, color='white', weight='bold'),
-                            bgcolor='#F44336',
-                            padding=3,
-                            border_radius=5,
-                        )
-                    ], spacing=5)
-                )
+                if promoter_is_admin:
+                    # Show with admin badge
+                    message_content.append(
+                        ft.Row([
+                            ft.Text(display_name, size=13, weight='bold'),
+                            ft.Container(
+                                content=ft.Text('ADMIN', size=10, color='white', weight='bold'),
+                                bgcolor='#F44336',
+                                padding=3,
+                                border_radius=5,
+                            )
+                        ], spacing=5)
+                    )
+                else:
+                    # Show without admin badge
+                    message_content.append(
+                        ft.Text(display_name, size=13, weight='bold')
+                    )
         
             if show_admin_badge and not selected_fake_promoter.get('promoter_id'):
                 # Show admin badge for real user (not fake promoter)
@@ -14874,7 +15050,11 @@ def main(page: ft.Page):
             # Color and alignment based on whether it's a fake promoter message
             if is_fake_promoter:
                 # Fake promoter messages appear on left (like other people's messages)
-                bg_color = "#FFF176"  # Yellow for admin messages from others
+                # Yellow background if admin, gray if not admin
+                if show_admin_badge:
+                    bg_color = "#FFF176"  # Yellow for admin messages from others
+                else:
+                    bg_color = "#E0E0E0"  # Gray for non-admin messages
                 alignment = "start"
                 margin = ft.margin.only(left=10, right=50)
             elif (is_admin or user_is_group_admin):
@@ -14911,8 +15091,21 @@ def main(page: ft.Page):
                 if is_admin and selected_fake_promoter.get('promoter_id'):
                     sender_id_to_use = f"cp_{selected_fake_promoter['promoter_id']}"
                     sender_name_to_use = selected_fake_promoter.get('promoter_name', 'Promoter')
-                    is_admin_badge = True  # Fake promoters always show as admin
-                    print(f"[FAKE PROMOTER] Sending message as: {sender_name_to_use} (ID: {sender_id_to_use})")
+                    
+                    # Check if THIS specific promoter is marked as admin in the group
+                    # Fetch the promoter's data to get their actual admin status
+                    try:
+                        custom_promoters = db.get_group_custom_promoters_by_id(current_group_id) or []
+                        promoter_is_admin = False
+                        for cp in custom_promoters:
+                            if cp.get("id") == selected_fake_promoter['promoter_id']:
+                                promoter_is_admin = bool(cp.get("is_admin", False))
+                                break
+                        is_admin_badge = promoter_is_admin
+                        print(f"[FAKE PROMOTER] Sending as: {sender_name_to_use} (ID: {sender_id_to_use}), is_admin={is_admin_badge}")
+                    except Exception as ex:
+                        print(f"[FAKE PROMOTER] Error checking admin status: {ex}, defaulting to False")
+                        is_admin_badge = False
                 else:
                     print(f"[NORMAL] Sending message as: {sender_name_to_use} (ID: {sender_id_to_use})")
                 
