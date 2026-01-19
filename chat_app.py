@@ -4423,6 +4423,9 @@ def main(page: ft.Page):
     promoter_needs_refresh = True
     main_menu_initialized = False
     
+    # Fake promoter messaging state (creator-only feature)
+    selected_fake_promoter = {"promoter_id": None, "promoter_name": None, "promoter_pic": None}
+    
     # ============================================
     # UI COMPONENT DEFINITIONS
     # ============================================
@@ -4461,6 +4464,30 @@ def main(page: ft.Page):
                 ft.Icon(ft.Icons.PUSH_PIN, size=18),
                 ft.Column([pinned_title, pinned_body], spacing=2, expand=True),
                 unpin_pinned_btn,
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=10,
+        ),
+    )
+    
+    # Fake promoter indicator banner (creator-only)
+    fake_promoter_indicator_text = ft.Text("", size=12, weight="bold", color="white")
+    fake_promoter_banner = ft.Container(
+        visible=False,
+        padding=8,
+        bgcolor="#9C27B0",  # Purple background
+        content=ft.Row(
+            [
+                ft.Icon(ft.Icons.PERSON, size=18, color="white"),
+                fake_promoter_indicator_text,
+                ft.IconButton(
+                    icon=ft.Icons.CLOSE,
+                    icon_color="white",
+                    tooltip="Stop messaging as promoter",
+                    icon_size=18,
+                    on_click=None  # Will be set later
+                )
             ],
             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -6767,14 +6794,30 @@ def main(page: ft.Page):
 
         def show_specific_group_chat(group_id, group_info_data, members, user_is_admin_in_group):
             """Show chat screen for a specific group"""
-            nonlocal current_group_id, group_info, user_is_group_admin, current_group_joined_at
-            
-            # State for messaging as fake promoter (creator-only feature)
-            selected_fake_promoter = {"promoter_id": None, "promoter_name": None, "promoter_pic": None}
+            nonlocal current_group_id, group_info, user_is_group_admin, current_group_joined_at, selected_fake_promoter
             
             active_screen["current"] = "group_chat"
             current_group_id = group_id
             user_is_group_admin = user_is_admin_in_group
+
+            # Function to reset fake promoter selection
+            def reset_fake_promoter(e=None):
+                """Reset to messaging as yourself"""
+                try:
+                    selected_fake_promoter['promoter_id'] = None
+                    selected_fake_promoter['promoter_name'] = None
+                    selected_fake_promoter['promoter_pic'] = None
+                    fake_promoter_banner.visible = False
+                    show_snackbar("✅ Reset to messaging as yourself")
+                    page.update()
+                except Exception as ex:
+                    print(f"[FAKE PROMOTER] Reset error: {ex}")
+            
+            # Bind the close button in fake promoter banner
+            for control in fake_promoter_banner.content.controls:
+                if isinstance(control, ft.IconButton):
+                    control.on_click = reset_fake_promoter
+                    break
 
             # Ensure join timestamp is captured for message filtering
             if current_group_joined_at is None:
@@ -7063,6 +7106,8 @@ def main(page: ft.Page):
                                 selected_fake_promoter['promoter_pic'] = None
                                 promoter_status.value = "Currently messaging as: Yourself"
                                 promoter_status.color = "grey"
+                                # Hide the banner
+                                fake_promoter_banner.visible = False
                                 show_snackbar("✅ Reset to messaging as yourself")
                             else:
                                 # Find the selected promoter
@@ -7074,6 +7119,9 @@ def main(page: ft.Page):
                                         selected_fake_promoter['promoter_pic'] = item.get("profile_image_url", "")
                                         promoter_status.value = f"Currently messaging as: {selected_fake_promoter['promoter_name']}"
                                         promoter_status.color = "blue"
+                                        # Show the banner
+                                        fake_promoter_indicator_text.value = f"🎭 Messaging as: {selected_fake_promoter['promoter_name']}"
+                                        fake_promoter_banner.visible = True
                                         show_snackbar(f"✅ Now messaging as {selected_fake_promoter['promoter_name']}")
                                         break
                             
@@ -7533,7 +7581,13 @@ def main(page: ft.Page):
                         # Add pin button for creator (more reliable than long press)
                         message_controls = [message_card]
                         
-                        if _is_creator_account():
+                        # Use is_admin check (creator account check)
+                        try:
+                            is_creator = (str(getattr(auth, "email", "") or "").strip().lower() == str(ADMIN_EMAIL).strip().lower())
+                        except:
+                            is_creator = False
+                        
+                        if is_creator:
                             # Check if this message is currently pinned
                             is_currently_pinned = False
                             try:
@@ -7547,8 +7601,8 @@ def main(page: ft.Page):
                                 pass
                             
                             pin_btn = ft.IconButton(
-                                icon=ft.Icons.PUSH_PIN if not is_currently_pinned else ft.Icons.PUSH_PIN,
-                                icon_color="grey" if not is_currently_pinned else "red",
+                                icon=ft.Icons.PUSH_PIN,
+                                icon_color="red" if is_currently_pinned else "grey",
                                 tooltip="Pin/Unpin message",
                                 icon_size=18,
                                 on_click=lambda e, m=msg, gid=group_id: open_pin_dialog(gid, m)
@@ -7560,12 +7614,17 @@ def main(page: ft.Page):
                                 message_controls = [message_card, pin_btn]
 
                         # Flet GestureDetector for long press (backup method)
+                        try:
+                            is_creator_for_gesture = (str(getattr(auth, "email", "") or "").strip().lower() == str(ADMIN_EMAIL).strip().lower())
+                        except:
+                            is_creator_for_gesture = False
+                            
                         wrapped_card = ft.GestureDetector(
                             content=ft.Row(
                                 controls=message_controls,
                                 alignment=ft.MainAxisAlignment.END if is_me else ft.MainAxisAlignment.START
                             ),
-                            on_long_press_start=lambda e, m=msg, gid=group_id: open_pin_dialog(gid, m) if _is_creator_account() else None,
+                            on_long_press_start=lambda e, m=msg, gid=group_id: open_pin_dialog(gid, m) if is_creator_for_gesture else None,
                             on_long_press_end=lambda e: None,
                         )
 
@@ -14779,8 +14838,29 @@ def main(page: ft.Page):
             time_str = timestamp.strftime("%I:%M %p")
         
             message_content = []
+            
+            # Check if messaging as fake promoter
+            display_name = current_username
+            show_admin_badge = (is_admin or user_is_group_admin)
+            
+            if is_admin and selected_fake_promoter.get('promoter_id'):
+                display_name = selected_fake_promoter.get('promoter_name', 'Promoter')
+                show_admin_badge = True  # Fake promoters always show admin badge
+                # Show sender info for fake promoter (since it's "not me")
+                message_content.append(
+                    ft.Row([
+                        ft.Text(display_name, size=13, weight='bold'),
+                        ft.Container(
+                            content=ft.Text('ADMIN', size=10, color='white', weight='bold'),
+                            bgcolor='#F44336',
+                            padding=3,
+                            border_radius=5,
+                        )
+                    ], spacing=5)
+                )
         
-            if is_admin or user_is_group_admin:
+            if show_admin_badge and not selected_fake_promoter.get('promoter_id'):
+                # Show admin badge for real user (not fake promoter)
                 message_content.append(ft.Text("👑 ADMIN", size=10, weight="bold", color="#FF6F00"))
         
             message_content.extend([
@@ -14788,16 +14868,36 @@ def main(page: ft.Page):
                 ft.Text(time_str, size=10)
             ])
         
+            # Determine if message should appear as "from me" or "from promoter"
+            is_fake_promoter = (is_admin and selected_fake_promoter.get('promoter_id'))
+            
+            # Color and alignment based on whether it's a fake promoter message
+            if is_fake_promoter:
+                # Fake promoter messages appear on left (like other people's messages)
+                bg_color = "#FFF176"  # Yellow for admin messages from others
+                alignment = "start"
+                margin = ft.margin.only(left=10, right=50)
+            elif (is_admin or user_is_group_admin):
+                # Real admin messages appear on right
+                bg_color = "#FFD54F"
+                alignment = "end"
+                margin = ft.margin.only(left=50, right=0)
+            else:
+                # Regular user messages appear on right
+                bg_color = "#BBDEFB"
+                alignment = "end"
+                margin = ft.margin.only(left=50, right=0)
+        
             message_bubble = ft.Container(
                 content=ft.Column(message_content, spacing=2),
-                bgcolor="#FFD54F" if (is_admin or user_is_group_admin) else "#BBDEFB",
+                bgcolor=bg_color,
                 border_radius=10,
                 padding=10,
-                margin=ft.margin.only(left=50, right=0)
+                margin=margin
             )
         
             group_messages_list.controls.append(
-                ft.Row([message_bubble], alignment="end")
+                ft.Row([message_bubble], alignment=alignment)
             )
             page.update()
         
@@ -14813,6 +14913,8 @@ def main(page: ft.Page):
                     sender_name_to_use = selected_fake_promoter.get('promoter_name', 'Promoter')
                     is_admin_badge = True  # Fake promoters always show as admin
                     print(f"[FAKE PROMOTER] Sending message as: {sender_name_to_use} (ID: {sender_id_to_use})")
+                else:
+                    print(f"[NORMAL] Sending message as: {sender_name_to_use} (ID: {sender_id_to_use})")
                 
                 success = db.send_group_message_by_id(
                     current_group_id,
@@ -14915,6 +15017,7 @@ def main(page: ft.Page):
                 bgcolor="#E3F2FD"
             ),
             pinned_banner,
+            fake_promoter_banner,
             ft.Container(content=group_messages_list, padding=20, expand=True),
             ft.Container(
                 content=ft.Row([
