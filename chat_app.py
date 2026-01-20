@@ -4925,10 +4925,17 @@ def main(page: ft.Page):
     #
     # We route that "close" attempt through handle_back_navigation(), so it
     # behaves exactly like the in-app back icon.
+    
+    # ✅ FIX: Support BOTH old and new Flet API
     try:
-        if hasattr(page, "window_prevent_close"):
-            # Prevent default close so we can decide whether to exit or navigate back.
+        # New API (Flet 0.21+): page.window.prevent_close
+        if hasattr(page, "window") and hasattr(page.window, "prevent_close"):
+            page.window.prevent_close = True
+            print("[BACK] ✅ Using new API: page.window.prevent_close = True")
+        # Old API (Flet < 0.21): page.window_prevent_close
+        elif hasattr(page, "window_prevent_close"):
             page.window_prevent_close = True
+            print("[BACK] ✅ Using old API: page.window_prevent_close = True")
     except Exception as ex:
         print(f"[BACK] window_prevent_close not supported: {ex}")
 
@@ -4943,7 +4950,11 @@ def main(page: ft.Page):
                     return
                 # User requested exit (double back at root): allow close now.
                 try:
-                    if hasattr(page, "window_prevent_close"):
+                    # New API
+                    if hasattr(page, "window") and hasattr(page.window, "prevent_close"):
+                        page.window.prevent_close = False
+                    # Old API
+                    elif hasattr(page, "window_prevent_close"):
                         page.window_prevent_close = False
                 except Exception:
                     pass
@@ -4956,14 +4967,64 @@ def main(page: ft.Page):
                             return
                         except Exception:
                             pass
+                # New API: page.window.close()
+                if hasattr(page, "window") and hasattr(page.window, "close"):
+                    try:
+                        page.window.close()
+                        return
+                    except Exception:
+                        pass
         except Exception as ex:
             print(f"[BACK] on_window_event error: {ex}")
 
+    # ✅ FIX: Support BOTH old and new Flet API for window events
     try:
-        if hasattr(page, "on_window_event"):
+        # New API (Flet 0.21+): page.window.on_event
+        if hasattr(page, "window") and hasattr(page.window, "on_event"):
+            page.window.on_event = _on_window_event
+            print("[BACK] ✅ Using new API: page.window.on_event")
+        # Old API (Flet < 0.21): page.on_window_event
+        elif hasattr(page, "on_window_event"):
             page.on_window_event = _on_window_event
+            print("[BACK] ✅ Using old API: page.on_window_event")
     except Exception as ex:
         print(f"[BACK] page.on_window_event not supported: {ex}")
+    
+    # ✅ FIX: Explicit Android back button handler (Flet mobile)
+    def _on_back_button_pressed(e):
+        """Handle Android hardware back button explicitly"""
+        print("[BACK] ✅ Android back button pressed (on_back_button_pressed)")
+        should_block = handle_back_navigation(None)
+        if should_block:
+            # Prevent default back action (exit)
+            return True
+        else:
+            # Allow exit
+            return False
+    
+    try:
+        # Try to set the explicit back button handler
+        if hasattr(page, "on_back_button_pressed"):
+            page.on_back_button_pressed = _on_back_button_pressed
+            print("[BACK] ✅ Registered page.on_back_button_pressed handler")
+    except Exception as ex:
+        print(f"[BACK] on_back_button_pressed not supported: {ex}")
+    
+    # ✅ FIX: Also try the Flet route/view pop mechanism for navigation
+    def _on_view_pop(e):
+        """Handle view pop event (another way Flet triggers back navigation)"""
+        print("[BACK] ✅ View pop event triggered")
+        should_block = handle_back_navigation(None)
+        if len(page.views) > 1 and not should_block:
+            page.views.pop()
+            page.update()
+    
+    try:
+        if hasattr(page, "on_view_pop"):
+            page.on_view_pop = _on_view_pop
+            print("[BACK] ✅ Registered page.on_view_pop handler")
+    except Exception as ex:
+        print(f"[BACK] on_view_pop not supported: {ex}")
 
     # Desktop fallback (ESC key): also use same navigation logic.
     def _on_keyboard_event(k: ft.KeyboardEvent):
@@ -4974,10 +5035,15 @@ def main(page: ft.Page):
                 # If user intended to exit, let window close normally.
                 if not should_block_close:
                     try:
-                        if hasattr(page, "window_prevent_close"):
+                        # New API
+                        if hasattr(page, "window") and hasattr(page.window, "prevent_close"):
+                            page.window.prevent_close = False
+                        # Old API
+                        elif hasattr(page, "window_prevent_close"):
                             page.window_prevent_close = False
                     except Exception:
                         pass
+                    # Try old API close methods
                     for fn_name in ("window_close", "window_destroy"):
                         fn = getattr(page, fn_name, None)
                         if callable(fn):
@@ -4986,6 +5052,12 @@ def main(page: ft.Page):
                                 break
                             except Exception:
                                 pass
+                    # Try new API close method
+                    if hasattr(page, "window") and hasattr(page.window, "close"):
+                        try:
+                            page.window.close()
+                        except Exception:
+                            pass
         except Exception as ex:
             print(f"[BACK] keyboard handler error: {ex}")
 
